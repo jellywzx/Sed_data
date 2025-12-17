@@ -183,7 +183,7 @@ def apply_quality_flag(value, variable_name):
 
 
 
-def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds):
+def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q_bounds):
     """Create a CF-1.8 compliant NetCDF file for one station."""
 
     station_name = row['Station']
@@ -208,6 +208,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds):
     elevation = row['Elevation (masl)']
     runoff = row['Runoff (mm)']
     sediment_mt_yr = row['Sediment（(Mt yr−1)）']
+
     # ==========================================================
     # Log-IQR outlier screening for SSL (source data)
     # ==========================================================
@@ -221,6 +222,8 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds):
             and (sediment_mt_yr < lower or sediment_mt_yr > upper)
         ):
             ssl_log_iqr_outlier = True
+    
+
 
     sediment_yield = row['Sediment（t km−2 yr−1）']
 
@@ -237,6 +240,37 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds):
     if ssl_log_iqr_outlier and SSL_flag == 0:
         SSL_flag = np.int8(2)  # suspect
 
+        # ==========================================================
+    # ==========================================================
+    # SSC–Q hydrological consistency check
+    # ==========================================================
+    ssc_q_inconsistent = False
+
+    if (
+        ssc_q_bounds is not None
+        and Q_flag == 0
+        and SSC_flag == 0
+        and not pd.isna(Q)
+        and not pd.isna(SSC)
+        and Q > 0
+        and SSC > 0
+    ):
+        logQ = np.log10(Q)
+        logSSC = np.log10(SSC)
+
+        coef = ssc_q_bounds["coef"]
+        logSSC_expected = coef[0] * logQ + coef[1]
+
+        resid = logSSC - logSSC_expected
+
+        if (
+            resid < ssc_q_bounds["lower"]
+            or resid > ssc_q_bounds["upper"]
+        ):
+            ssc_q_inconsistent = True
+    # Downgrade SSC flag if hydrologically inconsistent
+    if ssc_q_inconsistent and SSC_flag == 0:
+        SSC_flag = np.int8(2)  # suspect
 
     # Calculate time (middle of period)
     if start_year and end_year:
@@ -484,6 +518,13 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds):
     'using a log-transformed interquartile range (IQR) method based on source-reported '
     'annual sediment load (Mt yr−1). Values identified as statistical outliers were not '
     'removed but flagged as suspect (flag=2).')
+    nc.comment += (' A statistical outlier pre-screening was applied only to suspended sediment load (SSL) ')
+    nc.comment += (
+    ' In addition, a hydrological consistency check based on the SSC–Q relationship '
+    'was applied at the dataset level. SSC values that deviated substantially from the '
+    'log–log SSC–Q envelope were flagged as suspect (flag=2) but not removed.'
+    )
+
 
     # Close file
     nc.close()
@@ -607,11 +648,52 @@ def main():
     print(f"  SSL bounds (Mt/yr): {ssl_iqr_bounds}")
     print()
 
+    # ==========================================================
+    # SSC–Q reference envelope (log-log, dataset-level)
+    # ==========================================================
+    valid = (
+        (df['Sediment（(Mt yr−1)）'] > 0) &
+        (df['Runoff (mm)'] > 0) &
+        (df['Drainage area (km2)'] > 0)
+    )
+
+    Q_ref = (
+        df.loc[valid, 'Runoff (mm)']
+        * df.loc[valid, 'Drainage area (km2)']
+        / 31557.6
+    )
+
+    SSL_ref = df.loc[valid, 'Sediment（(Mt yr−1)）'] * 1e6 / 365.25
+    SSC_ref = SSL_ref / (Q_ref * 0.0864)
+
+    # log–log space
+    logQ = np.log10(Q_ref)
+    logSSC = np.log10(SSC_ref)
+
+    # Fit median trend
+    coef = np.polyfit(logQ, logSSC, 1)
+    logSSC_pred = np.polyval(coef, logQ)
+
+    # Residual-based envelope (robust)
+    resid = logSSC - logSSC_pred
+    resid_q1, resid_q3 = np.percentile(resid, [25, 75])
+    resid_iqr = resid_q3 - resid_q1
+
+    ssc_q_bounds = {
+        "coef": coef,
+        "lower": resid_q1 - 1.5 * resid_iqr,
+        "upper": resid_q3 + 1.5 * resid_iqr,
+    }
+
+    print("SSC–Q consistency envelope:")
+    print(ssc_q_bounds)
+
+
     # Process each station
     print("Creating CF-1.8 compliant NetCDF files...")
     station_data = []
     for idx, row in df.iterrows():
-        data = create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds)
+        data = create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds,ssc_q_bounds)
         station_data.append(data)
         print(f"  Created: {os.path.basename(data['filepath'])}")
         print(f"    Q={data['Q']:.2f} m³/s (flag={data['Q_flag']}), "
