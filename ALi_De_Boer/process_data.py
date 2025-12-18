@@ -24,7 +24,6 @@ import re
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
 
-
 def parse_dms_to_decimal(dms_str):
     """
     Convert degrees, minutes, seconds (DMS) to decimal degrees.
@@ -50,7 +49,6 @@ def parse_dms_to_decimal(dms_str):
         decimal = degrees + minutes/60.0 + seconds/3600.0
         return decimal
     return np.nan
-
 
 def parse_period(period_str):
     """
@@ -78,7 +76,6 @@ def parse_period(period_str):
             return None, None
     return None, None
 
-
 def calculate_discharge(runoff_mm_yr, area_km2):
     """
     Calculate river discharge from runoff and drainage area.
@@ -94,7 +91,6 @@ def calculate_discharge(runoff_mm_yr, area_km2):
         return np.nan
     return runoff_mm_yr * area_km2 / 31557.6
 
-
 def calculate_ssl_from_mt_yr(sediment_mt_yr):
     """
     Convert sediment load from Mt/yr to ton/day.
@@ -107,7 +103,6 @@ def calculate_ssl_from_mt_yr(sediment_mt_yr):
     if pd.isna(sediment_mt_yr):
         return np.nan
     return sediment_mt_yr * 1e6 / 365.25
-
 
 def calculate_ssc(ssl_ton_day, discharge_m3s):
     """
@@ -154,7 +149,6 @@ def compute_log_iqr_bounds(values, k=1.5):
 
     return lower, upper
 
-
 def apply_quality_flag(value, variable_name):
     """
     Apply quality flag based only on missing values and physical impossibility.
@@ -180,7 +174,6 @@ def apply_quality_flag(value, variable_name):
 
     # Otherwise good
     return np.int8(0)
-
 
 
 def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q_bounds):

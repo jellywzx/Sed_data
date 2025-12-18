@@ -242,11 +242,6 @@ def process_station(station_id, discharge_dir, sediment_dir, output_dir):
         print(f"    Sediment: {sediment_start} to {sediment_end}")
         return False
 
-    # Extend to full months
-    # Start from first day of the start month
-    overlap_start = overlap_start.replace(day=1)
-    # End at last day of December of the end year
-    overlap_end = overlap_end.replace(month=12, day=31)
 
     print(f"  Overlap period: {overlap_start} to {overlap_end}")
 
@@ -254,12 +249,18 @@ def process_station(station_id, discharge_dir, sediment_dir, output_dir):
     discharge_data = discharge_data.loc[overlap_start:overlap_end]
     sediment_data = sediment_data.loc[overlap_start:overlap_end]
 
-    # Create merged dataframe with aligned dates
-    date_range = pd.date_range(start=overlap_start, end=overlap_end, freq='D')
-    merged_data = pd.DataFrame(index=date_range)
+    # 按真实观测日期对齐
+    # merged_data = pd.DataFrame(index=discharge_data.index.union(sediment_data.index))
+    # merged_data = merged_data.loc[overlap_start:overlap_end]
 
-    merged_data['discharge'] = discharge_data['value']
-    merged_data['ssc'] = sediment_data['value']
+    # merged_data['discharge'] = discharge_data['value']
+    # merged_data['ssc'] = sediment_data['value']
+
+    #只保留Q和SSC都存在的日期【need_check】
+    merged_data = discharge_data[['value']].rename(columns={'value': 'discharge'}).join(
+    sediment_data[['value']].rename(columns={'value': 'ssc'}),
+    how='inner')
+    merged_data = merged_data.loc[overlap_start:overlap_end]
 
     # Calculate sediment load (ton/day)
     # Load = Q (m³/s) × SSC (g/m³) × 86400 (s/day) / 1e6 (g/ton)

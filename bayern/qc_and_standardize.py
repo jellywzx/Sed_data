@@ -18,65 +18,26 @@ Date: 2025-10-25
 Institution: Sun Yat-sen University, China
 """
 
+
+import os
+import sys
+# Add parent directory to PYTHONPATH
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
 from datetime import datetime
-import os
 import glob
-import sys
-
-def perform_qc_checks(q_value, ssc_value, ssl_value):
-    """
-    Perform quality control checks on daily data values.
-
-    Parameters:
-    -----------
-    q_value : float
-        Discharge value (m³/s)
-    ssc_value : float
-        Sediment concentration value (mg/L)
-    ssl_value : float
-        Sediment load value (ton/day)
-
-    Returns:
-    --------
-    q_flag, ssc_flag, ssl_flag : int
-        Quality flags (0=good, 1=estimated, 2=suspect, 3=bad, 9=missing)
-    """
-
-    # Q flag
-    if np.isnan(q_value) or q_value == -9999.0:
-        q_flag = 9  # Missing data
-    elif q_value < 0:
-        q_flag = 3  # Bad data (negative)
-    elif q_value == 0:
-        q_flag = 2  # Suspect data (zero discharge)
-    elif q_value > 10000:  # Extreme high for European rivers
-        q_flag = 2  # Suspect data (extreme high)
-    else:
-        q_flag = 0  # Good data
-
-    # SSC flag
-    if np.isnan(ssc_value) or ssc_value == -9999.0:
-        ssc_flag = 9  # Missing data
-    elif ssc_value < 0:
-        ssc_flag = 3  # Bad data (negative)
-    elif ssc_value > 3000:  # Physical limit
-        ssc_flag = 2  # Suspect data (extreme high)
-    else:
-        ssc_flag = 0  # Good data
-
-    # SSL flag
-    if np.isnan(ssl_value) or ssl_value == -9999.0:
-        ssl_flag = 9  # Missing data
-    elif ssl_value < 0:
-        ssl_flag = 3  # Bad data (negative)
-    else:
-        ssl_flag = 0  # Good data
-
-    return q_flag, ssc_flag, ssl_flag
-
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    calculate_ssc
+)
 
 def find_valid_time_range(ds_in):
     """
@@ -169,29 +130,57 @@ def process_station(input_file, output_dir):
         ssl_data = ds_in.variables['sediment_load'][start_idx:end_idx]
 
         # Replace fill values with NaN for processing
-        q_data = np.where(q_data == -9999.0, np.nan, q_data)
-        ssc_data = np.where(ssc_data == -9999.0, np.nan, ssc_data)
-        ssl_data = np.where(ssl_data == -9999.0, np.nan, ssl_data)
+        q_data = np.where(q_data == FILL_VALUE_FLOAT, np.nan, q_data)
+        ssc_data = np.where(ssc_data == FILL_VALUE_FLOAT, np.nan, ssc_data)
+        ssl_data = np.where(ssl_data == FILL_VALUE_FLOAT, np.nan, ssl_data)
+
+        # Log_IQR Quality control   
+        ssc_lower, ssc_upper = compute_log_iqr_bounds(ssc_data)
+        ssl_lower, ssl_upper = compute_log_iqr_bounds(ssl_data)
+
+        # ---- initialize flags ----
+        q_flags = np.zeros(len(q_data), dtype=np.int8)
+        ssc_flags = np.zeros(len(ssc_data), dtype=np.int8)
+        ssl_flags = np.zeros(len(ssl_data), dtype=np.int8)
+
+        # ---- unified QC loop ----
+        # quality control 1st step: negative values and missing values
+        for i in range(len(q_data)):
+            qf = apply_quality_flag(q_data[i], 'Q')
+            sscf = apply_quality_flag(ssc_data[i], 'SSC')
+            sslf = apply_quality_flag(ssl_data[i], 'SSL')
+
+            # log-IQR statistical outliers → suspect
+            if ssc_lower and ssc_upper:
+                if np.isfinite(ssc_data[i]) and (ssc_data[i] < ssc_lower or ssc_data[i] > ssc_upper):
+                    if sscf == 0:
+                        sscf = np.int8(2)
+
+            if ssl_lower and ssl_upper:
+                if np.isfinite(ssl_data[i]) and (ssl_data[i] < ssl_lower or ssl_data[i] > ssl_upper):
+                    if sslf == 0:
+                        sslf = np.int8(2)
+                        
+            # SSC–Q–SSL consistency (soft check)            
+            ssc_ref = calculate_ssc(ssl_data[i], q_data[i])
+            if np.isfinite(ssc_ref) and np.isfinite(ssc_data[i]):
+                ratio = ssc_data[i] / ssc_ref
+                if ratio < 0.1 or ratio > 10.0:
+                    if sscf == 0:
+                        sscf = np.int8(2)
+            
+            q_flags[i] = qf
+            ssc_flags[i] = sscf
+            ssl_flags[i] = sslf
 
         # Convert time to dates for reporting
         time_units = ds_in.variables['time'].units
         time_calendar = ds_in.variables['time'].calendar
         dates = nc.num2date(time_data, units=time_units, calendar=time_calendar)
 
-        # Close input file
         ds_in.close()
 
-        # Perform QC checks on all data points
-        q_flags = np.zeros(len(q_data), dtype=np.byte)
-        ssc_flags = np.zeros(len(ssc_data), dtype=np.byte)
-        ssl_flags = np.zeros(len(ssl_data), dtype=np.byte)
-
-        for i in range(len(q_data)):
-            q_flags[i], ssc_flags[i], ssl_flags[i] = perform_qc_checks(
-                q_data[i], ssc_data[i], ssl_data[i]
-            )
-
-        # Count quality flags for reporting
+        # # Count quality flags for reporting
         q_good = np.sum(q_flags == 0)
         q_suspect = np.sum(q_flags == 2)
         q_bad = np.sum(q_flags == 3)
@@ -213,11 +202,6 @@ def process_station(input_file, output_dir):
         print(f"  Q: {q_good} good, {q_suspect} suspect, {q_bad} bad, {q_missing} missing")
         print(f"  SSC: {ssc_good} good, {ssc_suspect} suspect, {ssc_bad} bad, {ssc_missing} missing")
         print(f"  SSL: {ssl_good} good, {ssl_suspect} suspect, {ssl_bad} bad, {ssl_missing} missing")
-
-        # Replace NaN with fill value for NetCDF
-        q_data = np.where(np.isnan(q_data), -9999.0, q_data)
-        ssc_data = np.where(np.isnan(ssc_data), -9999.0, ssc_data)
-        ssl_data = np.where(np.isnan(ssl_data), -9999.0, ssl_data)
 
         # Create output file
         output_file = os.path.join(output_dir, os.path.basename(input_file))
@@ -407,8 +391,8 @@ def main():
     print()
 
     # Paths
-    input_dir = '/Users/zhongwangwei/Downloads/Sediment/Output/daily/Bayern'
-    output_dir = '/Users/zhongwangwei/Downloads/Sediment/Output_r/daily/Bayern'
+    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/bayern/done'
+    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Bayern/qc'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -488,28 +472,28 @@ def main():
     print()
 
     # Quality control summary
-    print("="*80)
-    print("Quality Control Summary")
-    print("="*80)
-    print("Quality Checks Applied:")
-    print("  Q (Discharge):")
-    print("    - Q < 0: Flagged as BAD (flag=3)")
-    print("    - Q == 0: Flagged as SUSPECT (flag=2)")
-    print("    - Q > 10000 m³/s: Flagged as SUSPECT (flag=2)")
-    print("    - Valid Q: Flagged as GOOD (flag=0)")
-    print("  SSC (Concentration):")
-    print("    - SSC < 0: Flagged as BAD (flag=3)")
-    print("    - SSC > 3000 mg/L: Flagged as SUSPECT (flag=2)")
-    print("    - Valid SSC: Flagged as GOOD (flag=0)")
-    print("  SSL (Load):")
-    print("    - SSL < 0: Flagged as BAD (flag=3)")
-    print("    - Valid SSL: Flagged as GOOD (flag=0)")
-    print()
-    print("Time Series Trimming:")
-    print("  - Removed leading/trailing periods with all missing data")
-    print("  - Kept continuous middle section with valid measurements")
-    print("="*80)
-    print()
+    # print("="*80)
+    # print("Quality Control Summary")
+    # print("="*80)
+    # print("Quality Checks Applied:")
+    # print("  Q (Discharge):")
+    # print("    - Q < 0: Flagged as BAD (flag=3)")
+    # print("    - Q == 0: Flagged as SUSPECT (flag=2)")
+    # print("    - Q > 10000 m³/s: Flagged as SUSPECT (flag=2)")
+    # print("    - Valid Q: Flagged as GOOD (flag=0)")
+    # print("  SSC (Concentration):")
+    # print("    - SSC < 0: Flagged as BAD (flag=3)")
+    # print("    - SSC > 3000 mg/L: Flagged as SUSPECT (flag=2)")
+    # print("    - Valid SSC: Flagged as GOOD (flag=0)")
+    # print("  SSL (Load):")
+    # print("    - SSL < 0: Flagged as BAD (flag=3)")
+    # print("    - Valid SSL: Flagged as GOOD (flag=0)")
+    # print()
+    # print("Time Series Trimming:")
+    # print("  - Removed leading/trailing periods with all missing data")
+    # print("  - Kept continuous middle section with valid measurements")
+    # print("="*80)
+    # print()
 
 
 if __name__ == '__main__':

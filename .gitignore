@@ -16,6 +16,9 @@ output/
 *.txt
 log/
 *.log
+*.figs
+*.fig
+fig/
 
 # 临时文件
 *.swp

@@ -1,7 +1,15 @@
+import pandas as pd
+import numpy as np
+import re
+import os
+
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
 
+#=====================================
+# time unit conversion
+#====================================
 
 def parse_dms_to_decimal(dms_str):
     """
@@ -56,6 +64,11 @@ def parse_period(period_str):
             return None, None
     return None, None
 
+
+#=====================================
+# variable calculations
+#====================================
+
 def calculate_discharge(runoff_mm_yr, area_km2):
     """
     Calculate river discharge from runoff and drainage area.
@@ -97,6 +110,11 @@ def calculate_ssc(ssl_ton_day, discharge_m3s):
     if pd.isna(ssl_ton_day) or pd.isna(discharge_m3s) or discharge_m3s <= 0:
         return np.nan
     return ssl_ton_day / (discharge_m3s * 0.0864)
+
+
+#=====================================
+# quality control
+#====================================
 
 def compute_log_iqr_bounds(values, k=1.5):
     """
@@ -157,7 +175,9 @@ def apply_quality_flag(value, variable_name):
     # Otherwise good
     return np.int8(0)
 
-
+#=====================================
+# summary CSV generation
+#====================================
 
 def generate_station_summary_csv(station_data, output_dir):
     """Generate a CSV summary file of station metadata and data completeness."""
