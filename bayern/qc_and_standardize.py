@@ -36,7 +36,9 @@ from tool import (
     FILL_VALUE_INT,
     apply_quality_flag,
     compute_log_iqr_bounds,
-    calculate_ssc
+    calculate_ssc,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency
 )
 
 def find_valid_time_range(ds_in):
@@ -143,6 +145,15 @@ def process_station(input_file, output_dir):
         ssc_flags = np.zeros(len(ssc_data), dtype=np.int8)
         ssl_flags = np.zeros(len(ssl_data), dtype=np.int8)
 
+        # ==========================================================
+        # Build station-level SSC–Q envelope (daily data)
+        # ==========================================================
+        ssc_q_bounds = build_ssc_q_envelope(
+            Q_m3s=q_data,
+            SSC_mgL=ssc_data,
+            k=1.5
+        )
+
         # ---- unified QC loop ----
         # quality control 1st step: negative values and missing values
         for i in range(len(q_data)):
@@ -161,13 +172,17 @@ def process_station(input_file, output_dir):
                     if sslf == 0:
                         sslf = np.int8(2)
                         
-            # SSC–Q–SSL consistency (soft check)            
-            ssc_ref = calculate_ssc(ssl_data[i], q_data[i])
-            if np.isfinite(ssc_ref) and np.isfinite(ssc_data[i]):
-                ratio = ssc_data[i] / ssc_ref
-                if ratio < 0.1 or ratio > 10.0:
-                    if sscf == 0:
-                        sscf = np.int8(2)
+            # SSC–Q hydrological consistency (station-level, log–log envelope)
+            is_inconsistent, resid = check_ssc_q_consistency(
+                Q=q_data[i],
+                SSC=ssc_data[i],
+                Q_flag=qf,
+                SSC_flag=sscf,
+                ssc_q_bounds=ssc_q_bounds
+            )
+
+            if is_inconsistent and sscf == 0:
+                sscf = np.int8(2)
             
             q_flags[i] = qf
             ssc_flags[i] = sscf

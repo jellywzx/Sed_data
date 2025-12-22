@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import re
 import os
+import xarray as xr
 
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
@@ -98,6 +99,29 @@ def calculate_ssl_from_mt_yr(sediment_mt_yr):
         return np.nan
     return sediment_mt_yr * 1e6 / 365.25
 
+def convert_ssl_units_if_needed(ssl_da: xr.DataArray):
+    """
+    如果 sediment_flux 单位为 kg/s，则转换成 ton/day
+    - kg/s × 86400 s/day / 1000 kg/ton = ton/day
+    - 若无单位或已经是 ton/day，则不改值，只标准化 units 属性
+    """
+    units = str(getattr(ssl_da, "units", "")).lower()
+
+    if "kg/s" in units or "kg s-1" in units or "kg s^-1" in units:
+        LOGGER.info("Converting sediment_flux units from kg/s to ton/day")
+        data = ssl_da.values.astype(float)
+        converted = data * 86400.0 / 1000.0
+        da = ssl_da.copy(data=converted)
+        da.attrs["units"] = "ton day-1"
+        return da
+    else:
+        # 不需要转换，统一写成 ton day-1 或沿用原值
+        da = ssl_da.copy()
+        if units == "" or "ton" in units:
+            da.attrs["units"] = "ton day-1"
+        return da
+
+
 def calculate_ssc(ssl_ton_day, discharge_m3s):
     """
     Calculate suspended sediment concentration from sediment load and discharge.
@@ -174,6 +198,263 @@ def apply_quality_flag(value, variable_name):
 
     # Otherwise good
     return np.int8(0)
+
+def build_ssc_q_envelope(
+    Q_m3s,
+    SSC_mgL,
+    k=1.5,
+    min_samples=5
+):
+    """
+    Build a dataset-level SSC–Q consistency envelope in log–log space
+    using standardized physical variables.
+
+    Parameters
+    ----------
+    Q_m3s : array-like
+        River discharge in m3/s (standard unit)
+    SSC_mgL : array-like
+        Suspended sediment concentration in mg/L (standard unit)
+    k : float, optional
+        IQR multiplier for envelope width (default: 1.5)
+    min_samples : int, optional
+        Minimum number of valid samples required
+
+    Returns
+    -------
+    dict or None
+        Dictionary with keys:
+        - 'coef'  : linear coefficients [slope, intercept] in log–log space
+        - 'lower' : lower residual bound
+        - 'upper' : upper residual bound
+
+        Returns None if insufficient valid samples.
+    """
+
+    Q = np.asarray(Q_m3s, dtype=float)
+    SSC = np.asarray(SSC_mgL, dtype=float)
+
+    valid = (
+        np.isfinite(Q)
+        & np.isfinite(SSC)
+        & (Q > 0)
+        & (SSC > 0)
+    )
+
+    if valid.sum() < min_samples:
+        return None
+
+    logQ = np.log10(Q[valid])
+    logSSC = np.log10(SSC[valid])
+
+    # Fit central trend (log–log)
+    coef = np.polyfit(logQ, logSSC, 1)
+    logSSC_pred = np.polyval(coef, logQ)
+
+    # Residual-based IQR envelope
+    resid = logSSC - logSSC_pred
+    q1, q3 = np.percentile(resid, [25, 75])
+    iqr = q3 - q1
+
+    return {
+        "coef": coef,
+        "lower": q1 - k * iqr,
+        "upper": q3 + k * iqr,
+    }
+
+
+
+def check_ssc_q_consistency(
+    Q,
+    SSC,
+    Q_flag,
+    SSC_flag,
+    ssc_q_bounds
+    ):
+    """
+    Check hydrological consistency between SSC and Q using a dataset-level
+    log–log SSC–Q envelope.
+
+    Parameters
+    ----------
+    Q : float
+        Discharge (m3/s)
+    SSC : float
+        Suspended sediment concentration (mg/L)
+    Q_flag : int
+        Quality flag for Q
+    SSC_flag : int
+        Quality flag for SSC
+    ssc_q_bounds : dict
+        Dictionary with keys:
+        - 'coef': linear coefficients in log–log space
+        - 'lower': lower residual bound
+        - 'upper': upper residual bound
+
+    Returns
+    -------
+    bool
+        True if SSC is hydrologically inconsistent with Q, otherwise False
+    """
+    # Default
+    resid = np.nan
+
+    # Only check when both variables are valid and good
+    if (
+        ssc_q_bounds is None
+        or Q_flag != 0
+        or SSC_flag != 0
+        or pd.isna(Q)
+        or pd.isna(SSC)
+        or Q <= 0
+        or SSC <= 0
+    ):
+        return False, resid
+
+    logQ = np.log10(Q)
+    logSSC = np.log10(SSC)
+
+    coef = ssc_q_bounds["coef"]
+    logSSC_expected = coef[0] * logQ + coef[1]
+
+    resid = logSSC - logSSC_expected
+
+    is_inconsistent = (
+            resid < ssc_q_bounds["lower"]
+            or resid > ssc_q_bounds["upper"]
+        )
+
+    return is_inconsistent, resid
+
+#=====================================
+# plot_session
+#====================================
+
+import matplotlib.pyplot as plt
+
+def plot_ssc_q_diagnostic(
+    time,
+    Q,
+    SSC,
+    Q_flag,
+    SSC_flag,
+    ssc_q_bounds,
+    station_id,
+    station_name,
+    out_png,
+):
+    """
+    Create and save a station-level SSC–Q diagnostic plot.
+
+    Parameters
+    ----------
+    time : array-like (datetime64)
+    Q : array-like (m3/s)
+    SSC : array-like (mg/L)
+    Q_flag : array-like
+    SSC_flag : array-like
+    ssc_q_bounds : dict
+        Output of build_ssc_q_envelope
+    station_id : str
+    station_name : str
+    out_png : str
+        Path to output PNG
+    """
+
+    if ssc_q_bounds is None:
+        return
+
+    time = np.asarray(time)
+    Q = np.asarray(Q, dtype=float)
+    SSC = np.asarray(SSC, dtype=float)
+    Q_flag = np.asarray(Q_flag)
+    SSC_flag = np.asarray(SSC_flag)
+
+    valid = (
+        np.isfinite(Q)
+        & np.isfinite(SSC)
+        & (Q > 0)
+        & (SSC > 0)
+    )
+
+    if valid.sum() < 5:
+        return
+
+    # log–log values
+    logQ = np.log10(Q[valid])
+    logSSC = np.log10(SSC[valid])
+
+    coef = ssc_q_bounds["coef"]
+    logSSC_pred = coef[0] * logQ + coef[1]
+    resid = logSSC - logSSC_pred
+
+    # Good vs suspect
+    good = (Q_flag[valid] == 0) & (SSC_flag[valid] == 0)
+    suspect = (SSC_flag[valid] == 2)
+
+    fig, axes = plt.subplots(
+        2, 1,
+        figsize=(7, 9),
+        gridspec_kw={"height_ratios": [3, 1]},
+        sharex=False
+    )
+
+    # =========================
+    # Panel A: SSC–Q log–log
+    # =========================
+    ax = axes[0]
+
+    ax.scatter(
+        logQ[good], logSSC[good],
+        s=20, c="tab:blue", alpha=0.7, label="Good"
+    )
+    ax.scatter(
+        logQ[suspect], logSSC[suspect],
+        s=20, c="tab:red", alpha=0.7, label="Suspect"
+    )
+
+    # Envelope lines
+    x_line = np.linspace(logQ.min(), logQ.max(), 200)
+    y_mid = coef[0] * x_line + coef[1]
+    y_low = y_mid + ssc_q_bounds["lower"]
+    y_up = y_mid + ssc_q_bounds["upper"]
+
+    ax.plot(x_line, y_mid, "k-", lw=2, label="Median trend")
+    ax.plot(x_line, y_low, "k--", lw=1)
+    ax.plot(x_line, y_up, "k--", lw=1)
+
+    ax.set_xlabel("log10(Q) [m³/s]")
+    ax.set_ylabel("log10(SSC) [mg/L]")
+    ax.legend(frameon=False)
+    ax.set_title(f"SSC–Q diagnostic: {station_name} ({station_id})")
+
+    # =========================
+    # Panel B: Residual vs time
+    # =========================
+    ax2 = axes[1]
+
+    ax2.scatter(
+        time[valid][good], resid[good],
+        s=15, c="tab:blue", alpha=0.7
+    )
+    ax2.scatter(
+        time[valid][suspect], resid[suspect],
+        s=15, c="tab:red", alpha=0.7
+    )
+
+    ax2.axhline(0, color="k", lw=1)
+    ax2.axhline(ssc_q_bounds["lower"], color="k", ls="--")
+    ax2.axhline(ssc_q_bounds["upper"], color="k", ls="--")
+
+    ax2.set_ylabel("Residual (log SSC)")
+    ax2.set_xlabel("Time")
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
+
+
 
 #=====================================
 # summary CSV generation

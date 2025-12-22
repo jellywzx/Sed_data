@@ -22,15 +22,30 @@ import pandas as pd
 import numpy as np
 import netCDF4 as nc
 from datetime import datetime
+import sys
+import xarray as xr
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic
+)
+
 
 # --- Configuration ---
 
 # File paths
 # Note: These paths are relative to the script's execution directory.
 # The script assumes it is run from /Users/zhongwangwei/Downloads/Sediment/Script/Dataset/Chao_Phraya_River/
-SOURCE_DATA_PATH = "../../../Source/Chao_Phraya_River/Chao_Phraya_River.tab"
-OUTPUT_DIR = "../../../Output_r/annually_climatology/Chao_Phraya_River"
-SUMMARY_DIR = "../../../Output_r/annually_climatology/Chao_Phraya_River"
+SOURCE_DATA_PATH = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Chao_Phraya_River/Chao_Phraya_River.tab"
+OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
+SUMMARY_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
 
 
 # Constants for unit conversion
@@ -115,21 +130,66 @@ def convert_units_and_calculate_ssc(df):
     return df
 
 def assign_quality_flags(df):
-    """Assigns quality flags to Q, SSC, and SSL."""
-    df['Q_flag'] = 9
-    df.loc[df['Q'].notna(), 'Q_flag'] = 0
-    df.loc[df['Q'] < Q_MIN_THRESHOLD, 'Q_flag'] = 3
-    df.loc[df['Q'] == 0, 'Q_flag'] = 2
-
-    df['SSC_flag'] = 9
-    df.loc[df['SSC'].notna(), 'SSC_flag'] = 0
-    df.loc[df['SSC'] < SSC_MIN_THRESHOLD, 'SSC_flag'] = 3
-    df.loc[df['SSC'] > SSC_MAX_THRESHOLD, 'SSC_flag'] = 2
-
-    df['SSL_flag'] = 9
-    df.loc[df['SSL'].notna(), 'SSL_flag'] = 0
-    df.loc[df['SSL'] < SSL_MIN_THRESHOLD, 'SSL_flag'] = 3
+    df['Q_flag']   = [apply_quality_flag(v, 'Q')   for v in df['Q'].values]
+    df['SSC_flag'] = [apply_quality_flag(v, 'SSC') for v in df['SSC'].values]
+    df['SSL_flag'] = [apply_quality_flag(v, 'SSL') for v in df['SSL'].values]
     return df
+
+def apply_station_level_qc(station_df):
+    """
+    Apply log-IQR and SSC–Q consistency QC using tool.py only.
+    """
+
+    Q = station_df['Q'].values.astype(float)
+    SSC = station_df['SSC'].values.astype(float)
+    SSL = station_df['SSL'].values.astype(float)
+
+    Q_flag = station_df['Q_flag'].values.astype(np.int8)
+    SSC_flag = station_df['SSC_flag'].values.astype(np.int8)
+    SSL_flag = station_df['SSL_flag'].values.astype(np.int8)
+
+    # ---------- log-IQR bounds ----------
+    ssc_low, ssc_high = compute_log_iqr_bounds(SSC)
+    ssl_low, ssl_high = compute_log_iqr_bounds(SSL)
+
+    # ---------- SSC–Q envelope ----------
+    ssc_q_bounds = build_ssc_q_envelope(
+        Q_m3s=Q,
+        SSC_mgL=SSC,
+        k=1.5
+    )
+
+    # ---------- point-wise QC ----------
+    for i in range(len(station_df)):
+
+        # log-IQR (SSC)
+        if SSC_flag[i] == 0 and ssc_low and ssc_high:
+            if SSC[i] < ssc_low or SSC[i] > ssc_high:
+                SSC_flag[i] = 2
+
+        # log-IQR (SSL)
+        if SSL_flag[i] == 0 and ssl_low and ssl_high:
+            if SSL[i] < ssl_low or SSL[i] > ssl_high:
+                SSL_flag[i] = 2
+
+        # SSC–Q consistency
+        inconsistent, _ = check_ssc_q_consistency(
+            Q=Q[i],
+            SSC=SSC[i],
+            Q_flag=Q_flag[i],
+            SSC_flag=SSC_flag[i],
+            ssc_q_bounds=ssc_q_bounds
+        )
+
+        if inconsistent and SSC_flag[i] == 0:
+            SSC_flag[i] = 2
+
+    station_df['Q_flag'] = Q_flag
+    station_df['SSC_flag'] = SSC_flag
+    station_df['SSL_flag'] = SSL_flag
+
+    return station_df
+
 
 def create_netcdf_file(station_id, event_id, meta, data, output_dir):
     """Creates a CF-1.8 compliant NetCDF file for a station."""
@@ -324,6 +384,41 @@ def main():
     for event, meta in stations.items():
         if event in stations_with_sediment:
             station_data = df[df['event'] == event].copy()
+            station_data = apply_station_level_qc(station_data)
+
+            # =========================
+            # SSC–Q diagnostic plot
+            # =========================
+            diag_dir = os.path.join(OUTPUT_DIR, "diagnostic")
+            os.makedirs(diag_dir, exist_ok=True)
+
+            diag_png = os.path.join(
+                diag_dir,
+                f"SSC_Q_{meta['station_id'].replace('.', '_')}.png"
+            )
+
+            # 重新构建 envelope（station-level）
+            ssc_q_bounds = build_ssc_q_envelope(
+                Q_m3s=station_data['Q'].values,
+                SSC_mgL=station_data['SSC'].values,
+                k=1.5
+            )
+
+            plot_ssc_q_diagnostic(
+                time=pd.to_datetime(station_data['year'], format='%Y'),
+                Q=station_data['Q'].values,
+                SSC=station_data['SSC'].values,
+                Q_flag=station_data['Q_flag'].values,
+                SSC_flag=station_data['SSC_flag'].values,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=meta['station_id'],
+                station_name=meta['river'],
+                out_png=diag_png
+            )
+
+            df.loc[station_data.index, ['Q_flag','SSC_flag','SSL_flag']] = \
+                station_data[['Q_flag','SSC_flag','SSL_flag']]
+
             # Truncate time
             valid_indices = station_data['Q'].notna() | station_data['SSL'].notna()
             if not valid_indices.any():
