@@ -4,21 +4,95 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+import os
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
 
-def get_flag(value, thresholds, meanings):
-    if pd.isna(value):
-        return meanings.split().index('missing_data')
-    if value < thresholds.get('negative', -float('inf')):
-        return meanings.split().index('bad_data')
-    if value == thresholds.get('zero', -1):
-        return meanings.split().index('suspect_data')
-    if value > thresholds.get('extreme', float('inf')):
-        return meanings.split().index('suspect_data')
-    return meanings.split().index('good_data')
+
+def apply_tool_qc_yajiang(df, station_id, diagnostic_dir=None):
+    """
+    Unified QC for Yajiang daily Q and SSC using tool.py
+    """
+
+    out = df.copy()
+
+    # --------------------------------------------------
+    # 1. Physical validity (tool.py)
+    # --------------------------------------------------
+    if 'Q' in out.columns:
+        out['Q_flag'] = np.array(
+            [apply_quality_flag(v, "Q") for v in out['Q'].values],
+            dtype=np.int8
+        )
+        # Bad data → NaN
+        out.loc[out['Q_flag'] == 3, 'Q'] = np.nan
+    
+    if 'SSC' in out.columns:
+        out['SSC_flag'] = np.array(
+            [apply_quality_flag(v, "SSC") for v in out['SSC'].values],
+            dtype=np.int8
+        )
+        # Bad data → NaN
+        out.loc[out['SSC_flag'] == 3, 'SSC'] = np.nan
+
+    # --------------------------------------------------
+    # 2. log-IQR screening (observed variables only)
+    # --------------------------------------------------
+    for var in ['Q', 'SSC']:
+        if var in out.columns:
+            vals = out[var].values
+            lower, upper = compute_log_iqr_bounds(vals)
+            if (lower is not None) and (upper is not None):
+                out.loc[(vals < lower) | (vals > upper), f'{var}_flag'] = 2
+
+
+    # --------------------------------------------------
+    # 3. SSC–Q consistency check (only if both exist)
+    # --------------------------------------------------
+    if 'Q' in out.columns and 'SSC' in out.columns:
+        envelope = build_ssc_q_envelope(out['Q'].values, out['SSC'].values)
+
+        if envelope is not None:
+            inconsistent = check_ssc_q_consistency(
+                out['Q'].values,
+                out['SSC'].values,
+                envelope
+            )
+            out.loc[inconsistent, 'SSC_flag'] = 2
+
+            if diagnostic_dir is not None:
+                diagnostic_dir.mkdir(parents=True, exist_ok=True)
+                plot_ssc_q_diagnostic(
+                    Q=out['Q'].values,
+                    SSC=out['SSC'].values,
+                    SSC_flag=out['SSC_flag'].values,
+                    envelope=envelope,
+                    station_name=f"Yajiang_{station_id}",
+                    save_path=diagnostic_dir / f"SSC_Q_Yajiang_{station_id}.png"
+                )
+
+    return out
+
+
 
 def process_yajiang():
-    input_dir = Path("/Users/zhongwangwei/Downloads/Sediment/Output/daily/Yajiang")
-    output_dir = Path("/Users/zhongwangwei/Downloads/Sediment/Output_r/daily/Yajiang")
+    input_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Yajiang/nc")
+    output_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Yajiang/qc")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_station_summary_data = []
@@ -36,37 +110,84 @@ def process_yajiang():
 
         df = ds.to_dataframe()
 
+        # Handle case where index is MultiIndex (time, lat, lon) -> extract time and reset index
+        if isinstance(df.index, pd.MultiIndex):
+            time_index = df.index.get_level_values('time')
+            # Convert to datetime if needed
+            if not pd.api.types.is_datetime64_any_dtype(time_index):
+                try:
+                    time_index = pd.to_datetime(time_index)
+                except:
+                    pass
+            df = df.reset_index(drop=False)
+            df.index = time_index
+        
         # Unit conversion and calculation
-        if 'discharge' in df:
+        if 'Q' in df:
+            pass  # Q already in m³/s
+        elif 'discharge' in df:
             df['Q'] = df['discharge']
-        if 'ssc' in df:
-            df['SSC'] = df['ssc'] # Already in mg/L
+        
+        if 'SSC' in df:
+            pass  # SSC already in g/L
+        elif 'ssc' in df:
+            df['SSC'] = df['ssc']
+        
         if 'Q' in df and 'SSC' in df:
             df['SSL'] = df['Q'] * df['SSC'] * 0.0864
 
-        # Time cropping
+        # Time cropping - allow processing with either Q or SSC
         subset_cols = [col for col in ['Q', 'SSC'] if col in df.columns]
+        if not subset_cols:
+            print(f"  Skipping station {station_id}: No Q or SSC data.")
+            continue
+        
         valid_data = df.dropna(subset=subset_cols, how='all')
         if valid_data.empty:
             print(f"  Skipping station {station_id}: No valid data.")
             continue
         start_date = valid_data.index.min()
         end_date = valid_data.index.max()
-        date_index = pd.date_range(start=f"{start_date.year}-01-01", end=f"{end_date.year}-12-31", freq='D')
-        df = df.reindex(date_index)
+        
+        # Convert timestamp to datetime if needed
+        if isinstance(start_date, (tuple, np.ndarray)):
+            start_date = pd.Timestamp(start_date).to_pydatetime().date()
+        if isinstance(end_date, (tuple, np.ndarray)):
+            end_date = pd.Timestamp(end_date).to_pydatetime().date()
 
-        # QC Flags
-        q_thresholds = {'negative': 0, 'zero': 0, 'extreme': 15000}
-        ssc_thresholds = {'negative': 0, 'extreme': 3000}
-        ssl_thresholds = {'negative': 0}
-        flag_meanings = "good_data suspect_data bad_data missing_data"
+        # --------------------------------------------------
+        # Apply unified QC (tool.py)
+        # --------------------------------------------------
+        diagnostic_dir = output_dir / "diagnostic"
 
-        if 'Q' in df:
-            df['Q_flag'] = df['Q'].apply(lambda x: get_flag(x, q_thresholds, flag_meanings))
-        if 'SSC' in df:
-            df['SSC_flag'] = df['SSC'].apply(lambda x: get_flag(x, ssc_thresholds, flag_meanings))
-        if 'SSL' in df:
-            df['SSL_flag'] = df['SSL'].apply(lambda x: get_flag(x, ssl_thresholds, flag_meanings))
+        df = apply_tool_qc_yajiang(
+            df,
+            station_id=station_id,
+            diagnostic_dir=diagnostic_dir
+        )
+
+        # --------------------------------------------------
+        # Calculate SSL AFTER QC (derived variable)
+        # --------------------------------------------------
+        if 'Q' in df.columns and 'SSC' in df.columns:
+            df['SSL'] = df['Q'] * df['SSC'] * 0.0864
+            df['SSL_flag'] = FILL_VALUE_INT
+            # Only mark SSL as good if both Q and SSC are good
+            valid_ssl = (
+                (df['Q_flag'] == 0) &
+                (df['SSC_flag'] == 0) &
+                df['SSL'].notna()
+            )
+            df.loc[valid_ssl, 'SSL_flag'] = 0
+        elif 'Q' in df.columns:
+            # Only Q available - mark Q_flag as FILL if missing
+            if 'Q_flag' not in df.columns:
+                df['Q_flag'] = FILL_VALUE_INT
+        elif 'SSC' in df.columns:
+            # Only SSC available - mark SSC_flag as FILL if missing
+            if 'SSC_flag' not in df.columns:
+                df['SSC_flag'] = FILL_VALUE_INT
+
 
         # Create new xarray Dataset
         new_ds = xr.Dataset()
@@ -89,14 +210,47 @@ def process_yajiang():
                 if f'{var_key}_flag' in df.columns:
                     new_ds[f'{var_key}_flag'] = ('time', df[f'{var_key}_flag'].astype(np.byte).values)
                     new_ds[f'{var_key}_flag'].attrs = {
-                        'long_name': f'Quality flag for {attrs["long_name"]}', '_FillValue': -127,
-                        'flag_values': np.array([0, 1, 2, 3], dtype=np.byte), 'flag_meanings': flag_meanings,
-                        'comment': "Flag definitions: 0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data"
+                        'long_name': f'Quality flag for {attrs["long_name"]}',
+                        '_FillValue': FILL_VALUE_INT,
+                        'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.int8),
+                        'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
                     }
 
+
         # Coordinates and other metadata
-        new_ds['lat'] = ((), ds.latitude.item())
-        new_ds['lon'] = ((), ds.longitude.item())
+        # Get lat/lon from global attributes or variables
+        lat = np.nan
+        lon = np.nan
+        
+        # Try to get from variables first
+        if 'latitude' in ds.data_vars:
+            try:
+                lat = float(ds.latitude.item())
+            except:
+                pass
+        if 'longitude' in ds.data_vars:
+            try:
+                lon = float(ds.longitude.item())
+            except:
+                pass
+        
+        # If not found in variables, get from global attributes
+        if np.isnan(lat) and 'lat' in ds.attrs:
+            try:
+                lat = float(ds.attrs['lat'])
+            except:
+                pass
+        if np.isnan(lon) and 'lon' in ds.attrs:
+            try:
+                lon = float(ds.attrs['lon'])
+            except:
+                pass
+        
+        # Add as variables to output dataset
+        new_ds['lat'] = ((), lat)
+        new_ds['lon'] = ((), lon)
+        new_ds['lat'].attrs = {'long_name': 'station latitude', 'standard_name': 'latitude', 'units': 'degrees_north'}
+        new_ds['lon'].attrs = {'long_name': 'station longitude', 'standard_name': 'longitude', 'units': 'degrees_east'}
         new_ds['altitude'] = ((), ds.altitude.item() if 'altitude' in ds else np.nan)
         new_ds['upstream_area'] = ((), np.nan) # Not available
 
@@ -104,7 +258,7 @@ def process_yajiang():
         new_ds.attrs = {
             'title': 'Harmonized Global River Discharge and Sediment',
             'Data_Source_Name': 'Yajiang Dataset',
-            'station_name': ds.attrs.get('station_name_english', 'N/A'),
+            'station_name': ds.attrs.get('station_name', 'N/A'),
             'river_name': 'Yarlung Tsangpo River',
             'Source_ID': station_id,
             'Type': 'In-situ station data',
@@ -124,6 +278,7 @@ def process_yajiang():
         # Save to NetCDF
         output_file = output_dir / f'Yajiang_{station_id}.nc'
         new_ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': f'days since {start_date.year}-01-01'}})
+
 
         # Summary for CSV
         for var_key in ['Q', 'SSC', 'SSL']:

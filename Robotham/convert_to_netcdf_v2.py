@@ -21,8 +21,29 @@ from datetime import datetime
 import os
 import sys
 import argparse
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
+
 
 # --- Configuration ---
+
+# WSL format absolute paths
+DEFAULT_SOURCE_DIR = '/mnt/d/sediment_wzx_1111/Source/Robotham/data'
+DEFAULT_OUTPUT_DIR = '/mnt/d/sediment_wzx_1111/Output_r/daily/Robotham'
 
 # Station metadata
 STATIONS = {
@@ -104,44 +125,62 @@ def truncate_time_range(df):
     print(f"  Truncating data from {start_date.date()} to {end_date.date()}")
     return df.loc[start_date:end_date]
 
-def apply_quality_control(df):
-    """Applies QC checks and creates flag variables."""
-    print("  Applying quality control...")
-    df_qc = df.copy()
+def apply_tool_qc(df):
+    """
+    Apply unified QC using tool.py for Robotham et al. dataset.
+    Includes:
+    - Physical validity
+    - log-IQR outlier detection
+    - SSC–Q consistency check
+    """
 
-    # --- Flag definitions ---
-    # 0: Good data
-    # 2: Suspect data (e.g., zero flow, extreme value)
-    # 3: Bad data (e.g., negative value)
-    # 9: Missing in source (NaN)
+    out = df.copy()
 
-    # Initialize flags to 0 (Good data)
-    df_qc['Q_flag'] = 0
-    df_qc['SSC_flag'] = 0
+    # =========================
+    # 1. Physical QC
+    # =========================
+    out['Q_flag'] = np.array(
+        [apply_quality_flag(v, "Q") for v in out['Q'].values],
+        dtype=np.int8
+    )
+    out['SSC_flag'] = np.array(
+        [apply_quality_flag(v, "SSC") for v in out['SSC'].values],
+        dtype=np.int8
+    )
 
-    # --- Discharge (Q) QC ---
-    # Mark NaN values as missing
-    df_qc.loc[df_qc['Q'].isna(), 'Q_flag'] = 9
-    # Mark negative values as bad
-    df_qc.loc[df_qc['Q'] < 0, 'Q_flag'] = 3
-    # Mark zero values as suspect
-    df_qc.loc[df_qc['Q'] == 0, 'Q_flag'] = 2
+    # Bad data → NaN
+    out.loc[out['Q_flag'] == 3, 'Q'] = np.nan
+    out.loc[out['SSC_flag'] == 3, 'SSC'] = np.nan
 
-    # --- SSC QC ---
-    # Mark NaN values as missing
-    df_qc.loc[df_qc['SSC'].isna(), 'SSC_flag'] = 9
-    # Mark negative values as bad
-    df_qc.loc[df_qc['SSC'] < 0, 'SSC_flag'] = 3
-    # Mark extreme high values as suspect
-    df_qc.loc[df_qc['SSC'] > 3000, 'SSC_flag'] = 2
-    # Mark extreme high values for Q as suspect
-    df_qc.loc[df_qc['Q'] > 100, 'Q_flag'] = 2
+    # =========================
+    # 2. log-IQR screening
+    # =========================
+    for var in ['Q', 'SSC']:
+        data = out[var].values
+        lower, upper = compute_log_iqr_bounds(data)
+        if lower is not None:
+            out.loc[(data < lower) | (data > upper), f'{var}_flag'] = 2
 
-    # Set data values with bad flags to NaN
-    df_qc.loc[df_qc['Q_flag'] == 3, 'Q'] = np.nan
-    df_qc.loc[df_qc['SSC_flag'] == 3, 'SSC'] = np.nan
+    # =========================
+    # 3. SSC–Q consistency
+    # =========================
+    envelope = build_ssc_q_envelope(out['Q'].values, out['SSC'].values)
 
-    return df_qc
+    if envelope is not None:
+        for i in range(len(out)):
+            inconsistent, _ = check_ssc_q_consistency(
+                out['Q'].iloc[i],
+                out['SSC'].iloc[i],
+                out['Q_flag'].iloc[i],
+                out['SSC_flag'].iloc[i],
+                envelope
+            )
+            if inconsistent:
+                out.loc[out.index[i], 'SSC_flag'] = 2
+
+    return out, envelope
+
+
 
 def process_and_convert(df):
     """Resamples to daily, converts units, and calculates SSL."""
@@ -217,9 +256,10 @@ def create_netcdf(df, station_info, output_path, history_log):
         time = ds.createVariable('time', 'f8', ('time',))
         time.long_name = "time"
         time.standard_name = "time"
-        time.units = f"days since {df.index.min().strftime('%Y-%m-%d')} 00:00:00"
+        time.units = "days since 1970-01-01 00:00:00"
         time.calendar = "gregorian"
-        time[:] = (df.index - df.index.min()).total_seconds() / 86400.0
+        reference_date = pd.Timestamp('1970-01-01')
+        time[:] = (df.index - reference_date).total_seconds() / 86400.0
 
         lat = ds.createVariable('lat', 'f4', ())
         lat.long_name = "station latitude"
@@ -326,8 +366,10 @@ def calculate_summary_stats(df, station_info):
 def main():
     """Main processing function."""
     parser = argparse.ArgumentParser(description="Convert Robotham et al. (2022) data to NetCDF.")
-    parser.add_argument('--source_dir', required=True, help="Absolute path to the source data directory (e.g., '.../Source/Robotham/data')")
-    parser.add_argument('--output_dir', required=True, help="Absolute path to the target output directory (e.g., '.../Output_r/daily/Robotham')")
+    parser.add_argument('--source_dir', '-i', default=DEFAULT_SOURCE_DIR, 
+                        help=f"Absolute path to the source data directory (default: {DEFAULT_SOURCE_DIR})")
+    parser.add_argument('--output_dir', '-o', default=DEFAULT_OUTPUT_DIR, 
+                        help=f"Absolute path to the target output directory (default: {DEFAULT_OUTPUT_DIR})")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -356,8 +398,33 @@ def main():
             print("  Skipping station due to no valid data in the specified range.")
             continue
 
-        df_qc = apply_quality_control(df_truncated)
+        df_qc, envelope = apply_tool_qc(df_truncated)
+
+        # -----------------------------
+        # SSC–Q diagnostic plot
+        # -----------------------------
+        if envelope is not None:
+            fig_path = os.path.join(
+                args.output_dir,
+                "diagnostic",
+                f"SSC_Q_{info['Source_ID']}.png"
+            )
+            os.makedirs(os.path.dirname(fig_path), exist_ok=True)
+
+            plot_ssc_q_diagnostic(
+                time=df_qc.index.values,
+                Q=df_qc['Q'].values,
+                SSC=df_qc['SSC'].values,
+                Q_flag=df_qc['Q_flag'].values,
+                SSC_flag=df_qc['SSC_flag'].values,
+                ssc_q_bounds=envelope,
+                station_id=info['Source_ID'],
+                station_name=info['station_name'],
+                out_png=fig_path
+            )
+
         df_final = process_and_convert(df_qc)
+
 
         if df_final[['Q', 'SSC']].isna().all().all():
             print("  Skipping station as all Q and SSC data are NaN after processing.")
@@ -366,6 +433,16 @@ def main():
         # Create NetCDF
         output_nc_path = os.path.join(args.output_dir, f"Robotham_{info['Source_ID']}.nc")
         create_netcdf(df_final, info, output_nc_path, history_log)
+
+        # errors, warnings_nc = check_nc_completeness(output_nc_path, strict=False)
+
+        # if errors:
+        #     print(f"  ✗ NetCDF completeness check failed for {info['Source_ID']}")
+        #     for e in errors:
+        #         print(f"    ERROR: {e}")
+        #     os.remove(output_nc_path)
+        #     continue
+
 
         # Collect summary stats
         station_summaries.append(calculate_summary_stats(df_final, info))

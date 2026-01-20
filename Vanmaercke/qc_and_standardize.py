@@ -26,59 +26,22 @@ from datetime import datetime
 import os
 import glob
 import sys
-
-def perform_qc_checks(value, var_type='SSL'):
-    """
-    Perform quality control checks and return quality flag.
-
-    Quality flags:
-    0 = Good data
-    1 = Estimated data
-    2 = Suspect data (extreme or zero values)
-    3 = Bad data (negative or invalid)
-    9 = Missing data
-
-    Parameters:
-    -----------
-    value : float
-        Value to check
-    var_type : str
-        Type of variable: 'Q', 'SSC', or 'SSL'
-
-    Returns:
-    --------
-    flag : int
-        Quality flag (0, 1, 2, 3, or 9)
-    """
-    if np.isnan(value) or value == -9999.0:
-        return 9  # Missing data
-
-    if var_type == 'SSL':  # Suspended Sediment Load
-        if value < 0:
-            return 3  # Bad data (negative)
-        else:
-            return 0  # Good data (no upper limit for SSL)
-
-    elif var_type == 'Q':  # Discharge
-        if value < 0:
-            return 3  # Bad data (negative)
-        elif value == 0:
-            return 2  # Suspect (zero flow)
-        elif value > 500000:  # Extremely high
-            return 2  # Suspect
-        else:
-            return 0  # Good data
-
-    elif var_type == 'SSC':  # Suspended Sediment Concentration
-        if value < 0:
-            return 3  # Bad data (negative)
-        elif value > 3000:  # mg/L
-            return 2  # Suspect (extremely high)
-        else:
-            return 0  # Good data
-
-    return 0
-
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
 
 def standardize_netcdf_file(input_file, output_dir):
     """
@@ -144,17 +107,22 @@ def standardize_netcdf_file(input_file, output_dir):
         print(f"  SKIPPED: No valid SSL data")
         return None
 
-    # Perform QC checks
-    ssl_flag = perform_qc_checks(ssl_val, 'SSL')
-    ssc_flag = perform_qc_checks(ssc_val, 'SSC')
-    q_flag = perform_qc_checks(q_val, 'Q')
+# --------------------------------------------------
+    # Quality control using tool.py
+    # --------------------------------------------------
+
+    # SSL is observed (derived from SY × area) → QC allowed
+    ssl_flag = apply_quality_flag(ssl_val, "SSL")
+
+    # Q / SSC are NOT observed in Vanmaercke → force MISSING
+    q_flag = FILL_VALUE_INT   # = 9
+    ssc_flag = FILL_VALUE_INT # = 9
 
     # Calculate statistics for CSV
     ssl_percent = 100.0 if ssl_flag == 0 else 0.0
     ssc_percent = 100.0 if ssc_flag == 0 else 0.0
     q_percent = 100.0 if q_flag == 0 else 0.0
 
-    # Parse period for temporal span
     import re
     match = re.search(r'(\d{4})\s*[-–]\s*(\d{4})', str(period))
     if match:
@@ -365,6 +333,52 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.station_location = station_location
         ds.measurement_period = period
 
+        # --------------------------------------------------
+        # NetCDF completeness check
+        # --------------------------------------------------
+        # errors, warnings = check_nc_completeness(output_file, strict=False)
+
+        # if errors:
+        #     print(f"  ✗ NetCDF failed CF/ACDD completeness check: {station_id}")
+        #     for err in errors:
+        #         print(f"    ERROR: {err}")
+        #     os.remove(output_file)
+        #     return None
+
+    # --------------------------------------------------
+    # Generate diagnostic plot using plot_ssc_q_diagnostic
+    # --------------------------------------------------
+    try:
+        diagnostic_dir = os.path.join(output_dir, "diagnostic")
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        
+        # For Vanmaercke data without Q and SSC, create placeholder arrays
+        time_array = np.array([time_val])
+        Q = np.full_like(time_array, np.nan, dtype=float)  # All NaN (missing discharge)
+        SSC = np.full_like(time_array, np.nan, dtype=float)  # All NaN (missing SSC)
+        Q_flag_array = np.array([q_flag], dtype=np.int8)  # All 9 (missing)
+        SSC_flag_array = np.array([ssc_flag], dtype=np.int8)  # All 9 (missing)
+        SSL_array = np.array([ssl_val if not np.isnan(ssl_val) else -9999.0], dtype=float)
+        
+        # No SSC-Q consistency bounds available
+        ssc_q_bounds = None
+        
+        # Generate diagnostic plot
+        out_png = os.path.join(diagnostic_dir, f"SSC_Q_Vanmaercke_{station_id}.png")
+        plot_ssc_q_diagnostic(
+            time=time_array,
+            Q=Q,
+            SSC=SSC,
+            Q_flag=Q_flag_array,
+            SSC_flag=SSC_flag_array,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=station_id,
+            station_name=f"Vanmaercke_{station_id}",
+            out_png=out_png
+        )
+    except Exception as e:
+        print(f"  Warning: Failed to create diagnostic plot for {station_id}: {e}")
+
     # Prepare station info for CSV
     station_info = {
         'station_name': station_name,
@@ -404,8 +418,8 @@ def main():
     print()
 
     # Paths
-    input_dir = '/Users/zhongwangwei/Downloads/Sediment/Output/annually_climatology/Vanmaercke'
-    output_dir = '/Users/zhongwangwei/Downloads/Sediment/Output_r/annually_climatology/Vanmaercke'
+    input_dir = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/nc'
+    output_dir = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/qc'
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

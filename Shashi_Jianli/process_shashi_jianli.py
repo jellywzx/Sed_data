@@ -3,24 +3,118 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import json
-from datetime import datetime
+import os
 from pathlib import Path
+from datetime import datetime
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
 
-def get_flag(value, thresholds, meanings):
-    if pd.isna(value):
-        return meanings.split().index('missing_data')
-    if value < thresholds['negative']:
-        return meanings.split().index('bad_data')
-    if value == thresholds['zero']:
-        return meanings.split().index('suspect_data')
-    if value > thresholds['extreme']:
-        return meanings.split().index('suspect_data')
-    return meanings.split().index('good_data')
+def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
+    """
+    Unified QC for Shashi–Jianli using tool.py
+
+    Includes:
+    - Physical validity (apply_quality_flag)
+    - log-IQR outlier detection
+    - SSC–Q consistency
+    - Optional SSC–Q diagnostic plot
+    """
+
+    out = df.copy()
+
+    # ======================================================
+    # 1. Physical QC
+    # ======================================================
+    out['Q_flag'] = np.array(
+        [apply_quality_flag(v, "Q") for v in out['Q'].values],
+        dtype=np.int8
+    )
+    out['SSC_flag'] = np.array(
+        [apply_quality_flag(v, "SSC") for v in out['SSC'].values],
+        dtype=np.int8
+    )
+
+    # Bad data → NaN
+    out.loc[out['Q_flag'] == 3, 'Q'] = np.nan
+    out.loc[out['SSC_flag'] == 3, 'SSC'] = np.nan
+
+    # ======================================================
+    # 2. log-IQR screening
+    # ======================================================
+    for var in ['Q', 'SSC']:
+        values = out[var].values
+        lower, upper = compute_log_iqr_bounds(values)
+        if lower is not None:
+            out.loc[(values < lower) | (values > upper), f'{var}_flag'] = 2
+
+    # ======================================================
+    # 3. SSC–Q consistency
+    # ======================================================
+    envelope = build_ssc_q_envelope(out['Q'].values, out['SSC'].values)
+
+    if envelope is not None:
+        for i in range(len(out)):
+            inconsistent, _ = check_ssc_q_consistency(
+                out['Q'].iloc[i],
+                out['SSC'].iloc[i],
+                out['Q_flag'].iloc[i],
+                out['SSC_flag'].iloc[i],
+                envelope
+            )
+            if inconsistent:
+                out.loc[out.index[i], 'SSC_flag'] = 2
+
+        # --------------------------------------------------
+        # 4. Diagnostic plot
+        # --------------------------------------------------
+        if diagnostic_dir is not None:
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            fig_path = diagnostic_dir / f"SSC_Q_{station_id}.png"
+
+            plot_ssc_q_diagnostic(
+                time=out.index.values,
+                Q=out['Q'].values,
+                SSC=out['SSC'].values,
+                Q_flag=out['Q_flag'].values,
+                SSC_flag=out['SSC_flag'].values,
+                ssc_q_bounds=envelope,
+                station_id=station_id,
+                station_name=station_id,
+                out_png=str(fig_path)
+            )
+
+    # ======================================================
+    # 5. SSL & SSL_flag
+    # ======================================================
+    out['SSL'] = out['Q'] * out['SSC'] * 0.0864
+    out['SSL_flag'] = np.array(
+        [apply_quality_flag(v, "SSL") for v in out['SSL'].values],
+        dtype=np.int8
+    )
+    out.loc[out['SSL_flag'] == 3, 'SSL'] = np.nan
+
+    return out
+
 
 def process_shashi_jianli():
     # Define paths
-    source_dir = Path("/Users/zhongwangwei/Downloads/Sediment/Source/Shashi_Jianli")
-    output_dir = Path("/Users/zhongwangwei/Downloads/Sediment/Output_r/daily/Shashi_Jianli")
+    source_dir = Path("/mnt/d/sediment_wzx_1111/Source/Shashi_Jianli")
+    output_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Shashi_Jianli/qc")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load data
@@ -37,6 +131,10 @@ def process_shashi_jianli():
     summary_data = []
 
     for station_id, station_info in stations.items():
+        print(f"\n{'='*80}")
+        print(f"Processing station: {station_info['name']} ({station_id})")
+        print(f"{'='*80}")
+        
         df_station = df[['Date', f'{station_id}_discharge', f'{station_id}_SSC']].copy()
         df_station.columns = ['Date', 'Q', 'SSC_kg_m3']
         df_station['Date'] = pd.to_datetime(df_station['Date'])
@@ -49,22 +147,54 @@ def process_shashi_jianli():
         df_station.dropna(subset=['Q', 'SSC_kg_m3'], how='all', inplace=True)
 
         if df_station.empty:
+            print("  ✗ No data available for this station.")
             continue
 
+        print(f"  Original data points: {len(df_station)}")
+
         # Unit conversions
-        df_station['SSC'] = df_station['SSC_kg_m3'] * 1000  # kg/m3 to mg/L
-        df_station['SSL'] = df_station['Q'] * df_station['SSC_kg_m3'] * 86.4  # ton/day
+        df_station['SSC'] = df_station['SSC_kg_m3'] * 1000  # kg/m3 → mg/L
 
-        # QC Flags
-        q_thresholds = {'negative': 0, 'zero': 0, 'extreme': 120000}
-        ssc_thresholds = {'negative': 0, 'zero': -1, 'extreme': 10000} # No zero check for ssc
-        ssl_thresholds = {'negative': 0, 'zero': -1, 'extreme': float('inf')} # No zero/extreme check for ssl
+        # Apply QC to observed variables
+        df_station = apply_tool_qc_shashi(
+            df_station,
+            station_id=station_id,
+            diagnostic_dir=output_dir / "diagnostic"
+        )
 
-        flag_meanings = "good_data suspect_data bad_data missing_data"
-        
-        df_station['Q_flag'] = df_station['Q'].apply(lambda x: get_flag(x, q_thresholds, flag_meanings))
-        df_station['SSC_flag'] = df_station['SSC'].apply(lambda x: get_flag(x, ssc_thresholds, flag_meanings))
-        df_station['SSL_flag'] = df_station['SSL'].apply(lambda x: get_flag(x, ssl_thresholds, flag_meanings))
+        # --------------------------------------------------
+        # SSL is a derived variable → calculated AFTER QC
+        # --------------------------------------------------
+        df_station['SSL'] = df_station['Q'] * df_station['SSC'] * 0.0864
+
+        # SSL flag: derived from inputs
+        df_station['SSL_flag'] = np.where(
+            df_station['SSL'].isna(),
+            FILL_VALUE_INT,
+            0
+        ).astype(np.int8)
+
+        # Print QC results
+        print("\n  Quality Control Results:")
+        for var in ['Q', 'SSC', 'SSL']:
+            flag_col = f'{var}_flag'
+            good = (df_station[flag_col] == 0).sum()
+            suspect = (df_station[flag_col] == 2).sum()
+            bad = (df_station[flag_col] == 3).sum()
+            missing = (df_station[flag_col] == FILL_VALUE_INT).sum()
+            total = len(df_station)
+            
+            good_pct = 100.0 * good / total if total > 0 else 0.0
+            suspect_pct = 100.0 * suspect / total if total > 0 else 0.0
+            bad_pct = 100.0 * bad / total if total > 0 else 0.0
+            missing_pct = 100.0 * missing / total if total > 0 else 0.0
+            
+            print(f"    {var}:")
+            print(f"      Total:     {total:6d} ({100.0:5.1f}%)")
+            print(f"      Good:      {good:6d} ({good_pct:5.1f}%)")
+            print(f"      Suspect:   {suspect:6d} ({suspect_pct:5.1f}%)")
+            print(f"      Bad:       {bad:6d} ({bad_pct:5.1f}%)")
+            print(f"      Missing:   {missing:6d} ({missing_pct:5.1f}%)")
 
         # Time cropping
         valid_data = df_station.dropna(subset=['Q', 'SSC_kg_m3'], how='all')
@@ -108,7 +238,7 @@ def process_shashi_jianli():
                 'long_name': f'Quality flag for {attrs["long_name"]}',
                 '_FillValue': -127,
                 'flag_values': np.array([0, 1, 2, 3], dtype=np.byte),
-                'flag_meanings': flag_meanings,
+                'flag_meanings': 'good_data suspect_data bad_data missing_data',
                 'comment': "Flag definitions: 0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data"
             }
 
@@ -142,6 +272,7 @@ def process_shashi_jianli():
         # Save to NetCDF
         output_file = output_dir / f'Shashi_Jianli_{station_id}.nc'
         ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': f'days since {start_date.year}-01-01'}})
+        print(f"\n  ✓ NetCDF file created: {output_file}")
 
         # Summary data for CSV
         for var in ['Q', 'SSC', 'SSL']:
@@ -168,7 +299,10 @@ def process_shashi_jianli():
     summary_df = pd.DataFrame(summary_data)
     summary_df.to_csv(output_dir / 'Shashi_Jianli_station_summary.csv', index=False)
     
+    print("\n" + "="*80)
     print("Processing complete.")
+    print(f"Summary CSV saved: {output_dir / 'Shashi_Jianli_station_summary.csv'}")
+    print("="*80)
 
 if __name__ == '__main__':
     process_shashi_jianli()

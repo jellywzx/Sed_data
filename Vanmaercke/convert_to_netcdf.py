@@ -12,6 +12,10 @@ import os
 import re
 from pathlib import Path
 
+# --- Absolute paths (WSL format) ---
+SOURCE_DIR = '/mnt/d/sediment_wzx_1111/Source/Vanmaercke'
+OUTPUT_DIR = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/nc'
+
 def parse_measurement_period(mp_str):
     """
     Parse measurement period string to extract start and end years
@@ -231,12 +235,13 @@ def main():
     print("="*60)
 
     # Create output directory
-    output_dir = Path('done')
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Read Excel file
-    print("\nReading sediment.xlsx...")
-    df = pd.read_excel('sediment.xlsx', sheet_name='Table 1', skiprows=17)
+    source_file = Path(SOURCE_DIR) / 'sediment.xlsx'
+    print(f"\nReading {source_file}...")
+    df = pd.read_excel(source_file, sheet_name='Table 1', skiprows=17)
 
     print(f"Total stations in dataset: {len(df)}")
 

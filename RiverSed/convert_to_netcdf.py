@@ -11,6 +11,29 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
+
+# --- Absolute paths (WSL format) ---
+SOURCE_DIR = "C:\\Users\\fzjxw\\Desktop\\sediment_wzx_1111\\Source\\RiverSed"
+
+OUTPUT_DIR = 'C:\\Users\\fzjxw\\Desktop\\sediment_wzx_1111\\Output_r\\daily\\RiverSed\\nc'
 
 def load_aquasat_data(file_path):
     """Load Aquasat TSS data"""
@@ -70,6 +93,67 @@ def create_daily_timeseries(start_date, end_date):
     """Create daily time series"""
     return pd.date_range(start=start_date, end=end_date, freq='D')
 
+def apply_satellite_ssc_qc(df, station_id, diagnostic_dir=None):
+    """
+    QC for satellite-only SSC (TSS) data using tool.py
+
+    Rules:
+    - Physical validity (apply_quality_flag)
+    - log-IQR outlier screening
+    - NO SSC–Q consistency (no discharge)
+    """
+
+    ssc = df['tss'].values.astype(float)
+
+    # -----------------------------
+    # 1. Physical QC
+    # -----------------------------
+    ssc_flag = np.array(
+        [apply_quality_flag(v, "SSC") for v in ssc],
+        dtype=np.int8
+    )
+
+    # -----------------------------
+    # 2. log-IQR screening
+    # -----------------------------
+    lower, upper = compute_log_iqr_bounds(ssc)
+
+    if lower is not None:
+        outlier = (ssc < lower) | (ssc > upper)
+        ssc_flag[outlier] = 2  # suspect
+
+    # -----------------------------
+    # 3. Mask bad data
+    # -----------------------------
+    ssc_clean = ssc.copy()
+    ssc_clean[ssc_flag == 3] = np.nan  # bad → NaN
+
+    df['tss'] = ssc_clean
+    df['SSC_flag'] = ssc_flag
+
+    # 至少保留一个非缺测值
+    if np.all(np.isnan(df['tss'].values)):
+        print(f"  -> All SSC invalid after QC for station {station_id}")
+        return None
+
+    # Generate diagnostic plot using plot_ssc_q_diagnostic
+    # Note: For satellite data without Q, ssc_q_bounds will be None and plot will be skipped
+    if diagnostic_dir is not None:
+        try:
+            diagnostic_dir = Path(diagnostic_dir)
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            
+            # For satellite data without Q, we cannot generate SSC-Q consistency plots
+            # since ssc_q_bounds = None causes plot_ssc_q_diagnostic to return early
+            # This is expected behavior for satellite-only data
+            pass
+            
+        except Exception as e:
+            print(f"  Warning: Failed to create diagnostic plot for {station_id}: {e}")
+
+    return df
+
+
 def create_netcdf_file(station_id, tss_df, output_dir):
     """Create netCDF file following HYBAM format"""
 
@@ -85,17 +169,25 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         print(f"  No valid dates for station {station_id}")
         return False
 
-    # Create daily time series
-    daily_dates = create_daily_timeseries(start_date, end_date)
+    # 只保留有数据的日期（按日平均）
+    tss_df['date'] = pd.to_datetime(tss_df['date'], errors='coerce')
+    tss_df = tss_df.dropna(subset=['date'])
+    tss_df['date'] = tss_df['date'].dt.floor('D')
 
-    # Aggregate multiple observations per day to daily mean
-    tss_daily = tss_df.groupby('date')['tss'].mean().reset_index()
+    tss_daily = tss_df.groupby('date', as_index=False)['tss'].mean()
 
-    # Create daily dataframe
-    daily_df = pd.DataFrame({'date': daily_dates})
+    # 只保留有数据的时间点（不补全）
+    daily_df = tss_daily.sort_values('date').reset_index(drop=True)
 
-    # Merge TSS data (keep all daily dates, fill with NaN where no TSS data)
-    daily_df = daily_df.merge(tss_daily, on='date', how='left')
+    # -----------------------------
+    # Apply QC using tool.py
+    # -----------------------------
+    diagnostic_dir = Path(output_dir) / "diagnostic"
+    daily_df = apply_satellite_ssc_qc(daily_df, station_id, diagnostic_dir=diagnostic_dir)
+
+    if daily_df is None:
+        return False
+
 
     # Get metadata (use first non-null values)
     latitude = tss_df['lat'].dropna().iloc[0] if 'lat' in tss_df.columns and not tss_df['lat'].dropna().empty else np.nan
@@ -152,30 +244,54 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         area_var[:] = -9999.0
 
         # Create data variables
-        discharge_var = ds.createVariable('discharge', 'f4', ('time',), fill_value=-9999.0)
-        discharge_var.standard_name = 'water_volume_transport_in_river_channel'
-        discharge_var.long_name = 'river discharge'
-        discharge_var.units = 'm3 s-1'
-        discharge_var.coordinates = 'time latitude longitude'
-        discharge_var.comment = 'Discharge data not available - all values set to missing'
+        Q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
+        Q_var.standard_name = 'water_volume_transport_in_river_channel'
+        Q_var.long_name = 'river discharge'
+        Q_var.units = 'm3 s-1'
+        Q_var.coordinates = 'time latitude longitude'
+        Q_var.comment = 'Discharge data not available - all values set to missing'
         # Set all discharge to fill value (NaN equivalent)
-        discharge_var[:] = -9999.0
+        Q_var[:] = -9999.0
 
-        ssc_var = ds.createVariable('ssc', 'f4', ('time',), fill_value=-9999.0)
-        ssc_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
-        ssc_var.long_name = 'suspended sediment concentration'
-        ssc_var.units = 'mg L-1'
-        ssc_var.coordinates = 'time latitude longitude'
-        ssc_var.comment = 'TSS from satellite observations (Aquasat/RiverSed database)'
-        ssc_var[:] = daily_df['tss'].fillna(-9999.0).values
+        Q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
+        Q_flag_var.long_name = 'quality flag for river discharge'
+        Q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='b')
+        Q_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
+        Q_flag_var.comment = 'All set to 9 (missing) - discharge not available for satellite data'
+        Q_flag_var[:] = np.full(len(daily_df), FILL_VALUE_INT, dtype=np.int8)
 
-        sedload_var = ds.createVariable('sediment_load', 'f4', ('time',), fill_value=-9999.0)
-        sedload_var.long_name = 'suspended sediment load'
-        sedload_var.units = 'ton day-1'
-        sedload_var.coordinates = 'time latitude longitude'
-        sedload_var.comment = 'Cannot be calculated without discharge data - all values set to missing'
+        SSC_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=-9999.0)
+        SSC_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
+        SSC_var.long_name = 'suspended sediment concentration'
+        SSC_var.units = 'mg L-1'
+        SSC_var.coordinates = 'time latitude longitude'
+        SSC_var.comment = 'SSC from satellite observations (Aquasat/RiverSed database)'
+        SSC_var[:] = daily_df['tss'].fillna(-9999.0).values
+
+        SSC_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
+        SSC_flag_var.long_name = 'quality flag for suspended sediment concentration'
+        SSC_flag_var.flag_values = np.array([0, 2, 3, 9], dtype='b')
+        SSC_flag_var.flag_meanings = 'good_data suspect_data bad_data missing_data'
+        SSC_flag_var.comment = (
+            'QC applied using tool.py: physical validity + log-IQR outlier screening. '
+            'Satellite-derived SSC only; no SSC–Q consistency check.'
+        )
+        SSC_flag_var[:] = daily_df['SSC_flag'].values
+
+        SSL_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0)
+        SSL_var.long_name = 'suspended sediment load'
+        SSL_var.units = 'ton day-1'
+        SSL_var.coordinates = 'time latitude longitude'
+        SSL_var.comment = 'Cannot be calculated without discharge data - all values set to missing'
         # Set all sediment load to fill value
-        sedload_var[:] = -9999.0
+        SSL_var[:] = -9999.0
+
+        SSL_flag_var = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
+        SSL_flag_var.long_name = 'quality flag for suspended sediment load'
+        SSL_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='b')
+        SSL_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
+        SSL_flag_var.comment = 'All set to 9 (missing) - cannot be calculated without discharge'
+        SSL_flag_var[:] = np.full(len(daily_df), FILL_VALUE_INT, dtype=np.int8)
 
         # Global attributes
         ds.Conventions = 'CF-1.8'
@@ -189,17 +305,31 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         ds.data_period_start = start_date.strftime('%Y-%m-%d')
         ds.data_period_end = end_date.strftime('%Y-%m-%d')
 
+        # errors, warnings_nc = check_nc_completeness(output_file, strict=False)
+
+        # if errors:
+        #     print(f"  ✗ Completeness check failed for {station_id}")
+        #     for e in errors:
+        #         print(f"    ERROR: {e}")
+        #     os.remove(output_file)
+        #     return False
+
+        # if warnings_nc:
+        #     for w in warnings_nc:
+        #         print(f"    WARNING: {w}")
+
+
     print(f"  Created {output_file}")
     return True
 
 def main():
-    # Configuration
-    aquasat_file = 'Aquasat_TSS_v1.1.csv'
-    riversed_file = 'RiverSed_USA_V1.1.txt'
-    output_dir = 'done'
+    # Configuration with WSL absolute paths
+    aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
+    riversed_file = os.path.join(SOURCE_DIR, 'RiverSed_USA_V1.1.txt')
+    output_dir = OUTPUT_DIR
 
     # Create output directory
-    Path(output_dir).mkdir(exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Load data
     print("\n" + "="*80)
@@ -220,24 +350,37 @@ def main():
     aquasat_success = 0
     aquasat_failed = 0
 
-    for i, station_id in enumerate(aquasat_stations, 1):
-        if i % 100 == 0:
-            print(f"  Processed {i}/{len(aquasat_stations)} stations...")
-
-        # Get TSS data for this station
-        station_data = aquasat_df[aquasat_df['station_id'] == station_id].copy()
-
-        # Create netCDF file
-        success = create_netcdf_file(station_id, station_data, output_dir)
-
-        if success:
-            aquasat_success += 1
-        else:
-            aquasat_failed += 1
-
     print("\n" + "="*80)
-    print("PROCESSING RIVERSED STATIONS")
+    print("PROCESSING AQUASAT STATIONS")
     print("="*80)
+
+    aquasat_stations = aquasat_df['station_id'].unique()
+    print(f"Processing {len(aquasat_stations)} Aquasat stations...")
+
+    aquasat_success = 0
+    aquasat_failed = 0
+
+    with ProcessPoolExecutor() as executor:
+        futures = {
+            executor.submit(create_netcdf_file, station_id, aquasat_df[aquasat_df['station_id'] == station_id].copy(), output_dir): station_id
+            for station_id in aquasat_stations
+        }
+
+        for i, future in enumerate(as_completed(futures), 1):
+            station_id = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    aquasat_success += 1
+                else:
+                    aquasat_failed += 1
+            except Exception as e:
+                print(f"  Station {station_id} failed with error: {e}")
+                aquasat_failed += 1
+
+            if i % 100 == 0:
+                print(f"  Processed {i}/{len(aquasat_stations)} stations...")
+
 
     # For RiverSed, limit to stations with sufficient data
     riversed_station_counts = riversed_df.groupby('station_id').size()
@@ -247,20 +390,38 @@ def main():
     riversed_success = 0
     riversed_failed = 0
 
-    for i, station_id in enumerate(riversed_stations, 1):
-        if i % 1000 == 0:
-            print(f"  Processed {i}/{len(riversed_stations)} stations...")
+    print("\n" + "="*80)
+    print("PROCESSING RIVERSED STATIONS")
+    print("="*80)
 
-        # Get TSS data for this station
-        station_data = riversed_df[riversed_df['station_id'] == station_id].copy()
+    riversed_station_counts = riversed_df.groupby('station_id').size()
+    riversed_stations = riversed_station_counts[riversed_station_counts >= 5].index.tolist()
+    print(f"Processing {len(riversed_stations)} RiverSed stations (with at least 5 observations)...")
 
-        # Create netCDF file
-        success = create_netcdf_file(station_id, station_data, output_dir)
+    riversed_success = 0
+    riversed_failed = 0
 
-        if success:
-            riversed_success += 1
-        else:
-            riversed_failed += 1
+    with ProcessPoolExecutor() as executor:
+        futures = {
+            executor.submit(create_netcdf_file, station_id, riversed_df[riversed_df['station_id'] == station_id].copy(), output_dir): station_id
+            for station_id in riversed_stations
+        }
+
+        for i, future in enumerate(as_completed(futures), 1):
+            station_id = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    riversed_success += 1
+                else:
+                    riversed_failed += 1
+            except Exception as e:
+                print(f"  Station {station_id} failed with error: {e}")
+                riversed_failed += 1
+
+            if i % 1000 == 0:
+                print(f"  Processed {i}/{len(riversed_stations)} stations...")
+
 
     print("\n" + "="*80)
     print("SUMMARY")

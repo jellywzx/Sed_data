@@ -17,6 +17,24 @@ from datetime import datetime
 import os
 import warnings
 warnings.filterwarnings('ignore')
+import sys
+import argparse
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    # check_nc_completeness,
+    # add_global_attributes
+)
 
 # Station metadata based on NERC documentation
 # Reference: Heppell, C.M.; Binley, A. (2016). Hampshire Avon: Daily discharge, stage
@@ -67,59 +85,79 @@ def parse_date(date_str):
     except:
         return pd.NaT
 
-def apply_quality_checks(df):
+def apply_tool_qc(
+    time,
+    Q,
+    SSC,
+    SSL,
+    station_id,
+    station_name,
+    plot_dir=None,
+    ):
     """
-    Apply physical validity checks and set quality flags.
-
-    Flag definitions:
-    0 = Good data
-    1 = Estimated data
-    2 = Suspect data (zero/extreme values)
-    3 = Bad data (negative/invalid values)
-    9 = Missing data
-
-    Physical thresholds:
-    - Q: < 0 = bad, == 0 = suspect, > 1000 = suspect
-    - SSC: < 0 = bad, > 3000 mg/L = suspect
-    - SSL: < 0 = bad
+    Unified QC using tool.py:
+    - Physical validity (apply_quality_flag)
+    - log-IQR screening for Q and SSC
+    - SSC–Q hydrological consistency (if sample size allows)
     """
 
-    # Initialize flags
-    df['Q_flag'] = 9  # Default: missing
-    df['SSC_flag'] = 9
-    df['SSL_flag'] = 9
+    n = len(time)
 
-    # Q (discharge) flags
-    if 'Q' in df.columns:
-        # Good data (reasonable range)
-        df.loc[(df['Q'] > 0) & (df['Q'] <= 1000), 'Q_flag'] = 0
-        # Suspect: zero flow (could be legitimate)
-        df.loc[df['Q'] == 0, 'Q_flag'] = 2
-        # Suspect: extreme high values
-        df.loc[df['Q'] > 1000, 'Q_flag'] = 2
-        # Bad: negative values
-        df.loc[df['Q'] < 0, 'Q_flag'] = 3
-        # Missing values remain as 9
+    # -------------------------
+    # 1. Physical QC
+    # -------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
 
-    # SSC (sediment concentration) flags
-    if 'SSC' in df.columns:
-        # Good data (reasonable range)
-        df.loc[(df['SSC'] >= 0.1) & (df['SSC'] <= 3000), 'SSC_flag'] = 0
-        # Bad: negative values
-        df.loc[df['SSC'] < 0.1, 'SSC_flag'] = 3
-        # Suspect: extreme high values
-        df.loc[df['SSC'] > 3000, 'SSC_flag'] = 2
-        # Missing values remain as 9
+    # -------------------------
+    # 2. log-IQR screening
+    # -------------------------
+    q_bounds = compute_log_iqr_bounds(Q)
+    if q_bounds[0] is not None:
+        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
 
-    # SSL (sediment load) flags
-    if 'SSL' in df.columns:
-        # Good data (non-negative)
-        df.loc[df['SSL'] >= 0, 'SSL_flag'] = 0
-        # Bad: negative values
-        df.loc[df['SSL'] < 0, 'SSL_flag'] = 3
-        # Missing values remain as 9
+    ssc_bounds = compute_log_iqr_bounds(SSC)
+    if ssc_bounds[0] is not None:
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
 
-    return df
+    # -------------------------
+    # 3. SSC–Q consistency
+    # -------------------------
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            inconsistent, _ = check_ssc_q_consistency(
+                Q[i], SSC[i],
+                Q_flag[i], SSC_flag[i],
+                ssc_q_bounds
+            )
+            if inconsistent:
+                SSC_flag[i] = 2
+
+    # -------------------------
+    # 4. Keep valid rows
+    # -------------------------
+    valid = (
+        (Q_flag != FILL_VALUE_INT)
+        | (SSC_flag != FILL_VALUE_INT)
+        | (SSL_flag != FILL_VALUE_INT)
+    )
+
+    if not np.any(valid):
+        return None
+
+    return {
+        "time": time[valid],
+        "Q": Q[valid],
+        "SSC": SSC[valid],
+        "SSL": SSL[valid],
+        "Q_flag": Q_flag[valid],
+        "SSC_flag": SSC_flag[valid],
+        "SSL_flag": SSL_flag[valid],
+    }
+
 
 def calculate_SSL(Q, SSC):
     """
@@ -218,11 +256,29 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
 
     # Apply quality checks
     print("  Applying quality control checks...")
-    df = apply_quality_checks(df)
+    print("  Applying tool.py quality control...")
+
+    qc = apply_tool_qc(
+        time=df['date'].values,
+        Q=df['Q'].values,
+        SSC=df['SSC'].values,
+        SSL=df['SSL'].values,
+        station_id=metadata['Source_ID'],
+        station_name=metadata['station_name'],
+        plot_dir=os.path.join(output_dir, "diagnostic_plots"),
+    )
+
+    if qc is None:
+        warnings.warn(f"No valid data after QC for station {station_code}. Skipping.")
+        return None, None, None, None
+
+    df = pd.DataFrame(qc)
 
     # Convert dates to days since 1970-01-01
     reference_date = datetime(1970, 1, 1)
-    df['time'] = (df['date'] - pd.Timestamp(reference_date)).dt.total_seconds() / 86400
+    # df['time'] = (df['time'] - pd.Timestamp(reference_date)).dt.total_seconds() / 86400
+    df['time'] = (pd.to_datetime(df['date']) - pd.Timestamp(reference_date)).dt.total_seconds() / 86400.0
+
 
     # Get temporal span
     valid_dates = df['date'].dropna()
@@ -401,6 +457,21 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
 
     print(f"  Successfully created {output_file}")
 
+    # errors, warnings_nc = check_nc_completeness(output_file, strict=True)
+
+    # if errors:
+    #     print(f"  ✗ Completeness check FAILED for {station_code}")
+    #     for e in errors:
+    #         print(f"    ERROR: {e}")
+    #     os.remove(output_file)
+    #     return None, None, None, None
+
+    # if warnings_nc:
+    #     print(f"  ⚠ Completeness warnings for {station_code}")
+    #     for w in warnings_nc:
+    #         print(f"    WARNING: {w}")
+
+
     return df, metadata, start_date, end_date
 
 def generate_summary_csv(station_summaries, output_dir='Output'):
@@ -461,12 +532,21 @@ def main():
     print("CF-1.8 Compliant NetCDF Generation with Quality Control")
     print("="*70)
 
+    # parse command-line arguments for input/output directories
+    parser = argparse.ArgumentParser(description='Convert NERC CSVs to CF-1.8 NetCDF.')
+    parser.add_argument('--input-dir', '-i', default='/mnt/d/sediment_wzx_1111/Source/NERC/data', help='Input data directory containing CSV files (default: Source/NERC)')
+    parser.add_argument('--output-dir', '-o', default='/mnt/d/sediment_wzx_1111/Output_r/daily/NERC/qc', help='Output directory for NetCDF files (default: Output_r/daily/NERC/qc)')
+    args = parser.parse_args()
+
+    print(f"Using input directory: {args.input_dir}")
+    print(f"Using output directory: {args.output_dir}")
+
     station_codes = ['AS', 'CE', 'GA', 'GN']
     station_summaries = []
 
     for station_code in station_codes:
         try:
-            df, metadata, start_date, end_date = process_station(station_code)
+            df, metadata, start_date, end_date = process_station(station_code, data_dir=args.input_dir, output_dir=args.output_dir)
 
             # Calculate data completeness
             q_complete = calculate_percent_complete(df, 'Q', 'Q_flag')
@@ -512,7 +592,7 @@ def main():
 
     # Generate summary CSV
     if station_summaries:
-        generate_summary_csv(station_summaries)
+        generate_summary_csv(station_summaries, output_dir=args.output_dir)
 
     print("\n" + "="*70)
     print("Processing complete!")
