@@ -3,7 +3,25 @@ import re
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
+import sys
 from datetime import datetime
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+from tool import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    apply_quality_flag,
+    compute_log_iqr_bounds,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    convert_ssl_units_if_needed,
+    check_nc_completeness,
+    add_global_attributes
+)
+
 
 
 # ========= 1. 通用读取函数（关键：正确处理引号和空格） =========
@@ -74,6 +92,99 @@ def read_mpm(mpm_file):
 
     return df
 
+def apply_tool_qc(
+    time,
+    Q,
+    SSC,
+    SSL,
+    station_id,
+    station_name,
+    plot_dir=None,
+):
+    """
+    Unified QC using tool.py:
+    - Physical validity
+    - log-IQR screening
+    - SSC–Q hydrological consistency
+    """
+
+    n = len(time)
+
+    # -----------------------------
+    # 1. Physical QC
+    # -----------------------------
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+
+    # -----------------------------
+    # 2. log-IQR screening
+    # -----------------------------
+    q_bounds = compute_log_iqr_bounds(Q)
+    if q_bounds[0] is not None:
+        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
+
+    ssc_bounds = compute_log_iqr_bounds(SSC)
+    if ssc_bounds[0] is not None:
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
+
+    # -----------------------------
+    # 3. SSC–Q consistency
+    # -----------------------------
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            inconsistent, _ = check_ssc_q_consistency(
+                Q[i], SSC[i],
+                Q_flag[i], SSC_flag[i],
+                ssc_q_bounds
+            )
+            if inconsistent:
+                SSC_flag[i] = 2
+
+    # -----------------------------
+    # 4. Keep valid rows
+    # -----------------------------
+    valid = (
+        (Q_flag != FILL_VALUE_INT)
+        | (SSC_flag != FILL_VALUE_INT)
+        | (SSL_flag != FILL_VALUE_INT)
+    )
+
+    if not np.any(valid):
+        return None
+
+    # Optional: create diagnostic plot if envelope was constructed
+    if plot_dir is not None and ssc_q_bounds is not None:
+        try:
+            os.makedirs(plot_dir, exist_ok=True)
+            out_png = os.path.join(plot_dir, f"{station_id}_ssc_q.png")
+            plot_ssc_q_diagnostic(
+                time=time,
+                Q=Q,
+                SSC=SSC,
+                Q_flag=Q_flag,
+                SSC_flag=SSC_flag,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=station_name,
+                out_png=out_png,
+            )
+        except Exception:
+            # Plotting must not break processing
+            pass
+
+    return {
+        "date": time[valid],
+        "Q": Q[valid],
+        "SSC": SSC[valid],
+        "SSL": SSL[valid],
+        "Q_flag": Q_flag[valid],
+        "SSC_flag": SSC_flag[valid],
+        "SSL_flag": SSL_flag[valid],
+    }
+
 
 def get_rhine_data(input_path):
     spm_file = os.path.join(input_path, 'data_spm.txt')
@@ -125,7 +236,23 @@ def process_rhine_data(output_path, source_path):
             mpm_grouped = pd.DataFrame(columns=['date', 'q', 'ssc', 'latitude', 'longitude'])
 
         # ---------- 合并 SPM + MPM ----------
-        combined = pd.concat([spm_station_clean, mpm_grouped], ignore_index=True)
+        # 安全拼接：排除空 DataFrame 和所有值均为 NA 的列，避免 pandas FutureWarning
+        frames = []
+        for df_part in (spm_station_clean, mpm_grouped):
+            if df_part is None:
+                continue
+            if df_part.empty:
+                continue
+            # 去掉整列均为 NA 的列
+            df_part2 = df_part.loc[:, df_part.notna().any(axis=0)]
+            if df_part2.empty:
+                continue
+            frames.append(df_part2)
+
+        if frames:
+            combined = pd.concat(frames, ignore_index=True)
+        else:
+            combined = pd.DataFrame(columns=['date', 'ssc', 'q', 'latitude', 'longitude'])
         combined = combined.drop_duplicates(subset=['date'])
         combined = combined.sort_values('date')
 
@@ -155,22 +282,58 @@ def process_rhine_data(output_path, source_path):
 
         merged = pd.merge(daily_data, combined, on='date', how='left')
 
-        # QC 标志
-        merged['q_flag'] = 0
-        merged.loc[merged['q'] < 0, 'q_flag'] = 3
-        merged.loc[merged['q'] == 0, 'q_flag'] = 2
-        merged.loc[merged['q'] > 15000, 'q_flag'] = 2
-        merged.loc[merged['q'].isna(), 'q_flag'] = 9
-
-        merged['ssc_flag'] = 0
-        merged.loc[merged['ssc'] < 0, 'ssc_flag'] = 3
-        merged.loc[merged['ssc'] > 3000, 'ssc_flag'] = 2
-        merged.loc[merged['ssc'].isna(), 'ssc_flag'] = 9
-
+        # 计算 SSL（物理公式，保留）
         merged['ssl'] = merged['q'] * merged['ssc'] * 0.0864
-        merged['ssl_flag'] = 0
-        merged.loc[merged['ssl'] < 0, 'ssl_flag'] = 3
-        merged.loc[merged['ssl'].isna(), 'ssl_flag'] = 9
+
+        print("  -> Applying tool.py quality control...")
+
+        # 保存经纬度信息以便在 QC 后重新附加（apply_tool_qc 不会返回经纬度）
+        pre_qc_latlon = merged[['date', 'latitude', 'longitude']].copy()
+
+        qc = apply_tool_qc(
+            time=merged['date'].values,
+            Q=merged['q'].values,
+            SSC=merged['ssc'].values,
+            SSL=merged['ssl'].values,
+            station_id=station_name,
+            station_name=station_name,
+            plot_dir=os.path.join(output_path, "diagnostic_plots"),
+        )
+
+        if qc is None:
+            print("  -> QC 后无有效数据，跳过该站点。")
+            continue
+
+        # QC 输出只包含 time/Q/SSC/SSL 和 flags，重新合并经纬度
+        merged = pd.DataFrame(qc)
+        if 'date' in merged.columns:
+            merged = pd.merge(merged, pre_qc_latlon, on='date', how='left')
+        # 标准化列名为脚本其余部分使用的小写形式
+        rename_map = {}
+        if 'Q' in merged.columns:
+            rename_map['Q'] = 'q'
+        if 'SSC' in merged.columns:
+            rename_map['SSC'] = 'ssc'
+        if 'SSL' in merged.columns:
+            rename_map['SSL'] = 'ssl'
+        if 'Q_flag' in merged.columns:
+            rename_map['Q_flag'] = 'q_flag'
+        if 'SSC_flag' in merged.columns:
+            rename_map['SSC_flag'] = 'ssc_flag'
+        if 'SSL_flag' in merged.columns:
+            rename_map['SSL_flag'] = 'ssl_flag'
+        if rename_map:
+            merged.rename(columns=rename_map, inplace=True)
+        else:
+            # 万一 time 字段命名不同，尝试用第一个列名匹配（保守处理）
+            try:
+                merged = pd.concat([merged, pre_qc_latlon[['latitude','longitude']].reset_index(drop=True)], axis=1)
+            except Exception:
+                # 如果仍失败，填充缺省值，避免 KeyError
+                merged['latitude'] = np.nan
+                merged['longitude'] = np.nan
+
+
 
         # 提前保存经纬度（在 fillna 前）
         lat_series = merged['latitude'].dropna()
@@ -269,6 +432,21 @@ def process_rhine_data(output_path, source_path):
             ds.creator_email = 'weizhw6@mail.sysu.edu.cn'
             ds.creator_institution = 'Sun Yat-sen University, China'
             ds.conventions = 'CF-1.8, ACDD-1.3'
+            
+        # errors, warnings_nc = check_nc_completeness(nc_file_path, strict=True)
+
+        # if errors:
+        #     print(f"  ✗ Completeness check FAILED for {station_name}")
+        #     for e in errors:
+        #         print(f"    ERROR: {e}")
+        #     os.remove(nc_file_path)
+        #     continue
+
+        # if warnings_nc:
+        #     print(f"  ⚠ Completeness warnings for {station_name}")
+        #     for w in warnings_nc:
+        #         print(f"    WARNING: {w}")
+
 
         # ---------- 站点统计（可选） ----------
         q_good = merged[merged['q_flag'] == 0]
@@ -307,6 +485,6 @@ def process_rhine_data(output_path, source_path):
 if __name__ == "__main__":
     # 这里替换成你自己的路径
     process_rhine_data(
-        output_path="/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Rhine/test/",
-        source_path="/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Rhine"
+        output_path="/mnt/d/sediment_wzx_1111/Output_r/daily/Rhine/qc",
+        source_path="/mnt/d/sediment_wzx_1111/Source/Rhine"
     )
