@@ -191,8 +191,12 @@ def apply_quality_flag(value, variable_name):
     # Missing
     if pd.isna(value) or np.isnan(value):
         return np.int8(9)
-
+    # Check for fill value (-9999) before checking for negative values
+    # Use np.isclose to handle floating point precision issues
     # Physical impossibility
+    if np.isclose(value, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5):
+        return np.int8(9)
+
     if value < 0:
         return np.int8(3)
 

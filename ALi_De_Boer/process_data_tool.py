@@ -35,7 +35,8 @@ from tool import (
     apply_quality_flag,
     generate_station_summary_csv,
     build_ssc_q_envelope,
-    check_ssc_q_consistency
+    check_ssc_q_consistency,
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 
@@ -470,11 +471,25 @@ def main():
     """Main conversion function."""
 
     # Define paths (relative to script location)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    source_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/ALi_De_Boer'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/ALi_De_Boer/qc/'
+def main():
+    """Main conversion function."""
 
-    input_file = os.path.join(source_dir, 'ALi_De_Boer.xlsx')
+    # 当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 项目根目录：从 Script/Ali_De_Boer 往上两级 -> sediment_wzx_1111
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+
+    # Source 和 Output_r 都在项目根目录下
+    source_dir = os.path.join(project_root, "Source", "ALi_De_Boer")
+    output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "ALi_De_Boer", "qc")
+
+    input_file = os.path.join(source_dir, "ALi_De_Boer.xlsx")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("Input file:", input_file)
+    print("Output directory:", output_dir)
 
     print("=" * 80)
     print("ALi_De_Boer Dataset Conversion to CF-1.8 NetCDF")
