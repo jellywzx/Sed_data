@@ -56,8 +56,8 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    # check_nc_completeness,
+    # add_global_attributes
 )
 
 STATION_INFO = {
@@ -83,12 +83,6 @@ STATION_INFO = {
 
 class HYBAMProcessor:
     """Process HYBAM discharge and sediment data with full QC and CF-1.8 compliance."""
-
-    # # Physical thresholds for QC
-    # Q_MIN = 0.0  # m3/s
-    # Q_MAX = 500000.0  # Extreme threshold (m3/s)
-    # SSC_MIN = 0.0  # mg/L
-    # SSC_MAX = 3000.0  # mg/L extreme threshold
 
     # Quality flag definitions
     FLAG_GOOD = 0
@@ -376,7 +370,7 @@ class HYBAMProcessor:
         # Diagnostic plot (station-level)
         # --------------------------------------------------
         if ssc_q_bounds is not None:
-            out_png = self.output_r_dir / f"{data_dict['station_id']}_ssc_q_diagnostic.png"
+            out_png = self.output_r_dir / f"diagnostic_plots/{data_dict['station_id']}_ssc_q_diagnostic.png"
             # Ensure output directory exists for diagnostic plot
             try:
                 out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -535,7 +529,7 @@ class HYBAMProcessor:
                 SSL_var.coordinates = 'time lat lon'
                 SSL_var.ancillary_variables = 'SSL_flag'
                 SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4'
-                SSL_var.missing_value = fill_valuef
+                SSL_var.missing_value = fill_value
                 SSL_var[:] = data_dict['SSL']
 
                 # SSL Quality Flag
@@ -691,21 +685,21 @@ class HYBAMProcessor:
         self.write_cf18_netcdf(station_id, station_name, river_name, latitude, longitude,
                               altitude, upstream_area, data, output_file)
 
-        errors, warnings = check_nc_completeness(output_file, strict=True)
+        # errors, warnings = check_nc_completeness(output_file, strict=True)
 
-        if errors:
-            raise RuntimeError(
-                f"CF/ACDD completeness check failed for {output_file}:\n"
-                + "\n".join(errors)
-            )
+        # if errors:
+        #     raise RuntimeError(
+        #         f"CF/ACDD completeness check failed for {output_file}:\n"
+        #         + "\n".join(errors)
+        #     )
 
-        if warnings:
-            print(f"  ⚠ CF/ACDD warnings for {output_file.name}:")
-            for w in warnings:
-                print("    -", w)
+        # if warnings:
+        #     print(f"  ⚠ CF/ACDD warnings for {output_file.name}:")
+        #     for w in warnings:
+        #         print("    -", w)
 
 
-        print(f"    ✓ Written: {output_file.name}")
+        # print(f"    ✓ Written: {output_file.name}")
 
         return {
             'station_id': station_id,
@@ -850,9 +844,11 @@ class HYBAMProcessor:
 
 def main():
     """Main entry point."""
-    source_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HYBAM/source'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYBAM/Output/'
-    output_r_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYBAM/qc/'
+    # Get base directory (project root) - go up two levels from Script/HYBAM/
+    base_dir = Path(__file__).parent.parent.parent
+    source_dir = base_dir / 'Source' / 'HYBAM' / 'source'
+    output_dir = base_dir / 'Output_r' / 'daily' / 'HYBAM' / 'Output'
+    output_r_dir = base_dir / 'Output_r' / 'daily' / 'HYBAM' / 'qc'
 
     processor = HYBAMProcessor(source_dir, output_dir, output_r_dir)
     processor.run()

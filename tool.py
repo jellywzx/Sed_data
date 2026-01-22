@@ -326,6 +326,85 @@ def check_ssc_q_consistency(
 
     return is_inconsistent, resid
 
+
+def propagate_ssc_q_inconsistency_to_ssl(
+    inconsistent,
+    Q,
+    SSC,
+    SSL,
+    Q_flag,
+    SSC_flag,
+    SSL_flag,
+    ssl_is_derived_from_q_ssc
+):
+    """
+    Propagate SSC–Q hydrological inconsistency to derived sediment load (SSL)
+    ONLY when SSL is computed from Q and SSC.
+
+    Conditions
+    ----------
+    Propagation is applied ONLY if:
+    1. SSC–Q inconsistency is detected
+    2. Q, SSC, and SSL are all present and valid
+    3. SSL is derived from Q and SSC (not independently observed)
+
+    Rationale
+    ---------
+    SSL derived from Q × SSC inherits uncertainties from both variables.
+    If SSC is hydrologically inconsistent with Q, SSL cannot be considered 'good'.
+
+    Parameters
+    ----------
+    inconsistent : bool
+        Output from check_ssc_q_consistency
+    Q, SSC, SSL : float
+        Data values
+    Q_flag, SSC_flag, SSL_flag : int
+        Quality flags
+    ssl_is_derived_from_q_ssc : bool
+        True if SSL is computed from Q and SSC
+
+    Returns
+    -------
+    int
+        Updated SSL_flag
+    """
+
+    # --------------------------------------------------
+    # Condition 0: must be flagged inconsistent
+    # --------------------------------------------------
+    if not inconsistent:
+        return SSL_flag
+
+    # --------------------------------------------------
+    # Condition 1: SSL must be derived, not observed
+    # --------------------------------------------------
+    if not ssl_is_derived_from_q_ssc:
+        return SSL_flag
+
+    # --------------------------------------------------
+    # Condition 2: all variables must exist and be valid
+    # --------------------------------------------------
+    if (
+        Q_flag != 0
+        or SSC_flag != 0
+        or SSL_flag == FILL_VALUE_INT
+        or pd.isna(Q)
+        or pd.isna(SSC)
+        or pd.isna(SSL)
+        or Q <= 0
+        or SSC <= 0
+    ):
+        return SSL_flag
+
+    # --------------------------------------------------
+    # Propagation: downgrade SSL from good → suspect
+    # --------------------------------------------------
+    if SSL_flag == 0:
+        return np.int8(2)
+
+    return SSL_flag
+
 #=====================================
 # plot_session
 #====================================
