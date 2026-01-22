@@ -84,12 +84,6 @@ STATION_INFO = {
 class HYBAMProcessor:
     """Process HYBAM discharge and sediment data with full QC and CF-1.8 compliance."""
 
-    # # Physical thresholds for QC
-    # Q_MIN = 0.0  # m3/s
-    # Q_MAX = 500000.0  # Extreme threshold (m3/s)
-    # SSC_MIN = 0.0  # mg/L
-    # SSC_MAX = 3000.0  # mg/L extreme threshold
-
     # Quality flag definitions
     FLAG_GOOD = 0
     FLAG_ESTIMATED = 1
