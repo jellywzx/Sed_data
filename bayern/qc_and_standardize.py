@@ -52,6 +52,7 @@ def fmt_float(x, nd=2):
     except Exception:
         return str(x)
 
+
 def log_station_qc(site_name, site_code=None, n=None,
                    skipped_log_iqr=False, skipped_ssc_q=False,
                    q=None, q_flag=None, ssc=None, ssc_flag=None, ssl=None, ssl_flag=None,
