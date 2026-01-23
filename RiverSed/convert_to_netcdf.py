@@ -26,14 +26,12 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
-# --- Absolute paths (WSL format) ---
-SOURCE_DIR = "C:\\Users\\fzjxw\\Desktop\\sediment_wzx_1111\\Source\\RiverSed"
-
-OUTPUT_DIR = 'C:\\Users\\fzjxw\\Desktop\\sediment_wzx_1111\\Output_r\\daily\\RiverSed\\nc'
+PROJECT_ROOT = Path(CURRENT_DIR).parents[1]  
+SOURCE_DIR = str(PROJECT_ROOT / "Source" / "RiverSed")
+OUTPUT_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "nc")
 
 def load_aquasat_data(file_path):
     """Load Aquasat TSS data"""
@@ -187,6 +185,39 @@ def create_netcdf_file(station_id, tss_df, output_dir):
 
     if daily_df is None:
         return False
+        # -----------------------------
+    # Print QC summary (station-level)
+    # -----------------------------
+    n_total = len(daily_df)
+
+    def _repr(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), 0
+        if np.any(ok):
+            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+        return float("nan"), 9
+
+    sscv, sscf = _repr(daily_df["tss"].values, daily_df["SSC_flag"].values)
+
+    # 这个脚本没有 Q/SSL（都写成 missing），所以这里固定输出 nan/9
+    qv, qf = float("nan"), 9
+    sslv, sslf = float("nan"), 9
+
+    # 是否跳过 log-IQR（样本<5 或者 bounds=None）
+    lower, upper = compute_log_iqr_bounds(daily_df["tss"].values.astype(float))
+    skipped_log_iqr = (n_total < 5) or (lower is None)
+
+    print(f"  ✓ QC summary ({station_id})")
+    print(f"    Samples: {n_total}")
+    print(f"    Skipped log-IQR: {skipped_log_iqr}")
+    print(f"    Q  : {qv:.2f} m3/s (flag={qf})")
+    print(f"    SSC: {sscv:.2f} mg/L (flag={sscf})")
+    print(f"    SSL: {sslv:.2f} ton/day (flag={sslf})")
+
 
 
     # Get metadata (use first non-null values)
