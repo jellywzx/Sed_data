@@ -43,20 +43,18 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
-
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..', '..'))
 # Data paths
-SOURCE_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/EUSEDcollab/'
-OUTPUT_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/EUSEDcollab/qc'
+SOURCE_DIR = os.path.join(PROJECT_ROOT, 'Source', 'EUSEDcollab')
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'Output_r', 'monthly', 'EUSEDcollab', 'qc')
 METADATA_FILE = os.path.join(SOURCE_DIR, 'ALL_METADATA.csv')
-
 
 FILL_VALUE = -9999.0
 # =============================================================================
@@ -321,10 +319,22 @@ def qc_with_toolpy(
             )
             resid_arr[i] = resid
             if inconsistent and SSC_flag[i] == 0:
-                SSC_flag[i] = np.int8(2)
-                # 如果你希望 SSL 也跟着变成 suspect，可以打开：
-                # if SSL_flag[i] == 0 and np.isfinite(SSL[i]) and SSL[i] > 0:
-                #     SSL_flag[i] = np.int8(2)
+                SSC_flag[i] = np.int8(2)  # suspect
+
+                # 这里用 df 里那列 derived（你前面已经加了 df["derived"]）
+                ssl_is_derived_from_q_ssc = bool(out.get("derived", np.zeros(len(out), dtype=bool))[i])
+
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
+                )
+
 
     # ----------------------------
     # 4) write back
@@ -617,6 +627,32 @@ def process_station(station_id, country):
     # Create NetCDF file
     output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
     write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file)
+    # ---- Print QC result summary (station-level) ----
+    def _repr_val_and_flag(val_arr, flag_arr):
+        v = np.asarray(val_arr, dtype=float)
+        f = np.asarray(flag_arr, dtype=np.int8)
+
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), int(0)
+
+        if np.any(ok):
+            # 没有 good，就取“最好的那个 flag”（0最好，其次1/2/3/9）
+            best_flag = int(np.min(f[ok]))
+            return float(np.nanmedian(v[ok])), best_flag
+
+        return float("nan"), int(9)
+
+    qv, qf0 = _repr_val_and_flag(df["Q"].values, q_flag)
+    sscv, sscf0 = _repr_val_and_flag(df["SSC"].values, ssc_flag)
+    sslv, sslf0 = _repr_val_and_flag(df["SSL"].values, ssl_flag)
+
+    print(f"  ✓ Created: {output_file}")
+    print(f"    Q: {qv:.2f} m3/s (flag={qf0})")
+    print(f"    SSC: {sscv:.2f} mg/L (flag={sscf0})")
+    print(f"    SSL: {sslv:.2f} ton/day (flag={sslf0})")
 
      # ---------------------------------------------------------
     # Post-write CF-1.8 / ACDD-1.3 compliance check
