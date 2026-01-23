@@ -29,8 +29,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes,
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 warnings.filterwarnings('ignore')
@@ -148,6 +147,22 @@ def aggregate_to_daily(df):
     
     return daily.reset_index()
 
+def log_station_qc(station_name, source_id, n_samples,
+                   q_value, ssc_value, ssl_value,
+                   q_flag, ssc_flag, ssl_flag,
+                   skipped_log_iqr, skipped_ssc_q,
+                   created_path):
+    print(f"\nProcessing: {station_name} ({source_id})")
+    if skipped_log_iqr:
+        print(f"  [{station_name} ({source_id})] Sample size = {n_samples} < 5, log-IQR statistical QC skipped.")
+    if skipped_ssc_q:
+        print(f"  [{station_name} ({source_id})] Sample size = {n_samples} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+
+    print(f"✓ Created: {created_path}")
+    print(f"  Q: {q_value:.2f} m3/s (flag={int(q_flag)})")
+    print(f"  SSC: {ssc_value:.2f} mg/L (flag={int(ssc_flag)})")
+    print(f"  SSL: {ssl_value:.2f} ton/day (flag={int(ssl_flag)})")
+
 
 def perform_qc_checks(daily_df):
     """
@@ -210,7 +225,23 @@ def perform_qc_checks(daily_df):
             ssc_q_bounds=ssc_q_bounds
         )
         if is_bad:
-            qc_df.at[i, "SSC_flag"] = 2  # suspect
+            ssc_q_inconsistent = True
+
+            # 先把 SSC_flag 改为 suspect（仅当原来是 good）
+            if qc_df.at[i, "SSC_flag"] == 0:
+                qc_df.at[i, "SSC_flag"] = np.int8(2)  # suspect
+
+            # 再把不一致性传播到 SSL_flag
+            qc_df.at[i, "SSL_flag"] = propagate_ssc_q_inconsistency_to_ssl(
+                inconsistent=ssc_q_inconsistent,
+                Q=row["discharge"],
+                SSC=row["ssc_mg_L"],
+                SSL=row["sediment_load"],
+                Q_flag=qc_df.at[i, "Q_flag"],
+                SSC_flag=qc_df.at[i, "SSC_flag"],
+                SSL_flag=qc_df.at[i, "SSL_flag"],
+                ssl_is_derived_from_q_ssc=True,
+            )
 
     return qc_df, ssc_q_bounds
 
@@ -423,9 +454,13 @@ def process_fukushima_data():
     """Main processing function for Fukushima Niida River data."""
     
     # File paths
-    base_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Fukushima/'
-    data_file = os.path.join(base_dir, 'DOI00147_data.xls')
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Fukushima/qc/'
+    # File paths (relative to this script)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))  # .../sediment_wzx_1111
+
+    base_dir = os.path.join(project_root, "Source", "Fukushima")
+    data_file = os.path.join(base_dir, "DOI00147_data.xls")
+    output_dir = os.path.join(project_root, "Output_r", "daily", "Fukushima", "qc")
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -533,6 +568,37 @@ def process_fukushima_data():
 
             print(f"  Created: {output_file}")
             success_count += 1
+                        # ---- QC printout (like your screenshot) ----
+            n_samples = len(qc_data)
+            skipped_log_iqr = (n_samples < 5)
+            skipped_ssc_q = (n_samples < 5)
+
+            # 代表值：优先取 flag=0 的均值；如果没有 good，就取总体均值
+            def _mean_or_all(series, flag_series):
+                good = series[flag_series == 0]
+                if len(good) > 0:
+                    return float(np.nanmean(good))
+                return float(np.nanmean(series))
+
+            q_value = _mean_or_all(qc_data["discharge"].values, qc_data["Q_flag"].values)
+            ssc_value = _mean_or_all(qc_data["ssc_mg_L"].values, qc_data["SSC_flag"].values)
+            ssl_value = _mean_or_all(qc_data["sediment_load"].values, qc_data["SSL_flag"].values)
+
+            # 用“最后一天”的 flag 作为展示（也可改成众数/最大）
+            q_flag_show = qc_data["Q_flag"].values[-1]
+            ssc_flag_show = qc_data["SSC_flag"].values[-1]
+            ssl_flag_show = qc_data["SSL_flag"].values[-1]
+
+            log_station_qc(
+                station_name=station_name,
+                source_id=source_id,
+                n_samples=n_samples,
+                q_value=q_value, ssc_value=ssc_value, ssl_value=ssl_value,
+                q_flag=q_flag_show, ssc_flag=ssc_flag_show, ssl_flag=ssl_flag_show,
+                skipped_log_iqr=skipped_log_iqr,
+                skipped_ssc_q=skipped_ssc_q,
+                created_path=output_file,
+            )
             
             # Store summary info
             summary_data.append({
