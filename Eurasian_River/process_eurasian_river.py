@@ -31,17 +31,13 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness
+    propagate_ssc_q_inconsistency_to_ssl
 )
-
-
 # --- Configuration ---
-# --- Configuration ---
-BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
-
-SOURCE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Eurasian_River"
-OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/Eurasian_River/qc"
-SCRIPT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/Dataset/Eurasian_River"
+BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+SOURCE_DIR = os.path.join(BASE_DIR, "Source", "Eurasian_River")
+OUTPUT_DIR = os.path.join(BASE_DIR, "Output_r", "monthly", "Eurasian_River", "qc")
+SCRIPT_DIR = os.path.join(BASE_DIR, "Script", "Dataset", "Eurasian_River")
 
 # --- Helper Functions ---
 
@@ -69,6 +65,17 @@ def read_discharge_data():
                  discharge_data[river_name]['meta'] = meta
 
     return discharge_data
+
+def print_qc_summary(river_name, station_id, n, skipped_log_iqr, skipped_ssc_q, q, q_flag, ssc, ssc_flag, ssl, ssl_flag, nc_path):
+    print(f"\nProcessing: {river_name} ({station_id}) +")
+    if skipped_log_iqr:
+        print(f"  - Sample size = {n} < 5, log-IQR statistical QC skipped.")
+    if skipped_ssc_q:
+        print(f"  - Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+    print(f"  - Created: {nc_path}")
+    print(f"    Q:   {q:.2f} m3/s (flag={int(q_flag)})")
+    print(f"    SSC: {ssc:.2f} mg/L (flag={int(ssc_flag)})")
+    print(f"    SSL: {ssl:.2f} ton/day (flag={int(ssl_flag)})")
 
 def parse_discharge_file(filepath):
     """Parses a discharge file (.dat or .txt)."""
@@ -177,7 +184,7 @@ def parse_special_txt_content(lines):
 
 def read_sediment_data():
     """Reads sediment flux data from the Excel file."""
-    sediment_path = os.path.join('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Eurasian_River/Sediment_Flux_Data.xls')
+    sediment_path = os.path.join(SOURCE_DIR, "Sediment_Flux_Data.xls")
     xl = pd.ExcelFile(sediment_path)
     sediment_data = {}
     sheet_to_river = {
@@ -318,8 +325,19 @@ def main():
                 ssc_q_bounds=ssc_q_bounds
             )
 
-            if is_bad:
-                df.at[i, 'SSC_flag'] = 2  # suspect
+            if is_bad and row['SSC_flag'] == 0:
+                df.at[i, 'SSC_flag'] = np.int8(2) 
+
+                df.at[i, 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=is_bad,
+                    Q=row['Q'],
+                    SSC=row['SSC'],
+                    SSL=row['SSL'],
+                    Q_flag=row['Q_flag'],
+                    SSC_flag=np.int8(2),             
+                    SSL_flag=row['SSL_flag'],
+                    ssl_is_derived_from_q_ssc=True,
+                )
 
 
         # --- Time Trimming ---
@@ -421,6 +439,24 @@ def main():
             ssl_flag_var[:,0,0] = df['SSL_flag'].values
 
         print(f"  - Created {nc_filename}")
+
+        n = len(df)
+        skipped_log_iqr = (n < 5) or (ssl_lower is None) or (ssl_upper is None)
+        skipped_ssc_q = (n < 5) or (ssc_q_bounds is None)
+
+        last = df.iloc[-1]
+        print_qc_summary(
+            river_name=river_name,
+            station_id=station_id,
+            n=n,
+            skipped_log_iqr=skipped_log_iqr,
+            skipped_ssc_q=skipped_ssc_q,
+            q=float(last['Q']), q_flag=int(last['Q_flag']),
+            ssc=float(last['SSC']), ssc_flag=int(last['SSC_flag']),
+            ssl=float(last['SSL']), ssl_flag=int(last['SSL_flag']),
+            nc_path=nc_filename
+        )
+
 
         # ==========================================================
         # Post-write CF-1.8 / ACDD-1.3 compliance check
