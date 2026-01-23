@@ -42,13 +42,14 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    check_nc_completeness,
+    convert_ssl_units_if_needed,
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 # --- CONFIGURATION ---
 
 # Input and Output directories from user request
-BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
+BASE_DIR = os.path.abspath(os.path.join(PARENT_DIR, '..')) 
 SOURCE_DATA_DIR = os.path.join(BASE_DIR, "Source/Myanmar")
 TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Myanmar/qc")
 TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Myanmar/qc")
@@ -119,8 +120,19 @@ def apply_tool_qc(
                 Q_flag[i], SSC_flag[i],
                 ssc_q_bounds
             )
-            if inconsistent:
-                SSC_flag[i] = 2
+            if inconsistent and SSC_flag[i] == 0:
+                SSC_flag[i] = np.int8(2)  # suspect
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=True,
+                )
+
 
     # -----------------------------
     # 4. Keep valid times
