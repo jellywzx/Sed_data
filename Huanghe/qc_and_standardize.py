@@ -33,8 +33,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 def standardize_netcdf_file(input_file, output_dir):
@@ -421,8 +420,10 @@ def main():
     print()
 
     # Paths
-    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/netcdf/'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Huanghe/'
+    script_dir = os.path.dirname(os.path.abspath(__file__)) 
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+    input_dir = os.path.join(project_root, "Source", "HuangHe", "netcdf")
+    output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "Huanghe")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
