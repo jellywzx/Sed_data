@@ -40,8 +40,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 
@@ -396,9 +395,10 @@ def main():
     print()
 
     # Paths
-    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/netcdf_output'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Milliman/qc/'
-
+    BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..")) 
+    input_dir = os.path.join(BASE_DIR, "Source", "Milliman", "netcdf_output")
+    output_dir = os.path.join(BASE_DIR, "Output_r", "annually_climatology", "Milliman", "qc")
+ 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 

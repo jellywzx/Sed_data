@@ -8,6 +8,14 @@ from pathlib import Path
 from datetime import datetime
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+def find_repo_root(start: Path, max_up: int = 6) -> Path:
+    p = start.resolve()
+    for _ in range(max_up):
+        if (p / "Source").exists() and (p / "Output_r").exists():
+            return p
+        p = p.parent
+    # 兜底：找不到就用“脚本所在目录的上两级”，你也可以按需要改
+    return start.resolve().parents[2]
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
@@ -20,8 +28,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
@@ -62,6 +69,15 @@ def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
         if lower is not None:
             out.loc[(values < lower) | (values > upper), f'{var}_flag'] = 2
 
+
+    out['SSL'] = out['Q'] * out['SSC'] * 0.0864
+    out['SSL_flag'] = np.array(
+        [apply_quality_flag(v, "SSL") for v in out['SSL'].values],
+        dtype=np.int8
+    )
+    out.loc[out['SSL_flag'] == 3, 'SSL'] = np.nan
+
+
     # ======================================================
     # 3. SSC–Q consistency
     # ======================================================
@@ -77,7 +93,31 @@ def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
                 envelope
             )
             if inconsistent:
-                out.loc[out.index[i], 'SSC_flag'] = 2
+                sscf = int(out['SSC_flag'].iloc[i])
+                if sscf == 0:
+                    sscf = np.int8(2)
+
+                qv = out['Q'].iloc[i]
+                sscv = out['SSC'].iloc[i]
+                sslv = out['SSL'].iloc[i]
+
+                qf = int(out['Q_flag'].iloc[i])
+                sslf = int(out['SSL_flag'].iloc[i])
+
+                sslf = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=qv,
+                    SSC=sscv,
+                    SSL=sslv,
+                    Q_flag=qf,
+                    SSC_flag=sscf,
+                    SSL_flag=sslf,
+                    ssl_is_derived_from_q_ssc=True,
+                )
+
+                out.loc[out.index[i], 'SSC_flag'] = sscf
+                out.loc[out.index[i], 'SSL_flag'] = np.int8(sslf)
+
 
         # --------------------------------------------------
         # 4. Diagnostic plot
@@ -113,8 +153,10 @@ def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
 
 def process_shashi_jianli():
     # Define paths
-    source_dir = Path("/mnt/d/sediment_wzx_1111/Source/Shashi_Jianli")
-    output_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Shashi_Jianli/qc")
+    repo_root = find_repo_root(Path(CURRENT_DIR))
+    source_dir = repo_root / "Source" / "Shashi_Jianli"
+    output_dir = repo_root / "Output_r" / "daily" / "Shashi_Jianli" / "qc"
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load data
@@ -175,6 +217,15 @@ def process_shashi_jianli():
         ).astype(np.int8)
 
         # Print QC results
+        n_total = len(df_station)
+        n_valid_q = int(np.isfinite(df_station["Q"].values).sum())
+        n_valid_ssc = int(np.isfinite(df_station["SSC"].values).sum())
+        n_valid_ssl = int(np.isfinite(df_station["SSL"].values).sum())
+
+        print(f"  [QC] n_total={n_total}, n_valid(Q)={n_valid_q}, n_valid(SSC)={n_valid_ssc}, n_valid(SSL)={n_valid_ssl}")
+        if min(n_valid_q, n_valid_ssc) < 5:
+            print(f"  [QC] Sample size < 5 → SSC–Q consistency check & diagnostic plot skipped")
+
         print("\n  Quality Control Results:")
         for var in ['Q', 'SSC', 'SSL']:
             flag_col = f'{var}_flag'
@@ -195,6 +246,21 @@ def process_shashi_jianli():
             print(f"      Suspect:   {suspect:6d} ({suspect_pct:5.1f}%)")
             print(f"      Bad:       {bad:6d} ({bad_pct:5.1f}%)")
             print(f"      Missing:   {missing:6d} ({missing_pct:5.1f}%)")
+        # 打印一个“代表值”（比如第一个 good 的值；没有就显示 nan）
+        def first_good_value(vname: str):
+            flag = df_station[f"{vname}_flag"]
+            good_idx = df_station.index[flag == 0]
+            if len(good_idx) == 0:
+                return np.nan, 9
+            t0 = good_idx[0]
+            return float(df_station.loc[t0, vname]), int(df_station.loc[t0, f"{vname}_flag"])
+
+        q0, qf0 = first_good_value("Q")
+        s0, sf0 = first_good_value("SSC")
+        l0, lf0 = first_good_value("SSL")
+        print(f"  [QC] Q:   {q0:.4g} (flag={qf0})")
+        print(f"  [QC] SSC: {s0:.4g} (flag={sf0})")
+        print(f"  [QC] SSL: {l0:.4g} (flag={lf0})")
 
         # Time cropping
         valid_data = df_station.dropna(subset=['Q', 'SSC_kg_m3'], how='all')

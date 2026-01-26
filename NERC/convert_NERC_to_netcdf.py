@@ -32,9 +32,15 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
+
+# project root 
+PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
+
+DEFAULT_INPUT_DIR = os.path.join(PROJECT_ROOT, 'Source', 'NERC', 'data')
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'Output_r', 'daily', 'NERC', 'qc')
+
 
 # Station metadata based on NERC documentation
 # Reference: Heppell, C.M.; Binley, A. (2016). Hampshire Avon: Daily discharge, stage
@@ -133,8 +139,36 @@ def apply_tool_qc(
                 Q_flag[i], SSC_flag[i],
                 ssc_q_bounds
             )
-            if inconsistent:
-                SSC_flag[i] = 2
+            if inconsistent and SSC_flag[i] == 0:
+                SSC_flag[i] = np.int8(2)  # suspect
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=True,
+                )
+    # -------------------------
+    # 3.5 SSC–Q diagnostic plot (optional but recommended)
+    # -------------------------
+    if plot_dir is not None:
+        try:
+            os.makedirs(plot_dir, exist_ok=True)
+            plot_ssc_q_diagnostic(
+                Q_m3s=Q,
+                SSC_mgL=SSC,
+                Q_flag=Q_flag,
+                SSC_flag=SSC_flag,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=station_name,
+                out_dir=plot_dir,
+            )
+        except Exception as e:
+            print(f"  ⚠ Diagnostic plot failed for {station_id}: {e}")
 
     # -------------------------
     # 4. Keep valid rows
@@ -271,13 +305,43 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
     if qc is None:
         warnings.warn(f"No valid data after QC for station {station_code}. Skipping.")
         return None, None, None, None
+    # -------- print QC summary (station-level) --------
+    n_raw = len(df)  # 注意：这里的 df 还是 merge 后的原始表（还没被 df = DataFrame(qc) 覆盖）
+    skipped_log_iqr = (n_raw < 5)
+    skipped_ssc_q = (n_raw < 5)
+
+    def _repr(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), 0
+        if np.any(ok):
+            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+        return float("nan"), 9
+
+    qv, qf = _repr(qc["Q"], qc["Q_flag"])
+    sscv, sscf = _repr(qc["SSC"], qc["SSC_flag"])
+    sslv, sslf = _repr(qc["SSL"], qc["SSL_flag"])
+
+    print(f"  ▣ [{metadata['Source_ID']}] Sample size = {n_raw}"
+          + (", log-IQR statistical QC skipped." if skipped_log_iqr else ""))
+    print(f"  ▣ [{metadata['Source_ID']}] Sample size = {n_raw}"
+          + (", SSC–Q consistency check and diagnostic plot skipped." if skipped_ssc_q else ""))
+    print(f"  ✓ QC summary for {metadata['Source_ID']}:")
+    print(f"    Q:   {qv:.2f} m3/s (flag={qf})")
+    print(f"    SSC: {sscv:.2f} mg/L (flag={sscf})")
+    print(f"    SSL: {sslv:.2f} ton/day (flag={sslf})")
 
     df = pd.DataFrame(qc)
 
     # Convert dates to days since 1970-01-01
     reference_date = datetime(1970, 1, 1)
     # df['time'] = (df['time'] - pd.Timestamp(reference_date)).dt.total_seconds() / 86400
-    df['time'] = (pd.to_datetime(df['date']) - pd.Timestamp(reference_date)).dt.total_seconds() / 86400.0
+    df["date"] = pd.to_datetime(df["time"])
+    df["time"] = (df["date"] - pd.Timestamp(reference_date)).dt.total_seconds() / 86400.0
+
 
 
     # Get temporal span
@@ -534,8 +598,11 @@ def main():
 
     # parse command-line arguments for input/output directories
     parser = argparse.ArgumentParser(description='Convert NERC CSVs to CF-1.8 NetCDF.')
-    parser.add_argument('--input-dir', '-i', default='/mnt/d/sediment_wzx_1111/Source/NERC/data', help='Input data directory containing CSV files (default: Source/NERC)')
-    parser.add_argument('--output-dir', '-o', default='/mnt/d/sediment_wzx_1111/Output_r/daily/NERC/qc', help='Output directory for NetCDF files (default: Output_r/daily/NERC/qc)')
+    parser.add_argument('--input-dir', '-i', default=DEFAULT_INPUT_DIR,
+                    help='Input data directory containing CSV files')
+    parser.add_argument('--output-dir', '-o', default=DEFAULT_OUTPUT_DIR,
+                    help='Output directory for NetCDF files')
+
     args = parser.parse_args()
 
     print(f"Using input directory: {args.input_dir}")

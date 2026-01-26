@@ -34,16 +34,15 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
-
 
 # --- Configuration ---
 
 # WSL format absolute paths
-DEFAULT_SOURCE_DIR = '/mnt/d/sediment_wzx_1111/Source/Robotham/data'
-DEFAULT_OUTPUT_DIR = '/mnt/d/sediment_wzx_1111/Output_r/daily/Robotham'
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..','..'))
+DEFAULT_SOURCE_DIR = os.path.join(PROJECT_ROOT, 'Source', 'Robotham', 'data')
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'Output_r', 'daily', 'Robotham')
 
 # Station metadata
 STATIONS = {
@@ -135,6 +134,8 @@ def apply_tool_qc(df):
     """
 
     out = df.copy()
+    out['SSL_flag'] = np.zeros(len(out), dtype=np.int8)  
+    out['ssc_q_inconsistent'] = np.zeros(len(out), dtype=bool) 
 
     # =========================
     # 1. Physical QC
@@ -177,6 +178,24 @@ def apply_tool_qc(df):
             )
             if inconsistent:
                 out.loc[out.index[i], 'SSC_flag'] = 2
+                out.loc[out.index[i], 'ssc_q_inconsistent'] = True
+
+                # 用 Q 和 SSC 临时算一个 SSL（吨/天），用于传播 flag（值本身不重要，flag 才重要）
+                _q = out['Q'].iloc[i]
+                _ssc = out['SSC'].iloc[i]
+                _ssl = (_q * 1e-3) * _ssc * 0.0864  # Q: L/s -> m3/s，再转 ton/day
+
+                out.loc[out.index[i], 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=True,
+                    Q=_q,
+                    SSC=_ssc,
+                    SSL=_ssl,
+                    Q_flag=int(out['Q_flag'].iloc[i]),
+                    SSC_flag=int(out['SSC_flag'].iloc[i]),
+                    SSL_flag=int(out['SSL_flag'].iloc[i]),
+                    ssl_is_derived_from_q_ssc=True,
+                )
+
 
     return out, envelope
 
@@ -362,6 +381,37 @@ def calculate_summary_stats(df, station_info):
             summary[f'{var}_end_date'] = 'N/A'
             summary[f'{var}_percent_complete'] = 0.0
     return summary
+
+def print_qc_summary(station_name: str, merged: pd.DataFrame, created_path: str,
+                     skipped_log_iqr: bool, skipped_ssc_q: bool):
+    n_total = len(merged)
+
+    def _repr(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), 0
+        if np.any(ok):
+            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+        return float("nan"), 9
+
+    # 这里按你的 df_final 列名来（如果你列名是大写 Q/SSC/SSL，就把下面改成对应的）
+    qv, qf = _repr(merged['Q'].values, merged['Q_flag'].values)
+    sscv, sscf = _repr(merged['SSC'].values, merged['SSC_flag'].values)
+    sslv, sslf = _repr(merged['SSL'].values, merged['SSL_flag'].values)
+
+    print(f"\nProcessing: {station_name}")
+    if skipped_log_iqr:
+        print(f"  ⚠ Sample size = {n_total} < 5, log-IQR statistical QC skipped.")
+    if skipped_ssc_q:
+        print(f"  ⚠ Sample size = {n_total} < 5, SSC–Q consistency check and diagnostic plot skipped.")
+    print(f"  ✅ Created: {created_path}")
+    print(f"  Q  : {qv:.2f} (flag={qf})")
+    print(f"  SSC: {sscv:.2f} (flag={sscf})")
+    print(f"  SSL: {sslv:.2f} (flag={sslf})")
+
 
 def main():
     """Main processing function."""

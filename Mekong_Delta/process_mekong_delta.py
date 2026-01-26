@@ -39,9 +39,8 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
+    propagate_ssc_q_inconsistency_to_ssl,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
 )
 
 
@@ -49,10 +48,11 @@ from tool import (
 
 # Input and Output directories
 # Assumes the script is run from the 'Script/Dataset/Mekong_Delta' directory
-BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
-SOURCE_DATA_DIR = os.path.join(BASE_DIR, "Source/Mekong_Delta/data")
-TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta/qc")
-TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r/daily/Mekong_Delta/qc")
+BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))  
+SOURCE_DATA_DIR = os.path.join(BASE_DIR, "Source", "Mekong_Delta", "data")
+TARGET_NC_DIR = os.path.join(BASE_DIR, "Output_r", "daily", "Mekong_Delta", "qc")
+TARGET_CSV_PATH = os.path.join(BASE_DIR, "Output_r", "daily", "Mekong_Delta", "qc")
+
 
 # Station metadata
 STATIONS = {
@@ -197,8 +197,20 @@ def apply_tool_qc(
                 Q_flag[i], SSC_flag[i],
                 ssc_q_bounds
             )
-            if inconsistent:
-                SSC_flag[i] = 2
+            if inconsistent and SSC_flag[i] == 0:
+                SSC_flag[i] = np.int8(2)  # suspect
+
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=False,
+                )
+
 
     # -----------------------------
     # 4. Keep valid times
@@ -246,6 +258,45 @@ def apply_tool_qc(
         "SSC_flag": SSC_flag,
         "SSL_flag": SSL_flag,
     }
+def _repr_value_and_flag(values, flags):
+    v = np.asarray(values, dtype=float)
+    f = np.asarray(flags, dtype=np.int8)
+    ok = np.isfinite(v) & (v > 0)
+
+    ok_good = ok & (f == 0)
+    if np.any(ok_good):
+        return float(np.nanmedian(v[ok_good])), int(0)
+
+    if np.any(ok):
+        return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+    return float("nan"), 9
+
+
+def log_station_qc(
+    station_id,
+    station_name,
+    n_samples,
+    skipped_log_iqr,
+    skipped_ssc_q,
+    Q, Q_flag,
+    SSC, SSC_flag,
+    SSL, SSL_flag,
+    created_path=None,
+):
+    print(f"\nProcessing: {station_name} ({station_id})")
+    print(f"  Sample size = {n_samples} {'< 5, ' if n_samples < 5 else ''}"
+          f"log-IQR {'skipped' if skipped_log_iqr else 'applied'}, "
+          f"SSC-Q {'skipped' if skipped_ssc_q else 'checked'}")
+
+    qv, qf = _repr_value_and_flag(Q, Q_flag)
+    sscv, sscf = _repr_value_and_flag(SSC, SSC_flag)
+    sslv, sslf = _repr_value_and_flag(SSL, SSL_flag)
+
+    if created_path:
+        print(f"✓ Created: {created_path}")
+    print(f"  Q:   {qv:.2f} m3/s (flag={qf})")
+    print(f"  SSC: {sscv:.2f} mg/L (flag={sscf})")
+    print(f"  SSL: {sslv:.2f} ton/day (flag={sslf})")
 
 
 # --- MAIN PROCESSING ---
@@ -396,7 +447,6 @@ def main():
     station_summaries = []
 
     for station_id, station_meta in STATIONS.items():
-        print(f"Processing station: {station_id}...")
         try:
             # Read and merge data
             fluxes_df = read_fluxes_file(os.path.join(SOURCE_DATA_DIR, f'{station_id}fluxes.csv'))
@@ -476,6 +526,23 @@ def main():
             output_filename = f"Mekong_Delta_{station_id}.nc"
             output_filepath = os.path.join(TARGET_NC_DIR, output_filename)
             create_netcdf_file(output_filepath, final_df, station_meta)
+            # --- QC printing ---
+            n_samples = len(qc_df)
+            skipped_log_iqr = (n_samples < 5) or (compute_log_iqr_bounds(qc_df["Q"].values)[0] is None)
+            skipped_ssc_q = (n_samples < 5) or (build_ssc_q_envelope(qc_df["Q"].values, qc_df["SSC"].values) is None)
+
+            log_station_qc(
+                station_id=station_meta["Source_ID"],
+                station_name=station_meta["name"],
+                n_samples=n_samples,
+                skipped_log_iqr=skipped_log_iqr,
+                skipped_ssc_q=skipped_ssc_q,
+                Q=qc_df["Q"].values, Q_flag=qc_df["Q_flag"].values,
+                SSC=qc_df["SSC"].values, SSC_flag=qc_df["SSC_flag"].values,
+                SSL=qc_df["SSL"].values, SSL_flag=qc_df["SSL_flag"].values,
+                created_path=output_filepath,
+            )
+
 
             # errors, warnings_nc = check_nc_completeness(output_filepath, strict=True)
 
@@ -497,6 +564,7 @@ def main():
             warnings.warn(f"Data file not found for station {station_id}: {e}. Skipping.")
         except Exception as e:
             warnings.warn(f"An error occurred while processing station {station_id}: {e}")
+            
 
     # Generate summary CSV
     if station_summaries:

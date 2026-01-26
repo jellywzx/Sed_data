@@ -35,8 +35,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 # Quality flag definitions
@@ -532,10 +531,14 @@ def create_summary_csv(stats_list, output_dir):
 def main():
     """Main processing function"""
     # File paths
-    source_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GSED/GSED')
-    csv_file = source_dir / 'GSED_Reach_Monthly_SSC.csv'
-    shapefile = source_dir / 'GSED_Reach.shp'
-    output_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/GSED/qc')
+    script_dir = Path(__file__).resolve().parent          # .../Script/GSED
+    project_root = script_dir.parents[1]                  # .../sediment_wzx_1111
+
+    source_dir = project_root / "Source" / "GSED" / "GSED"
+    csv_file = source_dir / "GSED_Reach_Monthly_SSC.csv"
+    shapefile = source_dir / "GSED_Reach.shp"
+    output_dir = project_root / "Output_r" / "monthly" / "GSED" / "qc"
+
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
