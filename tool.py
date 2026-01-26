@@ -7,6 +7,7 @@ import xarray as xr
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
+NOT_CHECKED_INT = np.int8(8)
 
 #=====================================
 # time unit conversion
@@ -172,6 +173,82 @@ def compute_log_iqr_bounds(values, k=1.5):
     upper = 10 ** (q3 + k * iqr)
 
     return lower, upper
+
+
+def apply_log_iqr_screening(
+    values,
+    base_flag,
+    k=1.5,
+    min_samples=5,
+    suspect_flag=np.int8(2),
+    pass_flag=np.int8(0),
+    missing_flag=FILL_VALUE_INT,
+    not_checked_flag=NOT_CHECKED_INT,
+):
+    """
+    Apply log-IQR screening WITHOUT overriding upstream QC failures.
+
+    This helper is designed to be reusable across datasets/pipelines:
+    - It only evaluates points where base_flag == pass_flag (default 0),
+      so upstream flags like "bad=3" will never be overwritten as "suspect=2".
+    - It distinguishes missing vs not_checked at the step level:
+      - missing_flag (default 9): value is missing/fill/NaN
+      - not_checked_flag (default 8): not evaluated (e.g., <=0, failed upstream QC,
+        insufficient samples, or bounds not computed)
+
+    Parameters
+    ----------
+    values : array-like
+        Data values.
+    base_flag : array-like (int)
+        Upstream QC flag array (same length as values).
+    k : float
+        IQR multiplier in log space.
+    min_samples : int
+        Minimum number of evaluable samples required to compute bounds.
+
+    Returns
+    -------
+    step_flag : np.ndarray (int8)
+        Step-level provenance flag (pass/suspect/not_checked/missing).
+    updated_flag : np.ndarray (int8)
+        Updated final flag array (base_flag with suspect applied where appropriate).
+    bounds : tuple
+        (lower, upper) bounds in original space; (None, None) if not computed.
+    """
+    v = np.asarray(values, dtype=float)
+    f = np.asarray(base_flag, dtype=np.int8)
+    n = len(v)
+
+    step_flag = np.full(n, not_checked_flag, dtype=np.int8)
+
+    # Missing detection: respect upstream missing flag and also guard against NaNs/fill.
+    missing_mask = (
+        (f == missing_flag)
+        | ~np.isfinite(v)
+        | np.isclose(v, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5)
+    )
+    step_flag[missing_mask] = missing_flag
+
+    # Evaluate only where upstream says "good" and value is strictly positive
+    eval_mask = (f == pass_flag) & np.isfinite(v) & (v > 0)
+
+    if eval_mask.sum() < int(min_samples):
+        return step_flag, f.copy(), (None, None)
+
+    lower, upper = compute_log_iqr_bounds(v[eval_mask], k=k)
+    if lower is None:
+        return step_flag, f.copy(), (None, None)
+
+    step_flag[eval_mask] = pass_flag
+    outlier_mask = eval_mask & ((v < lower) | (v > upper))
+    step_flag[outlier_mask] = suspect_flag
+
+    updated_flag = f.copy()
+    # Key rule: only downgrade points that are currently "good"
+    updated_flag[outlier_mask] = suspect_flag
+
+    return step_flag, updated_flag, (lower, upper)
 
 def apply_quality_flag(value, variable_name):
     """
