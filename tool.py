@@ -9,6 +9,8 @@ import xarray as xr
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
 NOT_CHECKED_INT = np.int8(8)
+ESTIMATED_INT = np.int8(1)  # derived/estimated data
+
 
 #=====================================
 # time unit conversion
@@ -255,6 +257,91 @@ def apply_log_iqr_screening(
 
     return step_flag, updated_flag, (lower, upper)
 
+def apply_qc2_log_iqr_if_independent(
+    values,
+    base_flag,
+    is_independent: bool,
+    *,
+    k=1.5,
+    min_samples=5,
+    pass_flag=np.int8(0),
+    suspect_flag=np.int8(2),
+    estimated_flag=ESTIMATED_INT,
+    bad_flag=np.int8(3),
+    missing_flag=FILL_VALUE_INT,
+    not_checked_flag=NOT_CHECKED_INT,
+    fill_value_float=FILL_VALUE_FLOAT,
+):
+    """
+    QC2: log-IQR screening applied ONLY to independent observations.
+
+    If is_independent == True:
+        - run apply_log_iqr_screening(values, base_flag)
+        - return (qc2_step_flag, updated_flag, bounds)
+
+    If is_independent == False (derived / estimated variable):
+        - QC2 is NOT applied:
+            qc2_step_flag:
+                - missing -> 9
+                - otherwise -> 8 (not_checked)
+        - final flag:
+            - downgrade ONLY "good(0)" points to "estimated(1)"
+            - keep suspect(2)/bad(3)/missing(9) unchanged
+        - bounds -> (None, None)
+
+    Notes
+    -----
+    - base_flag is the cumulative flag from upstream steps (typically QC1 or QC1+QCX).
+    - This function NEVER overwrites upstream bad/missing/suspect.
+    """
+
+    # normalize
+    if ma.isMaskedArray(values):
+        values = ma.filled(values, np.nan)
+    v = np.asarray(values, dtype=float)
+    f = np.asarray(base_flag, dtype=np.int8)
+    n = len(v)
+
+    # missing detection (same spirit as apply_log_iqr_screening)
+    missing_mask = (
+        (f == missing_flag)
+        | ~np.isfinite(v)
+        | np.isclose(v, float(fill_value_float), rtol=1e-5, atol=1e-5)
+    )
+
+    # -------------------------
+    # Case A: independent -> real QC2
+    # -------------------------
+    if bool(is_independent):
+        qc2_step_flag, updated_flag, bounds = apply_log_iqr_screening(
+            values=v,
+            base_flag=f,
+            k=k,
+            min_samples=min_samples,
+            suspect_flag=suspect_flag,
+            pass_flag=pass_flag,
+            missing_flag=missing_flag,
+            not_checked_flag=not_checked_flag,
+        )
+        return qc2_step_flag, updated_flag, bounds
+
+    # -------------------------
+    # Case B: derived -> no QC2, mark estimated
+    # -------------------------
+    qc2_step_flag = np.full(n, not_checked_flag, dtype=np.int8)
+    qc2_step_flag[missing_mask] = missing_flag
+
+    updated_flag = f.copy()
+
+    # Only turn "good(0)" into "estimated(1)" for non-missing points
+    mark_est_mask = (updated_flag == pass_flag) & (~missing_mask)
+
+    # Important: do NOT overwrite suspect(2)/bad(3)/missing(9)
+    updated_flag[mark_est_mask] = estimated_flag
+
+    return qc2_step_flag, updated_flag, (None, None)
+
+
 def apply_quality_flag(value, variable_name):
     """
     Apply quality flag based only on missing values and physical impossibility.
@@ -495,7 +582,7 @@ def propagate_ssc_q_inconsistency_to_ssl(
     # --------------------------------------------------
     # Propagation: downgrade SSL from good → suspect
     # --------------------------------------------------
-    if SSL_flag == 0:
+    if SSL_flag in (np.int8(0), ESTIMATED_INT):
         return np.int8(2)
 
     return SSL_flag

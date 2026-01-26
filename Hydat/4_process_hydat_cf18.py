@@ -85,13 +85,24 @@ def apply_tool_qc(
     # -----------------------------
     # QC2: statistical screening (log-IQR)
     # Use tool.py helper so QC2 never overrides upstream "bad=3".
-    Q_flag_qc2_log_iqr, Q_flag, _ = apply_log_iqr_screening(
+    #!!!需要手动修改
+    Q_flag_qc2_log_iqr, Q_flag, _ = apply_qc2_log_iqr_if_independent(
         values=Q,
         base_flag=Q_flag,
+        is_independent=True,   # Q 是独立观测
     )
-    SSC_flag_qc2_log_iqr, SSC_flag, _ = apply_log_iqr_screening(
+
+    SSC_flag_qc2_log_iqr, SSC_flag, _ = apply_qc2_log_iqr_if_independent(
         values=SSC,
         base_flag=SSC_flag,
+        is_independent=True,   # SSC 是独立观测
+    )
+
+    # 如果你的 SSL 是派生量（Q×SSC），就这样：
+    SSL_flag_qc2_log_iqr, SSL_flag, _ = apply_qc2_log_iqr_if_independent(
+        values=SSL,
+        base_flag=SSL_flag,
+        is_independent=False,  # SSL 是派生量 -> QC2 不做，但标 estimated
     )
 
     # -----------------------------
