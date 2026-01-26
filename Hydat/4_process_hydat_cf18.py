@@ -31,6 +31,7 @@ from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
     NOT_CHECKED_INT,
+    ESTIMATED_INT,
     apply_quality_flag,
     compute_log_iqr_bounds,
     apply_log_iqr_screening,
@@ -40,7 +41,8 @@ from tool import (
     convert_ssl_units_if_needed,
     # check_nc_completeness,
     # add_global_attributes,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_hydro_qc_with_provenance
 )
 
 def apply_tool_qc(
@@ -64,121 +66,21 @@ def apply_tool_qc(
     """
 
     n = len(time)
-
-    # -----------------------------
-    # 1. Physical QC (baseline)
-    # -----------------------------
-    # Step-level provenance flags (for tracing which QC step triggered a downgrade)
-    # QC1: physical feasibility / missing / fill value
-    Q_flag_qc1_physical = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
-    SSC_flag_qc1_physical = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
-    SSL_flag_qc1_physical = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
-
-    # Final flags start from physical QC
-    Q_flag = Q_flag_qc1_physical.copy()
-    SSC_flag = SSC_flag_qc1_physical.copy()
-    SSL_flag = SSL_flag_qc1_physical.copy()
-
-    # -----------------------------
-    # 2. log-IQR screening
-    #    (only independent vars)
-    # -----------------------------
-    # QC2: statistical screening (log-IQR)
-    # Use tool.py helper so QC2 never overrides upstream "bad=3".
-    #!!!需要手动修改
-    Q_flag_qc2_log_iqr, Q_flag, _ = apply_qc2_log_iqr_if_independent(
-        values=Q,
-        base_flag=Q_flag,
-        is_independent=True,   # Q 是独立观测
+    qc = apply_hydro_qc_with_provenance(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=False,  # SSL 通常为派生量（Q×SSC）
+        ssl_is_derived_from_q_ssc=True,
     )
 
-    SSC_flag_qc2_log_iqr, SSC_flag, _ = apply_qc2_log_iqr_if_independent(
-        values=SSC,
-        base_flag=SSC_flag,
-        is_independent=True,   # SSC 是独立观测
-    )
-
-    # 如果你的 SSL 是派生量（Q×SSC），就这样：
-    SSL_flag_qc2_log_iqr, SSL_flag, _ = apply_qc2_log_iqr_if_independent(
-        values=SSL,
-        base_flag=SSL_flag,
-        is_independent=False,  # SSL 是派生量 -> QC2 不做，但标 estimated
-    )
-
-    # -----------------------------
-    # 3. SSC–Q consistency check
-    # -----------------------------
-    # QC3: hydrological consistency (SSC–Q envelope)
-    # Only build envelope from data that survived QC1+QC2 (both good).
-    SSC_flag_qc3_ssc_q = np.full(n, NOT_CHECKED_INT, dtype=np.int8)    # 8 = not checked
-    SSL_flag_qc3_from_ssc_q = np.full(n, NOT_CHECKED_INT, dtype=np.int8)  # 8 = not checked / not applicable
-    # Mark missing explicitly
-    SSC_flag_qc3_ssc_q[SSC_flag_qc1_physical == FILL_VALUE_INT] = FILL_VALUE_INT
-    SSL_flag_qc3_from_ssc_q[SSL_flag_qc1_physical == FILL_VALUE_INT] = FILL_VALUE_INT
-
-    env_mask = (Q_flag == 0) & (SSC_flag == 0) & np.isfinite(Q) & np.isfinite(SSC) & (Q > 0) & (SSC > 0)
-    Q_env = np.where(env_mask, Q, np.nan)
-    SSC_env = np.where(env_mask, SSC, np.nan)
-    ssc_q_bounds = build_ssc_q_envelope(Q_env, SSC_env)
-
-    if ssc_q_bounds is not None:
-        eval_mask = env_mask.copy()
-        SSC_flag_qc3_ssc_q[eval_mask] = 0  # checked and passed by default
-
-        for i in np.where(eval_mask)[0]:
-            inconsistent, _ = check_ssc_q_consistency(
-                Q[i], SSC[i],
-                Q_flag[i], SSC_flag[i],
-                ssc_q_bounds
-            )
-
-            if inconsistent:
-                SSC_flag_qc3_ssc_q[i] = 2
-                SSC_flag[i] = 2
-
-                # Propagate inconsistency to derived SSL (optional)
-                prev_ssl_flag = SSL_flag[i]
-                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=inconsistent,
-                    Q=Q[i],
-                    SSC=SSC[i],
-                    SSL=SSL[i],
-                    Q_flag=Q_flag[i],
-                    SSC_flag=0,  # use pre-downgrade state for propagation logic
-                    SSL_flag=prev_ssl_flag,
-                    ssl_is_derived_from_q_ssc=True  # ← 这里你可以控制
-                )
-                # record whether propagation actually changed SSL quality
-                SSL_flag_qc3_from_ssc_q[i] = 2 if (prev_ssl_flag == 0 and SSL_flag[i] == 2) else 0
-
-
-    # -----------------------------
-    # 4. Valid-time mask
-    #    ANY variable non-missing
-    # -----------------------------
-    valid_time = (
-        (Q_flag != FILL_VALUE_INT)
-        | (SSC_flag != FILL_VALUE_INT)
-        | (SSL_flag != FILL_VALUE_INT)
-    )
-
-    if not np.any(valid_time):
+    if qc is None:
         return None
 
-    time = time[valid_time]
-    Q = Q[valid_time]
-    SSC = SSC[valid_time]
-    SSL = SSL[valid_time]
-    Q_flag = Q_flag[valid_time]
-    SSC_flag = SSC_flag[valid_time]
-    SSL_flag = SSL_flag[valid_time]
-    Q_flag_qc1_physical = Q_flag_qc1_physical[valid_time]
-    SSC_flag_qc1_physical = SSC_flag_qc1_physical[valid_time]
-    SSL_flag_qc1_physical = SSL_flag_qc1_physical[valid_time]
-    Q_flag_qc2_log_iqr = Q_flag_qc2_log_iqr[valid_time]
-    SSC_flag_qc2_log_iqr = SSC_flag_qc2_log_iqr[valid_time]
-    SSC_flag_qc3_ssc_q = SSC_flag_qc3_ssc_q[valid_time]
-    SSL_flag_qc3_from_ssc_q = SSL_flag_qc3_from_ssc_q[valid_time]
+    ssc_q_bounds = qc.get("ssc_q_bounds", None)
 
     # -----------------------------
     # 5. Diagnostic plot (optional)
@@ -186,34 +88,20 @@ def apply_tool_qc(
     if plot_dir is not None and ssc_q_bounds is not None:
         plot_dir.mkdir(parents=True, exist_ok=True)
         plot_ssc_q_diagnostic(
-            time=pd.to_datetime(time, unit="D", origin="1970-01-01"),
-            Q=Q,
-            SSC=SSC,
-            Q_flag=Q_flag,
-            SSC_flag=SSC_flag,
+            time=pd.to_datetime(qc["time"], unit="D", origin="1970-01-01"),
+            Q=qc["Q"],
+            SSC=qc["SSC"],
+            Q_flag=qc["Q_flag"],
+            SSC_flag=qc["SSC_flag"],
             ssc_q_bounds=ssc_q_bounds,
             station_id=station_id,
             station_name=station_name,
             out_png=plot_dir / f"{station_id}_ssc_q.png",
         )
 
-    return {
-        "time": time,
-        "Q": Q,
-        "SSC": SSC,
-        "SSL": SSL,
-        "Q_flag": Q_flag,
-        "SSC_flag": SSC_flag,
-        "SSL_flag": SSL_flag,
-        # Step-level provenance flags
-        "Q_flag_qc1_physical": Q_flag_qc1_physical,
-        "SSC_flag_qc1_physical": SSC_flag_qc1_physical,
-        "SSL_flag_qc1_physical": SSL_flag_qc1_physical,
-        "Q_flag_qc2_log_iqr": Q_flag_qc2_log_iqr,
-        "SSC_flag_qc2_log_iqr": SSC_flag_qc2_log_iqr,
-        "SSC_flag_qc3_ssc_q": SSC_flag_qc3_ssc_q,
-        "SSL_flag_qc3_from_ssc_q": SSL_flag_qc3_from_ssc_q,
-    }
+    # Remove non-serializable extras from return
+    qc.pop("ssc_q_bounds", None)
+    return qc
 
 
 class HYDATQualityControl:
@@ -368,6 +256,7 @@ class HYDATQualityControl:
                 SSL_flag_qc1_physical = qc["SSL_flag_qc1_physical"]
                 Q_flag_qc2_log_iqr = qc["Q_flag_qc2_log_iqr"]
                 SSC_flag_qc2_log_iqr = qc["SSC_flag_qc2_log_iqr"]
+                SSL_flag_qc2_log_iqr = qc["SSL_flag_qc2_log_iqr"]
                 SSC_flag_qc3_ssc_q = qc["SSC_flag_qc3_ssc_q"]
                 SSL_flag_qc3_from_ssc_q = qc["SSL_flag_qc3_from_ssc_q"]
 
@@ -394,7 +283,7 @@ class HYDATQualityControl:
                         out[name] = int(np.sum(arr == code))
                     return out
 
-                final_map = {0: "good", 2: "suspect", 3: "bad", 9: "missing"}
+                final_map = {0: "good", 1: "estimated", 2: "suspect", 3: "bad", 9: "missing"}
                 step_map = {0: "pass", 2: "suspect", 8: "not_checked", 9: "missing"}
                 ssl_qc3_map = {0: "not_propagated", 2: "propagated", 8: "not_checked", 9: "missing"}
 
@@ -535,7 +424,7 @@ class HYDATQualityControl:
                     var_SSL.long_name = 'suspended sediment load'
                     var_SSL.units = 'ton day-1'
                     var_SSL.coordinates = 'time lat lon'
-                    var_SSL.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc3_from_ssc_q'
+                    var_SSL.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
                     var_SSL.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4, where 86.4 = 86400 s/day × 10⁻⁶ ton/mg × 1000 L/m³.'
                     var_SSL[:] = SSL
 
@@ -556,6 +445,15 @@ class HYDATQualityControl:
                     var_SSL_flag_qc1.flag_meanings = 'pass bad_data missing_data'
                     var_SSL_flag_qc1.comment = 'QC step 1 (physical): 3=physically impossible (e.g., negative), 9=missing/fill.'
                     var_SSL_flag_qc1[:] = SSL_flag_qc1_physical
+
+                    # SSL - QC2 log-IQR provenance flag (usually not_checked for derived SSL)
+                    var_SSL_flag_qc2 = ds_out.createVariable('SSL_flag_qc2_log_iqr', 'i1', ('time',), fill_value=np.int8(9))
+                    var_SSL_flag_qc2.long_name = 'QC2 log-IQR screening flag for suspended sediment load'
+                    var_SSL_flag_qc2.standard_name = 'status_flag'
+                    var_SSL_flag_qc2.flag_values = np.array([0, 2, 8, 9], dtype=np.int8)
+                    var_SSL_flag_qc2.flag_meanings = 'pass suspect_data not_checked missing_data'
+                    var_SSL_flag_qc2.comment = 'QC step 2 (statistical): applied only if SSL is independent; if SSL is derived/estimated, values are typically 8 (not_checked) or 9 (missing).'
+                    var_SSL_flag_qc2[:] = SSL_flag_qc2_log_iqr
 
                     # SSL - QC3 propagation provenance flag (from SSC–Q inconsistency)
                     var_SSL_flag_qc3 = ds_out.createVariable('SSL_flag_qc3_from_ssc_q', 'i1', ('time',), fill_value=np.int8(9))
@@ -683,6 +581,7 @@ class HYDATQualityControl:
 
                     **{f"Q_qc2_{k}": v for k, v in _count_flags(Q_flag_qc2_log_iqr, step_map).items()},
                     **{f"SSC_qc2_{k}": v for k, v in _count_flags(SSC_flag_qc2_log_iqr, step_map).items()},
+                    **{f"SSL_qc2_{k}": v for k, v in _count_flags(SSL_flag_qc2_log_iqr, step_map).items()},
                     **{f"SSC_qc3_{k}": v for k, v in _count_flags(SSC_flag_qc3_ssc_q, step_map).items()},
                     **{f"SSL_qc3_{k}": v for k, v in _count_flags(SSL_flag_qc3_from_ssc_q, ssl_qc3_map).items()},
                 }
@@ -784,14 +683,15 @@ class HYDATQualityControl:
         preferred_cols = [
             'station_name', 'Source_ID', 'river_name', 'longitude', 'latitude',
             'QC_n_days',
-            'Q_final_good', 'Q_final_suspect', 'Q_final_bad', 'Q_final_missing',
-            'SSC_final_good', 'SSC_final_suspect', 'SSC_final_bad', 'SSC_final_missing',
-            'SSL_final_good', 'SSL_final_suspect', 'SSL_final_bad', 'SSL_final_missing',
+            'Q_final_good', 'Q_final_estimated', 'Q_final_suspect', 'Q_final_bad', 'Q_final_missing',
+            'SSC_final_good', 'SSC_final_estimated', 'SSC_final_suspect', 'SSC_final_bad', 'SSC_final_missing',
+            'SSL_final_good', 'SSL_final_estimated', 'SSL_final_suspect', 'SSL_final_bad', 'SSL_final_missing',
             'Q_qc1_pass', 'Q_qc1_bad', 'Q_qc1_missing',
             'SSC_qc1_pass', 'SSC_qc1_bad', 'SSC_qc1_missing',
             'SSL_qc1_pass', 'SSL_qc1_bad', 'SSL_qc1_missing',
             'Q_qc2_pass', 'Q_qc2_suspect', 'Q_qc2_not_checked', 'Q_qc2_missing',
             'SSC_qc2_pass', 'SSC_qc2_suspect', 'SSC_qc2_not_checked', 'SSC_qc2_missing',
+            'SSL_qc2_pass', 'SSL_qc2_suspect', 'SSL_qc2_not_checked', 'SSL_qc2_missing',
             'SSC_qc3_pass', 'SSC_qc3_suspect', 'SSC_qc3_not_checked', 'SSC_qc3_missing',
             'SSL_qc3_not_propagated', 'SSL_qc3_propagated', 'SSL_qc3_not_checked', 'SSL_qc3_missing',
         ]
