@@ -115,10 +115,10 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         Q=np.array([Q], dtype=float),
         SSC=np.array([SSC], dtype=float),
         SSL=np.array([SSL], dtype=float),
-        Q_is_independent=False,#calculate_discharge
+        Q_is_independent=True,#calculate_discharge
         SSC_is_independent=False,#calculate_ssc
-        SSL_is_independent=False,#calculate_ssl，only change unit
-        ssl_is_derived_from_q_ssc=True,
+        SSL_is_independent=True,#calculate_ssl，only change unit
+        ssl_is_derived_from_q_ssc=False,
         qc2_k=1.5,
         qc2_min_samples=5,
         qc3_k=1.5,
