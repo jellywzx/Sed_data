@@ -48,7 +48,7 @@ from tool import (
     generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
-def apply_tool_qc( #把tool.py中的质量控制函数封装成一个本地函数
+def apply_tool_qc(
     time,
     Q,
     SSC,
@@ -56,114 +56,75 @@ def apply_tool_qc( #把tool.py中的质量控制函数封装成一个本地函�
     station_id,
     station_name,
     plot_dir=None,
-    ):
+):
     """
-    Apply QC using functions from tool.py (local wrapper).
-
-    Rules
-    -----
-    - Physical checks: apply_quality_flag
-    - Statistical screening: log-IQR (Q, SSC only)
-    - Hydrological consistency: SSC–Q envelope
-    - Valid time: keep days where ANY of Q/SSC/SSL is not missing
+    Apply QC using tool.py end-to-end pipeline WITH step-level provenance flags.
+    Also fixes valid-time logic using value-based missing detection.
     """
 
-    n = len(time)
-
-    # -----------------------------
-    # 1. Physical QC (baseline) 0=good，2=suspect，3=bad，9=missing
-    # -----------------------------
-    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8) #给每一个变量打初始标记np.int8
-    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
-    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
-
-    # -----------------------------
-    # 2. log-IQR screening
-    #    (only independent vars)
-    # -----------------------------
-    q_bounds = compute_log_iqr_bounds(Q) #计算上下界函数
-    if q_bounds[0] is not None:
-        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
-
-    ssc_bounds = compute_log_iqr_bounds(SSC)
-    if ssc_bounds[0] is not None:
-        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2 #给超出范围的SSC打上2（怀疑）标记
-
-    # -----------------------------
-    # 3. SSC–Q consistency check
-    # -----------------------------
-    ssc_q_bounds = build_ssc_q_envelope(Q, SSC) #建立SSC-Q包络线函数
-
-    if ssc_q_bounds is not None:
-        for i in range(n):
-            inconsistent, _ = check_ssc_q_consistency(
-                Q[i], SSC[i],
-                Q_flag[i], SSC_flag[i],
-                ssc_q_bounds
-            ) #检查SSC-Q一致性函数，如果不一致返回True，设置suspect=2
-
-            if inconsistent:
-                SSC_flag[i] = 2
-                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl( #传播不一致性到SSL
-                    inconsistent=inconsistent,
-                    Q=Q[i],
-                    SSC=SSC[i],
-                    SSL=SSL[i],
-                    Q_flag=Q_flag[i],
-                    SSC_flag=SSC_flag[i],
-                    SSL_flag=SSL_flag[i],
-                    ssl_is_derived_from_q_ssc=True  #SSL是从Q和SSC计算得来的设为True
-                )
-
-
-    # -----------------------------
-    # 4. Valid-time mask 裁剪时间轴
-    #    ANY variable non-missing
-    # -----------------------------
-    valid_time = (
-        (Q_flag != FILL_VALUE_INT)
-        | (SSC_flag != FILL_VALUE_INT)
-        | (SSL_flag != FILL_VALUE_INT)
+    # 调用 tool.py 的通用 QC（QC1/QC2/QC3 + provenance）
+    qc = apply_hydro_qc_with_provenance(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=False,
+        ssl_is_derived_from_q_ssc=True,
+        qc2_k=1.5,
+        qc2_min_samples=5,
+        qc3_k=1.5,
+        qc3_min_samples=5,
     )
 
+    if qc is None:
+        return None
+
+    # =============================
+    # ✅ 修正 valid time 逻辑（关键）
+    # =============================
+    # 不仅看 flag，还要用“值是否为 NaN / fill”来判定是否缺失
+    def _present(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        return (
+            (f != FILL_VALUE_INT)  # final flag 不是 9
+            & np.isfinite(v)
+            & (~np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5))
+        )
+
+    present_Q   = _present(qc["Q"], qc["Q_flag"])
+    present_SSC = _present(qc["SSC"], qc["SSC_flag"])
+    present_SSL = _present(qc["SSL"], qc["SSL_flag"])
+
+    valid_time = present_Q | present_SSC | present_SSL
     if not np.any(valid_time):
-        return None #如果三个变量都没有有效时间点，返回None
+        return None
 
-    time = time[valid_time]
-    Q = Q[valid_time]
-    SSC = SSC[valid_time]
-    SSL = SSL[valid_time]
-    Q_flag = Q_flag[valid_time]
-    SSC_flag = SSC_flag[valid_time]
-    SSL_flag = SSL_flag[valid_time]
+    # 按修正后的 valid_time 再裁一遍（包括分步 flags）
+    for k in list(qc.keys()):
+        if isinstance(qc[k], np.ndarray) and len(qc[k]) == len(valid_time):
+            qc[k] = qc[k][valid_time]
 
-    # -----------------------------
-    # 5. Diagnostic plot (optional)
-    # -----------------------------
-    if plot_dir is not None and ssc_q_bounds is not None:
+    # =============================
+    # 诊断图（可选）
+    # =============================
+    if plot_dir is not None and qc.get("ssc_q_bounds") is not None:
         plot_dir.mkdir(parents=True, exist_ok=True)
         plot_ssc_q_diagnostic(
-            time=pd.to_datetime(time, unit="D", origin="1970-01-01"),
-            Q=Q,
-            SSC=SSC,
-            Q_flag=Q_flag,
-            SSC_flag=SSC_flag,
-            ssc_q_bounds=ssc_q_bounds,
+            time=pd.to_datetime(qc["time"], unit="D", origin="1970-01-01"),
+            Q=qc["Q"],
+            SSC=qc["SSC"],
+            Q_flag=qc["Q_flag"],
+            SSC_flag=qc["SSC_flag"],
+            ssc_q_bounds=qc["ssc_q_bounds"],
             station_id=station_id,
             station_name=station_name,
             out_png=plot_dir / f"{station_id}_ssc_q.png",
         )
 
-    return {
-        "time": time,
-        "Q": Q,
-        "SSC": SSC,
-        "SSL": SSL,
-        "Q_flag": Q_flag,
-        "SSC_flag": SSC_flag,
-        "SSL_flag": SSL_flag,
-    }
-
+    return qc
 
 class HYDATQualityControl: 
     """HYDAT批量数据质量控制和标准化处理类"""
@@ -196,6 +157,17 @@ class HYDATQualityControl:
             'stations_info': []
         }
 
+    def _count_flags(self, f):
+        f = np.asarray(f, dtype=np.int8)
+        return {
+            "good": int(np.sum(f == 0)),
+            "estimated": int(np.sum(f == 1)),
+            "suspect": int(np.sum(f == 2)),
+            "bad": int(np.sum(f == 3)),
+            "missing": int(np.sum(f == FILL_VALUE_INT)),
+        }
+
+
     def calculate_completeness(self, data_array, flag_array, start_date, end_date):
         """
         计算数据完整性（Good data的百分比）
@@ -224,6 +196,28 @@ class HYDATQualityControl:
             return (good_data_count / total_days) * 100.0
         else:
             return 0.0
+        
+    def _count_final_flags(self, f):
+        f = np.asarray(f, dtype=np.int8)
+        return {
+            "good": int(np.sum(f == 0)),
+            "estimated": int(np.sum(f == 1)),
+            "suspect": int(np.sum(f == 2)),
+            "bad": int(np.sum(f == 3)),
+            "missing": int(np.sum(f == FILL_VALUE_INT)),  # 9
+        }
+
+    def _count_step_flags(self, f, mapping: dict):
+        """
+        mapping: { "col_suffix": flag_value }
+        e.g. {"pass":0, "suspect":2, "not_checked":8, "missing":9}
+        """
+        f = np.asarray(f, dtype=np.int8)
+        out = {}
+        for name, val in mapping.items():
+            out[name] = int(np.sum(f == np.int8(val)))
+        return out
+
 
     def process_station(self, input_file): #处理单个站点文件
         """
@@ -553,11 +547,87 @@ class HYDATQualityControl:
                     'SSL_end_date': end_date.year,
                     'SSL_percent_complete': round(SSL_completeness, 2)
                 }
+                # ==========================================================
+                # ✅ QC统计（最终 + 分步）
+                # ==========================================================
+                station_info["QC_n_days"] = int(len(time))
+
+                # ---- Final flags count ----
+                q_cnt   = self._count_final_flags(Q_flag)
+                ssc_cnt = self._count_final_flags(SSC_flag)
+                ssl_cnt = self._count_final_flags(SSL_flag)
+
+                station_info.update({
+                    "Q_final_good": q_cnt["good"],
+                    "Q_final_estimated": q_cnt["estimated"],
+                    "Q_final_suspect": q_cnt["suspect"],
+                    "Q_final_bad": q_cnt["bad"],
+                    "Q_final_missing": q_cnt["missing"],
+
+                    "SSC_final_good": ssc_cnt["good"],
+                    "SSC_final_estimated": ssc_cnt["estimated"],
+                    "SSC_final_suspect": ssc_cnt["suspect"],
+                    "SSC_final_bad": ssc_cnt["bad"],
+                    "SSC_final_missing": ssc_cnt["missing"],
+
+                    "SSL_final_good": ssl_cnt["good"],
+                    "SSL_final_estimated": ssl_cnt["estimated"],
+                    "SSL_final_suspect": ssl_cnt["suspect"],
+                    "SSL_final_bad": ssl_cnt["bad"],
+                    "SSL_final_missing": ssl_cnt["missing"],
+                })
+
+                # ---- Step flags count (QC1/QC2/QC3) ----
+                # QC1 step flag: 0 pass, 3 bad, 9 missing
+                qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+
+                # QC2 step flag: 0 pass, 2 suspect, 8 not_checked, 9 missing
+                qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+                # QC3 SSC–Q step: 0 pass, 2 suspect, 8 not_checked, 9 missing
+                qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+                # QC3 SSL propagation step: 2 propagated, 0 not_propagated, 8 not_checked, 9 missing
+                qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+                # 注意：这些 key 只有在你用 apply_hydro_qc_with_provenance 时才会存在
+                if "Q_flag_qc1_physical" in qc:
+                    c = self._count_step_flags(qc["Q_flag_qc1_physical"], qc1_map)
+                    station_info.update({f"Q_qc1_{k}": v for k, v in c.items()})
+
+                if "SSC_flag_qc1_physical" in qc:
+                    c = self._count_step_flags(qc["SSC_flag_qc1_physical"], qc1_map)
+                    station_info.update({f"SSC_qc1_{k}": v for k, v in c.items()})
+
+                if "SSL_flag_qc1_physical" in qc:
+                    c = self._count_step_flags(qc["SSL_flag_qc1_physical"], qc1_map)
+                    station_info.update({f"SSL_qc1_{k}": v for k, v in c.items()})
+
+                if "Q_flag_qc2_log_iqr" in qc:
+                    c = self._count_step_flags(qc["Q_flag_qc2_log_iqr"], qc2_map)
+                    station_info.update({f"Q_qc2_{k}": v for k, v in c.items()})
+
+                if "SSC_flag_qc2_log_iqr" in qc:
+                    c = self._count_step_flags(qc["SSC_flag_qc2_log_iqr"], qc2_map)
+                    station_info.update({f"SSC_qc2_{k}": v for k, v in c.items()})
+
+                if "SSL_flag_qc2_log_iqr" in qc:
+                    c = self._count_step_flags(qc["SSL_flag_qc2_log_iqr"], qc2_map)
+                    station_info.update({f"SSL_qc2_{k}": v for k, v in c.items()})
+
+                if "SSC_flag_qc3_ssc_q" in qc:
+                    c = self._count_step_flags(qc["SSC_flag_qc3_ssc_q"], qc3_map)
+                    station_info.update({f"SSC_qc3_{k}": v for k, v in c.items()})
+
+                if "SSL_flag_qc3_from_ssc_q" in qc:
+                    c = self._count_step_flags(qc["SSL_flag_qc3_from_ssc_q"], qc3_ssl_map)
+                    station_info.update({f"SSL_qc3_{k}": v for k, v in c.items()})
+
+
                 station_info.update({
                         "n_warnings": len(station_warnings),
                         "warnings": " | ".join(station_warnings[:5])  # 最多存前5条，防爆
                     })
-
 
                 self.stats['processed_stations'] += 1
                 print(f"  ✓ 成功处理")
@@ -632,18 +702,25 @@ class HYDATQualityControl:
 def main():
     """主函数"""
     # 设置路径
-    input_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYDAT/sediment_update/')
-    output_dir = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/HYDAT/output_update/')
+    BASE_DIR = Path(__file__).resolve().parent          # .../Script/Hydat 之类
+    PROJECT_DIR = BASE_DIR.parents[1]                      # 上一级（你之前的 PARENT_DIR 逻辑）
+
+    # 用相对路径替代绝对路径（按你的目录结构改这里）
+    input_dir = PROJECT_DIR / "Output_r" / "daily" / "HYDAT" / "sediment_update"
+    output_dir = PROJECT_DIR / "Output_r" / "daily" / "HYDAT" / "output_update"
+
     csv_file = output_dir / 'HYDAT_station_summary.csv'
 
     # 创建处理对象
     qc = HYDATQualityControl(input_dir, output_dir) #这行是在初始化类，传入输入输出目录。初始化类是为了创建一个类的实例，并为其设置初始状态或属性。
+    qc_csv = output_dir / "HYDAT_qc_results_summary.csv"
 
     # 处理所有站点
     stats = qc.process_all_stations() #调用类的方法处理所有站点
 
     # 生成CSV摘要
     qc.generate_csv_summary(csv_file)
+    qc.generate_qc_results_csv(qc_csv)
 
     print(f"\n✓ 全部完成!")
     print(f"  输出目录: {output_dir}")
