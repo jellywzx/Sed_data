@@ -1215,6 +1215,126 @@ def plot_ssc_q_diagnostic(
 #=====================================
 # summary CSV generation
 #====================================
+def summarize_warning_types(stations_info):
+    """
+    Summarize and print warning types across stations.
+
+    Parameters
+    ----------
+    stations_info : list[dict]
+        Station metadata dictionaries containing "warnings" (pipe-delimited).
+
+    Returns
+    -------
+    collections.Counter
+        Warning counts by warning message.
+    """
+    counter = Counter()
+
+    for station in stations_info:
+        warnings = station.get("warnings")
+        if warnings:
+            for warning in warnings.split(" | "):
+                if warning:
+                    counter[warning] += 1
+
+    print("\nMetadata warning type summary:")
+    for warning, count in counter.most_common():
+        print(f"  {count:4d} × {warning}")
+
+    return counter
+
+
+def generate_csv_summary(stations_info, output_csv, column_order=None):
+    """Generate a station metadata summary CSV."""
+    print(f"\n生成CSV摘要文件: {output_csv}")
+
+    if not stations_info:
+        print("  ⚠ 警告: 无站点信息可写入CSV")
+        return
+
+    df = pd.DataFrame(stations_info)
+
+    if column_order is None:
+        column_order = [
+            'station_name', 'Source_ID', 'river_name', 'longitude', 'latitude',
+            'altitude', 'upstream_area', 'Data Source Name', 'Type',
+            'Temporal Resolution', 'Temporal Span', 'Variables Provided',
+            'Geographic Coverage', 'Reference/DOI',
+            'Q_start_date', 'Q_end_date', 'Q_percent_complete',
+            'SSC_start_date', 'SSC_end_date', 'SSC_percent_complete',
+            'SSL_start_date', 'SSL_end_date', 'SSL_percent_complete'
+        ]
+
+    ordered_cols = [col for col in column_order if col in df.columns]
+    remaining_cols = [col for col in df.columns if col not in ordered_cols]
+    if ordered_cols:
+        df = df[ordered_cols + remaining_cols]
+
+    df.to_csv(output_csv, index=False)
+
+    print(f"  ✓ CSV文件已生成: {len(df)} 个站点")
+
+
+def generate_qc_results_csv(stations_info, output_csv, preferred_cols=None):
+    """Generate per-station QC results summary CSV."""
+    print(f"\n生成站点QC结果汇总CSV: {output_csv}")
+
+    if not stations_info:
+        print("  ⚠ 警告: 无站点信息可写入CSV")
+        return
+
+    df = pd.DataFrame(stations_info)
+
+    if preferred_cols is None:
+        preferred_cols = [
+            'station_name', 'Source_ID', 'river_name', 'longitude', 'latitude',
+            'QC_n_days',
+            'Q_final_good', 'Q_final_estimated', 'Q_final_suspect', 'Q_final_bad', 'Q_final_missing',
+            'SSC_final_good', 'SSC_final_estimated', 'SSC_final_suspect', 'SSC_final_bad', 'SSC_final_missing',
+            'SSL_final_good', 'SSL_final_estimated', 'SSL_final_suspect', 'SSL_final_bad', 'SSL_final_missing',
+            'Q_qc1_pass', 'Q_qc1_bad', 'Q_qc1_missing',
+            'SSC_qc1_pass', 'SSC_qc1_bad', 'SSC_qc1_missing',
+            'SSL_qc1_pass', 'SSL_qc1_bad', 'SSL_qc1_missing',
+            'Q_qc2_pass', 'Q_qc2_suspect', 'Q_qc2_not_checked', 'Q_qc2_missing',
+            'SSC_qc2_pass', 'SSC_qc2_suspect', 'SSC_qc2_not_checked', 'SSC_qc2_missing',
+            'SSL_qc2_pass', 'SSL_qc2_suspect', 'SSL_qc2_not_checked', 'SSL_qc2_missing',
+            'SSC_qc3_pass', 'SSC_qc3_suspect', 'SSC_qc3_not_checked', 'SSC_qc3_missing',
+            'SSL_qc3_not_propagated', 'SSL_qc3_propagated', 'SSL_qc3_not_checked', 'SSL_qc3_missing',
+        ]
+
+    cols = [col for col in preferred_cols if col in df.columns]
+    if cols:
+        df = df[cols]
+
+    df.to_csv(output_csv, index=False)
+    print(f"  ✓ QC结果CSV已生成: {len(df)} 个站点")
+
+
+def generate_warning_summary_csv(stations_info, output_csv):
+    """Generate a warning summary CSV for stations with metadata warnings."""
+    if not stations_info:
+        print("⚠ No station info available for warning summary.")
+        return
+
+    rows = []
+    for station in stations_info:
+        if station.get("n_warnings", 0) > 0:
+            rows.append({
+                "station_name": station.get("station_name", ""),
+                "Source_ID": station.get("Source_ID", ""),
+                "n_warnings": station.get("n_warnings", 0),
+                "warnings": station.get("warnings", ""),
+            })
+
+    if not rows:
+        print("✓ No warnings found across all stations.")
+        return
+
+    df = pd.DataFrame(rows)
+    df.sort_values("n_warnings", ascending=False, inplace=True)
+    df.to_csv(output_csv, index=False)
+    print(f"✓ Warning summary CSV written: {output_csv} ({len(df)} stations)")
 
 def generate_station_summary_csv(station_data, output_dir):
     """Generate a CSV summary file of station metadata and data completeness."""
