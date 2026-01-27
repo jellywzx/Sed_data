@@ -43,10 +43,10 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
-    summarize_warning_types as summarize_warning_types_tool,
+    # summarize_warning_types as summarize_warning_types_tool,
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
-    generate_warning_summary_csv as generate_warning_summary_csv_tool,
+    # generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
 def fmt_float(x, nd=2):
@@ -217,8 +217,8 @@ def process_station(input_file, output_dir):
             SSL=ssl_data,
             Q_is_independent=True, # discharge is independent variable
             SSC_is_independent=True, # ssc is independent variable
-            SSL_is_independent=True, # ssl is independent variable
-            ssl_is_derived_from_q_ssc=False,
+            SSL_is_independent=False, # ssl is independent variable
+            ssl_is_derived_from_q_ssc=True,
             qc2_k=1.5, 
             qc2_min_samples=5,
             qc3_k=1.5, 
@@ -316,6 +316,12 @@ def process_station(input_file, output_dir):
         q_suspect = np.sum(q_flags == 2)
         q_bad = np.sum(q_flags == 3)
         q_missing = np.sum(q_flags == 9)
+        # estimated（final flag == 1）
+        q_estimated   = np.sum(q_flags == 1)
+        ssc_estimated = np.sum(ssc_flags == 1)
+        ssl_estimated = np.sum(ssl_flags == 1)
+        # 站点最终用于统计的天数（trim 后）
+        qc_n_days = int(len(q_flags))   # 或 len(time_data)，两者这里等价
 
         ssc_good = np.sum(ssc_flags == 0)
         ssc_suspect = np.sum(ssc_flags == 2)
@@ -326,6 +332,7 @@ def process_station(input_file, output_dir):
         ssl_suspect = np.sum(ssl_flags == 2)
         ssl_bad = np.sum(ssl_flags == 3)
         ssl_missing = np.sum(ssl_flags == 9)
+
 
         print(f"  Station: {station_name} ({river_name})")
         print(f"  Location: {lat:.3f}°, {lon:.3f}°")
@@ -546,8 +553,27 @@ def process_station(input_file, output_dir):
             'Q_good': int(q_good), 'Q_suspect': int(q_suspect), 'Q_bad': int(q_bad), 'Q_missing': int(q_missing),
             'SSC_good': int(ssc_good), 'SSC_suspect': int(ssc_suspect), 'SSC_bad': int(ssc_bad), 'SSC_missing': int(ssc_missing),
             'SSL_good': int(ssl_good), 'SSL_suspect': int(ssl_suspect), 'SSL_bad': int(ssl_bad), 'SSL_missing': int(ssl_missing),
+            "QC_n_days": int(len(time_data)),
 
+            "Q_final_good": int(q_good),
+            "Q_final_estimated": int(q_estimated),
+            "Q_final_suspect": int(q_suspect),
+            "Q_final_bad": int(q_bad),
+            "Q_final_missing": int(q_missing),
+
+            "SSC_final_good": int(ssc_good),
+            "SSC_final_estimated": int(ssc_estimated),
+            "SSC_final_suspect": int(ssc_suspect),
+            "SSC_final_bad": int(ssc_bad),
+            "SSC_final_missing": int(ssc_missing),
+
+            "SSL_final_good": int(ssl_good),
+            "SSL_final_estimated": int(ssl_estimated),
+            "SSL_final_suspect": int(ssl_suspect),
+            "SSL_final_bad": int(ssl_bad),
+            "SSL_final_missing": int(ssl_missing),
         }
+
 
         return station_info
 
@@ -635,34 +661,26 @@ def main():
 
         print(f"Station summary saved to: {csv_file}")
         print(f"Total stations: {len(df)}")
-        # ------------------------------------------------------------
-    # Standardized tool outputs (same pattern as HYDAT example)
+    # ------------------------------------------------------------
+    # Tool outputs (HYDAT-style): ONLY two CSVs
     # ------------------------------------------------------------
     if len(station_info_list) > 0:
         print("\n" + "=" * 80)
-        print("Generating Tool QC Summaries")
+        print("Generating Tool CSV Summaries (2 files)")
         print("=" * 80)
 
-        # 1) warning type summary (console)
-        warning_type_summary = summarize_warning_types_tool(station_info_list)
-        print("\n[WARN] Summary by type:")
-        print(warning_type_summary)
+        station_csv = os.path.join(output_dir, "Bayern_station_summary.csv")
+        qc_csv      = os.path.join(output_dir, "Bayern_qc_results_summary.csv")
 
-        # 2) tool CSVs
-        tool_csv_summary = os.path.join(output_dir, "tool_csv_summary.csv")
-        tool_qc_results = os.path.join(output_dir, "tool_qc_results.csv")
-        tool_warning_summary = os.path.join(output_dir, "tool_warning_summary.csv")
-
-        generate_csv_summary_tool(station_info_list, tool_csv_summary)
-        generate_qc_results_csv_tool(station_info_list, tool_qc_results)
-        generate_warning_summary_csv_tool(station_info_list, tool_warning_summary)
+        generate_csv_summary_tool(station_info_list, station_csv)
+        generate_qc_results_csv_tool(station_info_list, qc_csv)
 
         print("\n[CSV] Tool outputs written:")
-        print("  -", tool_csv_summary)
-        print("  -", tool_qc_results)
-        print("  -", tool_warning_summary)
+        print("  -", station_csv)
+        print("  -", qc_csv)
     else:
-        print("WARNING: No successful stations processed, CSV not created")
+        print("WARNING: No successful stations processed, tool CSV not created")
+
 
     print()
     print("="*80)
