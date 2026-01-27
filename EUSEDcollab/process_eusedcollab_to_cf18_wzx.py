@@ -29,6 +29,7 @@ import numpy as np
 import netCDF4 as nc
 from datetime import datetime
 import warnings
+import json
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
@@ -43,20 +44,20 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
-
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..', '..'))
 # Data paths
-SOURCE_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/EUSEDcollab/'
-OUTPUT_DIR = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/EUSEDcollab/qc'
+SOURCE_DIR = os.path.join(PROJECT_ROOT, 'Source', 'EUSEDcollab')
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'Output_r', 'monthly', 'EUSEDcollab', 'qc')
 METADATA_FILE = os.path.join(SOURCE_DIR, 'ALL_METADATA.csv')
-
 
 FILL_VALUE = -9999.0
 # =============================================================================
@@ -295,45 +296,42 @@ def qc_with_toolpy(
         bad = np.isfinite(SSL) & (SSL > 0) & ((SSL < ssl_lb) | (SSL > ssl_ub))
         SSL_flag = np.where(bad & (SSL_flag == 0), np.int8(2), SSL_flag)
 
-    # （可选）若你也想对 Q 做 IQR，可以打开这段
-    # q_lb, q_ub = compute_log_iqr_bounds(Q, k=iqr_k)
-    # if q_lb is not None:
-    #     bad = np.isfinite(Q) & (Q > 0) & ((Q < q_lb) | (Q > q_ub))
-    #     Q_flag = np.where(bad & (Q_flag == 0), np.int8(2), Q_flag)
+    # -----------------------------
+    # 4) write back
+    # -----------------------------
+    out["Q_flag"]   = Q_flag.astype(np.int8)
+    out["SSC_flag"] = SSC_flag.astype(np.int8)
+    out["SSL_flag"] = SSL_flag.astype(np.int8)
 
-    # ----------------------------
-    # 3) SSC–Q envelope consistency
-    # ----------------------------
+    # build SSC–Q envelope (may return None if not enough samples)
     ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=Q,
-        SSC_mgL=SSC,
+        Q_m3s=out["Q"].to_numpy(dtype=float),
+        SSC_mgL=out["SSC"].to_numpy(dtype=float),
         k=iqr_k,
         min_samples=min_samples_envelope
     )
 
+    # ✅ Always define resid_arr to avoid NameError
     resid_arr = np.full(len(out), np.nan, dtype=float)
+
     if ssc_q_bounds is not None:
+        Q_arr   = out["Q"].to_numpy(dtype=float)
+        SSC_arr = out["SSC"].to_numpy(dtype=float)
+        Qf_arr  = out["Q_flag"].to_numpy(dtype=np.int8)
+        SSCf_arr= out["SSC_flag"].to_numpy(dtype=np.int8)
+
         for i in range(len(out)):
             inconsistent, resid = check_ssc_q_consistency(
-                Q=Q[i], SSC=SSC[i],
-                Q_flag=Q_flag[i], SSC_flag=SSC_flag[i],
-                ssc_q_bounds=ssc_q_bounds
+                Q_arr[i],
+                SSC_arr[i],
+                int(Qf_arr[i]),
+                int(SSCf_arr[i]),
+                ssc_q_bounds
             )
-            resid_arr[i] = resid
-            if inconsistent and SSC_flag[i] == 0:
-                SSC_flag[i] = np.int8(2)
-                # 如果你希望 SSL 也跟着变成 suspect，可以打开：
-                # if SSL_flag[i] == 0 and np.isfinite(SSL[i]) and SSL[i] > 0:
-                #     SSL_flag[i] = np.int8(2)
+            # resid could be None
+            resid_arr[i] = np.nan if resid is None else float(resid)
 
-    # ----------------------------
-    # 4) write back
-    # ----------------------------
-    out["Q_flag"] = Q_flag.astype(np.int8)
-    out["SSC_flag"] = SSC_flag.astype(np.int8)
-    out["SSL_flag"] = SSL_flag.astype(np.int8)
     out["ssc_q_resid"] = resid_arr
-
     # ----------------------------
     # 5) diagnostic plot
     # ----------------------------
@@ -356,6 +354,108 @@ def qc_with_toolpy(
             print(f"  Warning: diagnostic plot failed: {e}")
 
     return out, ssc_q_bounds
+
+def apply_quality_flag_with_provenance(value, var_name):
+    """
+    Wrapper of tool.apply_quality_flag() that also returns a reason code.
+
+    reason_code (suggested):
+      0: good
+      1: estimated (reserved; usually set by caller mask)
+      2: suspect (e.g., outlier, envelope-inconsistent; set later)
+      3: bad (negative)
+      9: missing (NaN / FillValue)
+    """
+    flag = apply_quality_flag(value, var_name)
+
+    # A lightweight "reason" mapping (you can expand later)
+    if flag == FLAG_MISSING:
+        reason = 9
+    elif flag == FLAG_BAD:
+        reason = 3
+    elif flag == FLAG_SUSPECT:
+        reason = 2
+    elif flag == FLAG_ESTIMATED:
+        reason = 1
+    else:
+        reason = 0
+
+    return np.int8(flag), np.int8(reason)
+
+
+def apply_hydro_qc_with_provenance(
+    df,
+    station_id,
+    station_name,
+    output_dir=None,
+    diagnostic_dir=None,
+    iqr_k=1.5,
+    min_samples_envelope=5,
+    flag_estimated_mask=None,
+):
+    """
+    Apply QC (via qc_with_toolpy) + produce provenance summary.
+
+    Returns
+    -------
+    df_qc : DataFrame
+        df with Q_flag/SSC_flag/SSL_flag/ssc_q_resid (same as qc_with_toolpy)
+    prov : dict
+        station-level QC statistics (counts / percentages)
+    """
+
+    # 1) run your existing QC
+    df_qc, ssc_q_bounds = qc_with_toolpy(
+        df=df,
+        station_id=station_id,
+        station_name=station_name,
+        diagnostic_dir=diagnostic_dir,
+        iqr_k=iqr_k,
+        min_samples_envelope=min_samples_envelope,
+        flag_estimated_mask=flag_estimated_mask,
+    )
+
+    # 2) build provenance summary
+    def _flag_stats(flag_arr):
+        flag_arr = np.asarray(flag_arr, dtype=np.int8)
+        total = int(flag_arr.size)
+        out = {
+            "total": total,
+            "good": int(np.sum(flag_arr == 0)),
+            "estimated": int(np.sum(flag_arr == 1)),
+            "suspect": int(np.sum(flag_arr == 2)),
+            "bad": int(np.sum(flag_arr == 3)),
+            "missing": int(np.sum(flag_arr == 9)),
+        }
+        # percentages
+        if total > 0:
+            for k in ["good", "estimated", "suspect", "bad", "missing"]:
+                out[k + "_pct"] = float(out[k] / total * 100.0)
+        else:
+            for k in ["good", "estimated", "suspect", "bad", "missing"]:
+                out[k + "_pct"] = 0.0
+        return out
+
+    prov = {
+        "station_id": str(station_id),
+        "station_name": str(station_name),
+        "Q": _flag_stats(df_qc["Q_flag"].to_numpy()),
+        "SSC": _flag_stats(df_qc["SSC_flag"].to_numpy()),
+        "SSL": _flag_stats(df_qc["SSL_flag"].to_numpy()),
+    }
+
+    # 3) optionally save provenance json
+    if output_dir is not None:
+        prov_dir = os.path.join(output_dir, "qc_provenance")
+        os.makedirs(prov_dir, exist_ok=True)
+        prov_path = os.path.join(prov_dir, f"EUSEDcollab_{station_id}_{station_name}_qc_provenance.json")
+        try:
+            with open(prov_path, "w", encoding="utf-8") as f:
+                json.dump(prov, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"  Warning: failed to write provenance JSON: {e}")
+
+    return df_qc, ssc_q_bounds, prov
     
 def calculate_data_completeness_from_flag(flag_arr):
     flag_arr = np.asarray(flag_arr, dtype=np.int8)
@@ -558,15 +658,20 @@ def process_station(station_id, country):
     }
 
 
-    df_qc, ssc_q_bounds = qc_with_toolpy(
+    df_qc, ssc_q_bounds, prov = apply_hydro_qc_with_provenance(
         df=df,
         station_id=station_id,
         station_name=metadata["station_name"],
+        output_dir=OUTPUT_DIR,          # 用于保存 provenance JSON
         diagnostic_dir=DIAG_DIR,
         iqr_k=1.5,
         min_samples_envelope=5,
         flag_estimated_mask=estimated_mask
     )
+    print("  QC provenance summary:")
+    print(f"    Q   good={prov['Q']['good']} ({prov['Q']['good_pct']:.1f}%)  missing={prov['Q']['missing']} ({prov['Q']['missing_pct']:.1f}%)")
+    print(f"    SSC good={prov['SSC']['good']} ({prov['SSC']['good_pct']:.1f}%) missing={prov['SSC']['missing']} ({prov['SSC']['missing_pct']:.1f}%)")
+    print(f"    SSL good={prov['SSL']['good']} ({prov['SSL']['good_pct']:.1f}%) missing={prov['SSL']['missing']} ({prov['SSL']['missing_pct']:.1f}%)")
 
     q_flag = df_qc["Q_flag"].to_numpy(dtype=np.int8)
     ssc_flag = df_qc["SSC_flag"].to_numpy(dtype=np.int8)
@@ -617,6 +722,32 @@ def process_station(station_id, country):
     # Create NetCDF file
     output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
     write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file)
+    # ---- Print QC result summary (station-level) ----
+    def _repr_val_and_flag(val_arr, flag_arr):
+        v = np.asarray(val_arr, dtype=float)
+        f = np.asarray(flag_arr, dtype=np.int8)
+
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), int(0)
+
+        if np.any(ok):
+            # 没有 good，就取“最好的那个 flag”（0最好，其次1/2/3/9）
+            best_flag = int(np.min(f[ok]))
+            return float(np.nanmedian(v[ok])), best_flag
+
+        return float("nan"), int(9)
+
+    qv, qf0 = _repr_val_and_flag(df["Q"].values, q_flag)
+    sscv, sscf0 = _repr_val_and_flag(df["SSC"].values, ssc_flag)
+    sslv, sslf0 = _repr_val_and_flag(df["SSL"].values, ssl_flag)
+
+    print(f"  ✓ Created: {output_file}")
+    print(f"    Q: {qv:.2f} m3/s (flag={qf0})")
+    print(f"    SSC: {sscv:.2f} mg/L (flag={sscf0})")
+    print(f"    SSL: {sslv:.2f} ton/day (flag={sslf0})")
 
      # ---------------------------------------------------------
     # Post-write CF-1.8 / ACDD-1.3 compliance check

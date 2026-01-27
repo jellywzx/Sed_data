@@ -18,8 +18,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 
@@ -140,8 +139,21 @@ def apply_tool_qc(
                 Q_flag[i], SSC_flag[i],
                 ssc_q_bounds
             )
-            if inconsistent:
-                SSC_flag[i] = 2
+
+            if inconsistent and SSC_flag[i] == 0:
+                SSC_flag[i] = 2  # suspect
+
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=Q[i],
+                    SSC=SSC[i],
+                    SSL=SSL[i],
+                    Q_flag=Q_flag[i],
+                    SSC_flag=SSC_flag[i],
+                    SSL_flag=SSL_flag[i],
+                    ssl_is_derived_from_q_ssc=True,
+                )
+
 
     # -----------------------------
     # 4. Keep valid rows
@@ -306,6 +318,30 @@ def process_rhine_data(output_path, source_path):
 
         # QC 输出只包含 time/Q/SSC/SSL 和 flags，重新合并经纬度
         merged = pd.DataFrame(qc)
+        n_total = len(merged)
+
+        def _repr(v, f):
+            v = np.asarray(v, dtype=float)
+            f = np.asarray(f, dtype=np.int8)
+            ok = np.isfinite(v) & (v > 0)
+            ok_good = ok & (f == 0)
+            if np.any(ok_good):
+                return float(np.nanmedian(v[ok_good])), 0
+            if np.any(ok):
+                return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+            return np.nan, 9
+
+        qv, qf   = _repr(merged['Q'].values,   merged['Q_flag'].values)
+        sscv, sscf = _repr(merged['SSC'].values, merged['SSC_flag'].values)
+        sslv, sslf = _repr(merged['SSL'].values, merged['SSL_flag'].values)
+
+
+        print(f"  ✔ QC summary ({station_name})")
+        print(f"    Samples: {n_total}")
+        print(f"    Q   : {qv:.2f} m3/s (flag={qf})")
+        print(f"    SSC : {sscv:.2f} mg/L (flag={sscf})")
+        print(f"    SSL : {sslv:.2f} ton/day (flag={sslf})")
+
         if 'date' in merged.columns:
             merged = pd.merge(merged, pre_qc_latlon, on='date', how='left')
         # 标准化列名为脚本其余部分使用的小写形式
@@ -432,7 +468,8 @@ def process_rhine_data(output_path, source_path):
             ds.creator_email = 'weizhw6@mail.sysu.edu.cn'
             ds.creator_institution = 'Sun Yat-sen University, China'
             ds.conventions = 'CF-1.8, ACDD-1.3'
-            
+
+
         # errors, warnings_nc = check_nc_completeness(nc_file_path, strict=True)
 
         # if errors:
@@ -483,8 +520,14 @@ def process_rhine_data(output_path, source_path):
 
 
 if __name__ == "__main__":
-    # 这里替换成你自己的路径
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
     process_rhine_data(
-        output_path="/mnt/d/sediment_wzx_1111/Output_r/daily/Rhine/qc",
-        source_path="/mnt/d/sediment_wzx_1111/Source/Rhine"
+        output_path=os.path.join(
+            PROJECT_ROOT, "Output_r", "daily", "Rhine", "qc"
+        ),
+        source_path=os.path.join(
+            PROJECT_ROOT, "Source", "Rhine"
+        )
     )

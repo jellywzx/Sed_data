@@ -56,8 +56,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 STATION_INFO = {
@@ -344,6 +343,18 @@ class HYBAMProcessor:
                     if inconsistent:
                         SSC_flag[i] = 2  # suspect
 
+                        SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                            inconsistent=True,
+                            Q=Q[i],
+                            SSC=SSC[i],
+                            SSL=SSL[i],
+                            Q_flag=Q_flag[i],
+                            SSC_flag=SSC_flag[i],
+                            SSL_flag=SSL_flag[i],
+                            ssl_is_derived_from_q_ssc=True,
+                        )
+
+
         # --------------------------------------------------
         # Derived SSL
         # --------------------------------------------------
@@ -390,7 +401,19 @@ class HYBAMProcessor:
                 station_name=data_dict.get("station_name", ""),
                 out_png=str(out_png),
             )
+            # ---- QC summary print (station-level) ----
+            n = len(Q)
 
+            def _count(flag, v):
+                return int(np.sum(flag == v)) if flag is not None else 0
+
+            print(
+                f"    QC summary | "
+                f"Q(good/suspect/bad)={_count(Q_flag,0)}/{_count(Q_flag,2)}/{_count(Q_flag,3)}, "
+                f"SSC(good/suspect/bad)={_count(SSC_flag,0)}/{_count(SSC_flag,2)}/{_count(SSC_flag,3)}, "
+                f"SSL(good/suspect/bad)={_count(SSL_flag,0)}/{_count(SSL_flag,2)}/{_count(SSL_flag,3)}"
+            )
+  
         return data_dict
 
     def get_reference_info(self):

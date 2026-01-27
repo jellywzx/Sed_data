@@ -27,6 +27,7 @@ import os
 import glob
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
@@ -140,6 +141,9 @@ def standardize_netcdf_file(input_file, output_dir):
     print(f"  Station: {station_name} ({country})")
     print(f"  Location: {lat:.3f}°, {lon:.3f}°")
     print(f"  SSL: {ssl_val:.2f} ton/day (flag={ssl_flag}), Period: {period}")
+    print(f"  Q: missing in source (flag={q_flag})")
+    print(f"  SSC: missing in source (flag={ssc_flag})")
+
 
     # Create standardized NetCDF file
     with nc.Dataset(output_file, 'w', format='NETCDF4') as ds:
@@ -418,8 +422,9 @@ def main():
     print()
 
     # Paths
-    input_dir = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/nc'
-    output_dir = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/qc'
+    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+    input_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "Vanmaercke", "nc")
+    output_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "Vanmaercke", "qc")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

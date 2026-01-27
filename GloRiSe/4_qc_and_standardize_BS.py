@@ -24,7 +24,7 @@ import os
 warnings.filterwarnings('ignore')
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..')) 
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 from tool import (
@@ -36,14 +36,16 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 
 # Configuration
-INPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe/netcdf_output_BS/')
-OUTPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/GloRiSe/BS/qc/')
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]   
+
+INPUT_DIR = PROJECT_ROOT / "Source" / "GloRiSe" / "netcdf_output_BS"
+OUTPUT_DIR = PROJECT_ROOT / "Output_r" / "daily" / "GloRiSe" / "BS" / "qc"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Original data source information
@@ -94,7 +96,10 @@ def apply_tool_qc(discharge, ssc, ssl, return_envelope=True):
         "SSL_logIQR_suspect": 0,
         "SSC_Q_inconsistent": 0,
         "SSL_inherited_suspect": 0,
+        "SSL_propagated_from_ssc_q": 0,
+
     }
+    
 
    # -------------------------
     # 1. basic physical QC
@@ -141,8 +146,30 @@ def apply_tool_qc(discharge, ssc, ssl, return_envelope=True):
                 ssc_q_bounds=ssc_q_bounds
             )
             if bad:
-                ssc_flag[i] = 2   # suspect
                 bad_cnt += 1
+                ssc_q_inconsistent = True
+
+                # 先把 SSC_flag 从 0 -> 2（suspect）
+                if ssc_flag[i] == 0:
+                    ssc_flag[i] = np.int8(2)
+
+                # 传播到 SSL_flag（SSL 是由 Q 和 SSC 推导的）
+                old_ssl_flag = int(ssl_flag[i])
+                ssl_flag[i] = np.int8(
+                    propagate_ssc_q_inconsistency_to_ssl(
+                        inconsistent=ssc_q_inconsistent,
+                        Q=float(discharge[i]),
+                        SSC=float(ssc[i]),
+                        SSL=float(ssl[i]),
+                        Q_flag=int(q_flag[i]),
+                        SSC_flag=int(ssc_flag[i]),
+                        SSL_flag=int(ssl_flag[i]),
+                        ssl_is_derived_from_q_ssc=True,
+                    )
+                )
+                if old_ssl_flag == 0 and int(ssl_flag[i]) != 0:
+                    qc_report["SSL_propagated_from_ssc_q"] += 1
+
         qc_report["SSC_Q_inconsistent"] = bad_cnt
     else:
         print("    ℹ️ SSC–Q diagnostic skipped (insufficient samples)")
@@ -266,7 +293,28 @@ def standardize_station_file(input_file):
         print(f"      SSL physical flagged     : {qc_report['SSL_physical_bad']}")
         print(f"      SSL log-IQR suspect      : {qc_report['SSL_logIQR_suspect']}")
         print(f"      SSC–Q inconsistent       : {qc_report['SSC_Q_inconsistent']}")
+        print(f"      SSL propagated from SSC–Q : {qc_report['SSL_propagated_from_ssc_q']}")
         print(f"      SSL inherited suspect    : {qc_report['SSL_inherited_suspect']}")
+        # ---- Representative values for quick look (median of good, fallback to all valid) ----
+        def _repr(v, f):
+            v = np.asarray(v, dtype=float)
+            f = np.asarray(f, dtype=np.int8)
+            ok = np.isfinite(v) & (v != -9999.0)
+            ok_good = ok & (f == 0)
+            if np.any(ok_good):
+                return float(np.nanmedian(v[ok_good])), 0
+            if np.any(ok):
+                return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+            return float("nan"), 9
+
+        qv, qf = _repr(discharge, q_flag)
+        sscv, sscf = _repr(ssc, ssc_flag)
+        sslv, sslf = _repr(ssl, ssl_flag)
+
+        print(f"    Q  : {qv:.2f} m3/s (flag={qf})")
+        print(f"    SSC: {sscv:.2f} mg/L (flag={sscf})")
+        print(f"    SSL: {sslv:.2f} ton/day (flag={sslf})")
+
 
 
         # Convert time to datetime for summary

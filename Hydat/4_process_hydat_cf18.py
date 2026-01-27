@@ -23,9 +23,10 @@ warnings.filterwarnings('ignore')
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import sys
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) #得到当前脚本所在目录
+#设置相对路径第一步是利用dirname得到当前脚本所在目录，然后利用os.path.join()函数和获取其他目录的路径。
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..')) 
+if PARENT_DIR not in sys.path: #sys.path：这是一个列表，存储了 Python 查找模块 / 包的路径。
     sys.path.insert(0, PARENT_DIR)
 from tool import (
     FILL_VALUE_FLOAT,
@@ -37,11 +38,17 @@ from tool import (
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
     check_nc_completeness,
-    add_global_attributes,
-    propagate_ssc_q_inconsistency_to_ssl
+    check_variable_metadata_tiered,
+    # add_global_attributes,
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_hydro_qc_with_provenance,
+    summarize_warning_types as summarize_warning_types_tool,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+    generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
-def apply_tool_qc(
+def apply_tool_qc( #把tool.py中的质量控制函数封装成一个本地函数
     time,
     Q,
     SSC,
@@ -64,9 +71,9 @@ def apply_tool_qc(
     n = len(time)
 
     # -----------------------------
-    # 1. Physical QC (baseline)
+    # 1. Physical QC (baseline) 0=good，2=suspect，3=bad，9=missing
     # -----------------------------
-    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8) #给每一个变量打初始标记np.int8
     SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
     SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
 
@@ -74,18 +81,18 @@ def apply_tool_qc(
     # 2. log-IQR screening
     #    (only independent vars)
     # -----------------------------
-    q_bounds = compute_log_iqr_bounds(Q)
+    q_bounds = compute_log_iqr_bounds(Q) #计算上下界函数
     if q_bounds[0] is not None:
         Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
 
     ssc_bounds = compute_log_iqr_bounds(SSC)
     if ssc_bounds[0] is not None:
-        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
+        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2 #给超出范围的SSC打上2（怀疑）标记
 
     # -----------------------------
     # 3. SSC–Q consistency check
     # -----------------------------
-    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+    ssc_q_bounds = build_ssc_q_envelope(Q, SSC) #建立SSC-Q包络线函数
 
     if ssc_q_bounds is not None:
         for i in range(n):
@@ -93,11 +100,11 @@ def apply_tool_qc(
                 Q[i], SSC[i],
                 Q_flag[i], SSC_flag[i],
                 ssc_q_bounds
-            )
+            ) #检查SSC-Q一致性函数，如果不一致返回True，设置suspect=2
 
             if inconsistent:
                 SSC_flag[i] = 2
-                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
+                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl( #传播不一致性到SSL
                     inconsistent=inconsistent,
                     Q=Q[i],
                     SSC=SSC[i],
@@ -105,12 +112,12 @@ def apply_tool_qc(
                     Q_flag=Q_flag[i],
                     SSC_flag=SSC_flag[i],
                     SSL_flag=SSL_flag[i],
-                    ssl_is_derived_from_q_ssc=True  # ← 这里你可以控制
+                    ssl_is_derived_from_q_ssc=True  #SSL是从Q和SSC计算得来的设为True
                 )
 
 
     # -----------------------------
-    # 4. Valid-time mask
+    # 4. Valid-time mask 裁剪时间轴
     #    ANY variable non-missing
     # -----------------------------
     valid_time = (
@@ -120,7 +127,7 @@ def apply_tool_qc(
     )
 
     if not np.any(valid_time):
-        return None
+        return None #如果三个变量都没有有效时间点，返回None
 
     time = time[valid_time]
     Q = Q[valid_time]
@@ -158,8 +165,8 @@ def apply_tool_qc(
     }
 
 
-class HYDATQualityControl:
-    """HYDAT数据质量控制和标准化处理类"""
+class HYDATQualityControl: 
+    """HYDAT批量数据质量控制和标准化处理类"""
 
     def __init__(self, input_dir, output_dir):
         """
@@ -218,7 +225,7 @@ class HYDATQualityControl:
         else:
             return 0.0
 
-    def process_station(self, input_file):
+    def process_station(self, input_file): #处理单个站点文件
         """
         处理单个站点文件
 
@@ -303,13 +310,13 @@ class HYDATQualityControl:
                     print(f"  ⚠ No valid data after QC, skip station {station_id}")
                     return False, None
 
-                time = qc["time"]
+                time = qc["time"] 
                 Q = qc["Q"]
                 SSC = qc["SSC"]
                 SSL = qc["SSL"]
                 Q_flag = qc["Q_flag"]
                 SSC_flag = qc["SSC_flag"]
-                SSL_flag = qc["SSL_flag"]
+                SSL_flag = qc["SSL_flag"] #这段在返回的字典里面取出这些变量进行下面工作
 
                 
                 # 计算时间范围
@@ -323,26 +330,27 @@ class HYDATQualityControl:
                 SSL_completeness = self.calculate_completeness(SSL, SSL_flag, start_date, end_date)
 
                 # 创建输出文件
-                output_file = self.output_dir / f"HYDAT_{station_id}.nc"
+                output_file = self.output_dir / f"HYDAT_{station_id}.nc" #self.output_dir是在初始化类的时候定义的输出目录
 
                 with nc.Dataset(output_file, 'w', format='NETCDF4') as ds_out:
                     # 创建维度
                     ds_out.createDimension('time', len(time))
 
                     # 创建时间变量
-                    var_time = ds_out.createVariable('time', 'f8', ('time',))
+                    var_time = ds_out.createVariable('time', 'f8', ('time',)) #f8表示64位浮点数
                     var_time.standard_name = 'time'
                     var_time.long_name = 'time'
                     var_time.units = 'days since 1970-01-01 00:00:00'
                     var_time.calendar = 'gregorian'
-                    var_time.axis = 'T'
+                    var_time.axis = 'T' #T 表示时间轴
                     var_time[:] = time
 
                     # 创建坐标变量 (标量)
-                    var_lat = ds_out.createVariable('lat', 'f4')
+                    var_lat = ds_out.createVariable('lat', 'f4')#f4表示32位浮点数
                     var_lat.standard_name = 'latitude'
                     var_lat.long_name = 'station latitude'
                     var_lat.units = 'degrees_north'
+                    var_lat.axis = 'Y'
                     var_lat.valid_range = np.array([-90.0, 90.0], dtype=np.float32)
                     var_lat[:] = lat
 
@@ -350,6 +358,7 @@ class HYDATQualityControl:
                     var_lon.standard_name = 'longitude'
                     var_lon.long_name = 'station longitude'
                     var_lon.units = 'degrees_east'
+                    var_lon.axis = 'X'
                     var_lon.valid_range = np.array([-180.0, 180.0], dtype=np.float32)
                     var_lon[:] = lon
 
@@ -437,17 +446,17 @@ class HYDATQualityControl:
                     river_name = station_name.split(' AT ')[0] if ' AT ' in station_name else station_name.split(' NEAR ')[0] if ' NEAR ' in station_name else ''
                     ds_out.river_name = river_name
                     ds_out.location_id = station_id
-                    ds_out.Type = 'In-situ station data'
-                    ds_out.Temporal_Resolution = 'daily'
-                    ds_out.Temporal_Span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-                    ds_out.Variables_Provided = 'altitude, upstream_area, Q, SSC, SSL'
-                    ds_out.Geographic_Coverage = f"{province}, Canada"
+                    ds_out.type = 'In-situ station data'
+                    ds_out.temporal_resolution = 'daily'
+                    ds_out.temporal_span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    ds_out.variables_provided = 'altitude, upstream_area, Q, SSC, SSL'
+                    ds_out.geographic_coverage = f"{province}, Canada"
                     ds_out.country = 'Canada'
                     ds_out.continent_region = 'North America'
                     ds_out.time_coverage_start = start_date.strftime('%Y-%m-%d')
                     ds_out.time_coverage_end = end_date.strftime('%Y-%m-%d')
                     ds_out.number_of_data = '1'
-                    ds_out.Reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
+                    ds_out.reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
                     ds_out.source_data_link = 'https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html'
                     ds_out.creator_name = 'Zhongwang Wei'
                     ds_out.creator_email = 'weizhw6@mail.sysu.edu.cn'
@@ -470,40 +479,53 @@ class HYDATQualityControl:
                     ds_out.date_created = datetime.now().strftime('%Y-%m-%d')
                     ds_out.date_modified = datetime.now().strftime('%Y-%m-%d')
                     ds_out.processing_level = 'Quality controlled and standardized'
-                    # ds_out.comment = (
-                    #     f"Data quality flags indicate reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
-                    #     f"Quality control applied: Q<0 flagged as bad, Q=0 flagged as suspect, Q>{self.Q_extreme_high} flagged as suspect; "
-                    #     f"SSC<0 flagged as bad, SSC<{self.SSC_min} or SSC>{self.SSC_extreme_high} flagged as suspect; "
-                    #     f"SSL<0 flagged as bad."
-                    # )
+                    ds_out.comment = (
+                        "Quality flags: 0=good, 1=estimated (derived), 2=suspect, 3=bad, 9=missing. "
+                        "QC1: physical feasibility; QC2: log-IQR screening (independent variables only); "
+                        "QC3: SSC–Q consistency and propagation to derived SSL."
+                    )
+
                 # ==========================================================
                 # NetCDF completeness check (CF-1.8 / ACDD-1.3)
                 # ==========================================================
-                # errors, warnings = check_nc_completeness(output_file, strict=True)
 
-                # if errors:
-                #     print(f"  ✗ NetCDF completeness check FAILED for {station_id}")
-                #     for e in errors:
-                #         print(f"    ERROR: {e}")
+                errors, warnings = check_nc_completeness(
+                    output_file,
+                    strict=False   # ← 建议先用 False
+                )
+                var_errs, var_warns = check_variable_metadata_tiered(output_file, tier="recommended")
+                errors.extend(var_errs)
+                warnings.extend(var_warns)
 
-                #     # 可选：删除不合格文件
-                #     try:
-                #         output_file.unlink()
-                #         print(f"    → Invalid NetCDF removed: {output_file.name}")
-                #     except Exception:
-                #         pass
+                if errors:
+                    print(f"  ✗ NetCDF completeness check FAILED for {station_id}")
+                    for e in errors:
+                        print(f"    ERROR: {e}")
 
-                #     return False, None
+                    # 删除不合格文件（强一致性）
+                    try:
+                        output_file.unlink()
+                        print(f"    → Invalid NetCDF removed: {output_file.name}")
+                    except Exception:
+                        pass
 
-                #     if warnings:
-                #         with nc.Dataset(output_file, "a") as ds_out:
-                #             ds_out.history = (
-                #                 ds_out.history
-                #                 + f"; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
-                #                 f"Completeness check warnings: {len(warnings)} issues"
-                #             )
+                    return False, None
 
+                if warnings:
+                    print(f"  ⚠ NetCDF completeness warnings for {station_id}: {len(warnings)}")
+                    for w in warnings:
+                        print(f"    WARNING: {w}")
 
+                    # 把 warning 写入 history（非常加分）
+                    with nc.Dataset(output_file, "a") as ds_out:
+                        ds_out.history = (
+                            ds_out.history
+                            + f"; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
+                            + f"Completeness check warnings ({len(warnings)}): "
+                            + "; ".join(warnings[:3])
+                        )
+
+                station_warnings = warnings.copy() if warnings else []
 
                 # 收集站点信息用于CSV
                 station_info = {
@@ -531,6 +553,11 @@ class HYDATQualityControl:
                     'SSL_end_date': end_date.year,
                     'SSL_percent_complete': round(SSL_completeness, 2)
                 }
+                station_info.update({
+                        "n_warnings": len(station_warnings),
+                        "warnings": " | ".join(station_warnings[:5])  # 最多存前5条，防爆
+                    })
+
 
                 self.stats['processed_stations'] += 1
                 print(f"  ✓ 成功处理")
@@ -566,9 +593,9 @@ class HYDATQualityControl:
         results = []
 
         # ★★★ 并行执行 ★★★
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor: #ProcessPoolExecutor用于并行处理任务
             future_to_station = {executor.submit(self.process_station, f): f for f in input_files}
-
+            # 收集结果
             for future in as_completed(future_to_station):
                 success, station_info = future.result()
                 if success and station_info:
@@ -589,31 +616,17 @@ class HYDATQualityControl:
 
         return self.stats
 
+
+    def summarize_warning_types(self):
+        return summarize_warning_types_tool(self.stats['stations_info'])
+
+
     def generate_csv_summary(self, output_csv):
-        """生成CSV站点摘要文件"""
-        print(f"\n生成CSV摘要文件: {output_csv}")
+        generate_csv_summary_tool(self.stats['stations_info'], output_csv)
 
-        if not self.stats['stations_info']:
-            print("  ⚠ 警告: 无站点信息可写入CSV")
-            return
+    def generate_qc_results_csv(self, output_csv):
+        generate_qc_results_csv_tool(self.stats['stations_info'], output_csv)
 
-        df = pd.DataFrame(self.stats['stations_info'])
-
-        # 按指定顺序排列列
-        column_order = [
-            'station_name', 'Source_ID', 'river_name', 'longitude', 'latitude',
-            'altitude', 'upstream_area', 'Data Source Name', 'Type',
-            'Temporal Resolution', 'Temporal Span', 'Variables Provided',
-            'Geographic Coverage', 'Reference/DOI',
-            'Q_start_date', 'Q_end_date', 'Q_percent_complete',
-            'SSC_start_date', 'SSC_end_date', 'SSC_percent_complete',
-            'SSL_start_date', 'SSL_end_date', 'SSL_percent_complete'
-        ]
-
-        df = df[column_order]
-        df.to_csv(output_csv, index=False)
-
-        print(f"  ✓ CSV文件已生成: {len(df)} 个站点")
 
 
 def main():
@@ -624,10 +637,10 @@ def main():
     csv_file = output_dir / 'HYDAT_station_summary.csv'
 
     # 创建处理对象
-    qc = HYDATQualityControl(input_dir, output_dir)
+    qc = HYDATQualityControl(input_dir, output_dir) #这行是在初始化类，传入输入输出目录。初始化类是为了创建一个类的实例，并为其设置初始状态或属性。
 
     # 处理所有站点
-    stats = qc.process_all_stations()
+    stats = qc.process_all_stations() #调用类的方法处理所有站点
 
     # 生成CSV摘要
     qc.generate_csv_summary(csv_file)

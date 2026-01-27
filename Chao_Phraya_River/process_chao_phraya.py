@@ -34,19 +34,22 @@ from tool import (
     compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic
+    plot_ssc_q_diagnostic,
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
+)
+PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
+
+SOURCE_DATA_PATH = os.path.join(
+    PROJECT_ROOT, "Source", "Chao_Phraya_River", "Chao_Phraya_River.tab"
 )
 
+OUTPUT_DIR = os.path.join(
+    PROJECT_ROOT, "Output_r", "annually_climatology", "Chao_Phraya_River", "qc"
+)
 
-# --- Configuration ---
-
-# File paths
-# Note: These paths are relative to the script's execution directory.
-# The script assumes it is run from /Users/zhongwangwei/Downloads/Sediment/Script/Dataset/Chao_Phraya_River/
-SOURCE_DATA_PATH = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Chao_Phraya_River/Chao_Phraya_River.tab"
-OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
-SUMMARY_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/Chao_Phraya_River/qc/"
-
+SUMMARY_DIR = OUTPUT_DIR
 
 # Constants for unit conversion
 SECONDS_PER_YEAR = 365.25 * 24 * 3600  # 31,557,600
@@ -135,60 +138,72 @@ def assign_quality_flags(df):
     df['SSL_flag'] = [apply_quality_flag(v, 'SSL') for v in df['SSL'].values]
     return df
 
+
 def apply_station_level_qc(station_df):
-    """
-    Apply log-IQR and SSC–Q consistency QC using tool.py only.
-    """
+    # 1) 准备数组
+    Q   = station_df["Q"].to_numpy(dtype=float)
+    SSC = station_df["SSC"].to_numpy(dtype=float)
+    SSL = station_df["SSL"].to_numpy(dtype=float)
 
-    Q = station_df['Q'].values.astype(float)
-    SSC = station_df['SSC'].values.astype(float)
-    SSL = station_df['SSL'].values.astype(float)
+    # time：这里不纠结“days since 1970”，年序列也能跑 QC（只是用于返回/画图）
+    time = station_df["year"].to_numpy(dtype=float)
 
-    Q_flag = station_df['Q_flag'].values.astype(np.int8)
-    SSC_flag = station_df['SSC_flag'].values.astype(np.int8)
-    SSL_flag = station_df['SSL_flag'].values.astype(np.int8)
+    # 2) 显式调用 QC1-array（你要求的第二个函数）
+    Q_flag_qc1   = apply_quality_flag_array(Q,   "Q")
+    SSC_flag_qc1 = apply_quality_flag_array(SSC, "SSC")
+    SSL_flag_qc1 = apply_quality_flag_array(SSL, "SSL")
 
-    # ---------- log-IQR bounds ----------
-    ssc_low, ssc_high = compute_log_iqr_bounds(SSC)
-    ssl_low, ssl_high = compute_log_iqr_bounds(SSL)
+    # 用 QC1 的 missing(9) 来做 trim mask（和 tool 里 valid_time 逻辑一致）
+    valid_time = (Q_flag_qc1 != 9) | (SSC_flag_qc1 != 9) | (SSL_flag_qc1 != 9)
 
-    # ---------- SSC–Q envelope ----------
-    ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=Q,
-        SSC_mgL=SSC,
-        k=1.5
+    if not valid_time.any():
+        return None 
+
+    # 3) SSL, SSC (derived), Q
+    qc = apply_hydro_qc_with_provenance(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSL_is_independent=True,
+        SSC_is_independent=False,
+        ssl_is_derived_from_q_ssc=False,
     )
 
-    # ---------- point-wise QC ----------
-    for i in range(len(station_df)):
+    if qc is None:
+        return None
 
-        # log-IQR (SSC)
-        if SSC_flag[i] == 0 and ssc_low and ssc_high:
-            if SSC[i] < ssc_low or SSC[i] > ssc_high:
-                SSC_flag[i] = 2
+    # 4) 对齐长度
+    station_df = station_df.loc[valid_time].copy()
 
-        # log-IQR (SSL)
-        if SSL_flag[i] == 0 and ssl_low and ssl_high:
-            if SSL[i] < ssl_low or SSL[i] > ssl_high:
-                SSL_flag[i] = 2
+    # 5) 写回最终 flags（
+    station_df["Q_flag"]   = qc["Q_flag"].astype("int8")
+    station_df["SSC_flag"] = qc["SSC_flag"].astype("int8")
+    station_df["SSL_flag"] = qc["SSL_flag"].astype("int8")
 
-        # SSC–Q consistency
-        inconsistent, _ = check_ssc_q_consistency(
-            Q=Q[i],
-            SSC=SSC[i],
-            Q_flag=Q_flag[i],
-            SSC_flag=SSC_flag[i],
-            ssc_q_bounds=ssc_q_bounds
-        )
+    Q_flag   = station_df["Q_flag"].to_numpy(np.int8)
+    SSC_flag = station_df["SSC_flag"].to_numpy(np.int8)
+    SSL_flag = station_df["SSL_flag"].to_numpy(np.int8)
 
-        if inconsistent and SSC_flag[i] == 0:
-            SSC_flag[i] = 2
+    station_df.attrs["flag_counts"] = {
+        "Q":   (int((Q_flag==0).sum()),   int((Q_flag==2).sum()),   int((Q_flag==3).sum()),   int((Q_flag==9).sum())),
+        "SSC": (int((SSC_flag==0).sum()), int((SSC_flag==2).sum()), int((SSC_flag==3).sum()), int((SSC_flag==9).sum())),
+        "SSL": (int((SSL_flag==0).sum()), int((SSL_flag==2).sum()), int((SSL_flag==3).sum()), int((SSL_flag==9).sum())),
+    }
 
-    station_df['Q_flag'] = Q_flag
-    station_df['SSC_flag'] = SSC_flag
-    station_df['SSL_flag'] = SSL_flag
+    station_df.attrs["log_iqr_skipped"] = (np.isfinite(station_df["SSC"]).sum() < 5) or (np.isfinite(station_df["SSL"]).sum() < 5)
+    station_df.attrs["ssc_q_check_skipped"] = (np.isfinite(station_df["SSC"]).sum() < 5)
+
+    # 确认两个函数都真的被调用
+    print(
+        f"[QC] QC1(good cnt): Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+        f"Final(good cnt): Q={(station_df['Q_flag'].to_numpy()==0).sum()}, "
+        f"SSC={(station_df['SSC_flag'].to_numpy()==0).sum()}, SSL={(station_df['SSL_flag'].to_numpy()==0).sum()}"
+    )
 
     return station_df
+
 
 
 def create_netcdf_file(station_id, event_id, meta, data, output_dir):
@@ -385,6 +400,44 @@ def main():
         if event in stations_with_sediment:
             station_data = df[df['event'] == event].copy()
             station_data = apply_station_level_qc(station_data)
+            # ---------- Print QC summary ----------
+            sid = meta["station_id"]
+            print(f"\nProcessing: {sid} +")
+
+            if station_data.attrs.get("log_iqr_skipped", False):
+                print(f"  | [{sid}] Sample size < 5, log-IQR statistical QC skipped.")
+            else:
+                print(f"  | [{sid}] log-IQR statistical QC applied.")
+
+            if station_data.attrs.get("ssc_q_check_skipped", False):
+                print(f"  | [{sid}] Sample size < 5, SSC–Q consistency check skipped.")
+            else:
+                print(f"  | [{sid}] SSC–Q consistency check and diagnostic plot.")
+
+            # Representative values (mean of flag==0, fallback to mean of all finite)
+            def _rep(x, f):
+                x = x.astype(float)
+                good = (f == 0) & np.isfinite(x)
+                if good.any():
+                    return float(np.nanmean(x[good]))
+                return float(np.nanmean(x[np.isfinite(x)]))
+
+            q_rep   = _rep(station_data["Q"].values,   station_data["Q_flag"].values)
+            ssc_rep = _rep(station_data["SSC"].values, station_data["SSC_flag"].values)
+            ssl_rep = _rep(station_data["SSL"].values, station_data["SSL_flag"].values)
+
+            q0, q2, q3, q9 = station_data.attrs["flag_counts"]["Q"]
+            s0, s2, s3, s9 = station_data.attrs["flag_counts"]["SSC"]
+            l0, l2, l3, l9 = station_data.attrs["flag_counts"]["SSL"]
+
+            print(f"  ✓ Flags Q   (0/2/3/9): {q0}/{q2}/{q3}/{q9}")
+            print(f"  ✓ Flags SSC (0/2/3/9): {s0}/{s2}/{s3}/{s9}")
+            print(f"  ✓ Flags SSL (0/2/3/9): {l0}/{l2}/{l3}/{l9}")
+
+            print(f"  Q: {q_rep:.2f} m3/s (flag=0)")
+            print(f"  SSC: {ssc_rep:.2f} mg/L (flag=0)")
+            print(f"  SSL: {ssl_rep:.2f} ton/day (flag=0)")
+
 
             # =========================
             # SSC–Q diagnostic plot
@@ -442,6 +495,7 @@ def main():
     generate_summary_csv(df, stations, SUMMARY_DIR)
     
     print("---"" Processing Complete ---")
+
 
 if __name__ == "__main__":
     main()

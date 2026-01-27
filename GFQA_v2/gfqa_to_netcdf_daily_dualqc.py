@@ -25,6 +25,15 @@ import warnings
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+def find_project_root(start_dir, max_up=6):
+    p = Path(start_dir).resolve()
+    for _ in range(max_up):
+        if (p / "Source").exists() and (p / "Output_r").exists():
+            return p
+        p = p.parent
+    return Path(start_dir).resolve().parent
+
+PROJECT_ROOT = find_project_root(CURRENT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 from tool import (
@@ -36,8 +45,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 
@@ -68,6 +76,19 @@ def clean_value(value):
     except Exception:
         return -9999.0
 
+def log_station_qc(station_id, station_name, n_samples,
+                   skipped_log_iqr, skipped_ssc_q,
+                   q_value, q_flag, ssc_value, ssc_flag, ssl_value, ssl_flag,
+                   created_path):
+    print(f"\nProcessing: {station_name} ({station_id}) +")
+    if skipped_log_iqr:
+        print(f"  [{station_name} ({station_id})] Sample size = {n_samples} < 5, log-IQR statistical QC skipped.")
+    if skipped_ssc_q:
+        print(f"  [{station_name} ({station_id})] Sample size = {n_samples} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+    print(f"✓ Created: {created_path}")
+    print(f"  Q:   {q_value:.2f} m3/s (flag={int(q_flag)})")
+    print(f"  SSC: {ssc_value:.2f} mg/L (flag={int(ssc_flag)})")
+    print(f"  SSL: {ssl_value:.2f} ton/day (flag={int(ssl_flag)})")
 
 def parse_float(value):
     """解析浮点元数据"""
@@ -86,11 +107,10 @@ def parse_float(value):
 def read_csv_files():
     """读取 CSV 文件"""
     print("Reading CSV files...")
-    base_dir = Path("/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GFQA_v2/sed/")
-
-    flux_df = pd.read_csv(f'{base_dir}/Flux.csv', delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
-    water_df = pd.read_csv(f'{base_dir}/Water.csv', delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
-    station_df = pd.read_excel(f'{base_dir}/GEMStat_station_metadata.xlsx')
+    base_dir = PROJECT_ROOT / "Source" / "GFQA_v2" / "sed"
+    flux_df = pd.read_csv(base_dir / "Flux.csv", delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
+    water_df = pd.read_csv(base_dir / "Water.csv", delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
+    station_df = pd.read_excel(base_dir / "GEMStat_station_metadata.xlsx")
 
     # print(flux_df['Sample.Date'].head())
     # print(water_df['Sample.Date'].head())
@@ -273,10 +293,41 @@ def create_netcdf_file(station_id, station_row, dates,
     ds.history = f'Created on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by gfqa_to_netcdf_daily_dualqc.py'
     ds.close()
     print(f"✅ Created file: {filename}")
+    n = len(discharge)
+    skipped_log_iqr = (n < 5)
+    skipped_ssc_q = (n < 5)
+
+    def _repr(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), 0
+        if np.any(ok):
+            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+        return float("nan"), 9
+
+    qv, qf = _repr(discharge, q_flag)
+    sscv, sscf = _repr(ssc, ssc_flag)
+    sslv, sslf = _repr(ssl, ssl_flag)
+
+    log_station_qc(
+        station_id=station_id,
+        station_name=str(station_row.get('Station Name', station_id)),
+        n_samples=n,
+        skipped_log_iqr=skipped_log_iqr,
+        skipped_ssc_q=skipped_ssc_q,
+        q_value=qv, q_flag=qf,
+        ssc_value=sscv, ssc_flag=sscf,
+        ssl_value=sslv, ssl_flag=sslf,
+        created_path=filepath
+    )
+
 
 
 # ==========================================================
-# 主流程
+# main processing function
 # ==========================================================
 
 def process_all_stations(flux_df, water_df, station_df, output_dir):
@@ -326,7 +377,7 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             lambda x: apply_quality_flag(x, "SSL")
         )
 
-        # === SSC-Q 一致性检查 ===
+        # === SSC-Q check ===
         lower, upper = compute_log_iqr_bounds(merged['SSL'].values)
 
         if lower is not None:
@@ -352,8 +403,20 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
                 SSC_flag=row['SSC_flag'],
                 ssc_q_bounds=ssc_q_bounds
             )
-            if is_bad:
-                merged.at[i, 'SSC_flag'] = 2  # suspect
+            if is_bad and row['SSC_flag'] == 0:
+                merged.at[i, 'SSC_flag'] = np.int8(2)
+
+                merged.at[i, 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=True,
+                    Q=row['Clean_Value_Q'],
+                    SSC=row['Clean_Value_SSC'],
+                    SSL=merged.at[i, 'SSL'],
+                    Q_flag=row['Q_flag'],
+                    SSC_flag=merged.at[i, 'SSC_flag'],  
+                    SSL_flag=row['SSL_flag'],
+                    ssl_is_derived_from_q_ssc=True,  
+                )
+
             
         # --------------------------------------------------
         # SSC–Q diagnostic plot (station-level)
@@ -431,10 +494,7 @@ def main():
 
     flux_df, water_df, station_df = read_csv_files()
     
-    output_dir = (
-        "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
-        "Output_r/daily/GFQA_v2/qc"
-    )
+    output_dir = str(PROJECT_ROOT / "Output_r" / "daily" / "GFQA_v2" / "qc")
     process_all_stations(flux_df, water_df, station_df, output_dir=output_dir)
     print("\nConversion complete with Data.Quality and QC Flags!")
 

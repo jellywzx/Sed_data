@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
@@ -19,6 +20,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
+    propagate_ssc_q_inconsistency_to_ssl,
     # check_nc_completeness,
     # add_global_attributes
 )
@@ -66,14 +68,22 @@ def apply_tool_qc_yajiang(df, station_id, diagnostic_dir=None):
     # --------------------------------------------------
     if 'Q' in out.columns and 'SSC' in out.columns:
         envelope = build_ssc_q_envelope(out['Q'].values, out['SSC'].values)
-
+        out['ssc_q_inconsistent'] = False
         if envelope is not None:
-            inconsistent = check_ssc_q_consistency(
-                out['Q'].values,
-                out['SSC'].values,
-                envelope
-            )
-            out.loc[inconsistent, 'SSC_flag'] = 2
+            inconsistent = []
+            for i in range(len(out)):
+                is_bad, _ = check_ssc_q_consistency(
+                    Q=out['Q'].values[i],
+                    SSC=out['SSC'].values[i],
+                    Q_flag=out['Q_flag'].values[i],
+                    SSC_flag=out['SSC_flag'].values[i],
+                    ssc_q_bounds=envelope
+                )
+                inconsistent.append(bool(is_bad))
+
+            inconsistent = np.array(inconsistent, dtype=bool)
+            out.loc[inconsistent, 'ssc_q_inconsistent'] = True
+            out.loc[inconsistent, 'SSC_flag'] = np.int8(2)
 
             if diagnostic_dir is not None:
                 diagnostic_dir.mkdir(parents=True, exist_ok=True)
@@ -91,8 +101,10 @@ def apply_tool_qc_yajiang(df, station_id, diagnostic_dir=None):
 
 
 def process_yajiang():
-    input_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Yajiang/nc")
-    output_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/Yajiang/qc")
+    PROJECT_ROOT = Path(CURRENT_DIR).resolve().parent.parent
+
+    input_dir = PROJECT_ROOT / "Output_r" / "daily" / "Yajiang" / "nc"
+    output_dir = PROJECT_ROOT / "Output_r" / "daily" / "Yajiang" / "qc"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_station_summary_data = []
@@ -179,6 +191,22 @@ def process_yajiang():
                 df['SSL'].notna()
             )
             df.loc[valid_ssl, 'SSL_flag'] = 0
+            # propagate SSC-Q inconsistency to SSL_flag
+            if 'ssc_q_inconsistent' in df.columns:
+                bad = (df['ssc_q_inconsistent'] == True) & (df['SSC_flag'] == 0)
+                df.loc[bad, 'SSC_flag'] = np.int8(2)  # suspect
+                for i in df.index[bad]:
+                    df.at[i, 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
+                        inconsistent=True,
+                        Q=df.at[i, 'Q'],
+                        SSC=df.at[i, 'SSC'],
+                        SSL=df.at[i, 'SSL'],
+                        Q_flag=np.int8(df.at[i, 'Q_flag']),
+                        SSC_flag=np.int8(df.at[i, 'SSC_flag']),
+                        SSL_flag=np.int8(df.at[i, 'SSL_flag']),
+                        ssl_is_derived_from_q_ssc=True,
+                    )
+
         elif 'Q' in df.columns:
             # Only Q available - mark Q_flag as FILL if missing
             if 'Q_flag' not in df.columns:
@@ -276,8 +304,40 @@ def process_yajiang():
         }
 
         # Save to NetCDF
+        # -------- QC summary print --------
+        n_total = len(df)
+        def _repr(v, f):
+            v = np.asarray(v, dtype=float)
+            f = np.asarray(f, dtype=np.int8)
+            ok = np.isfinite(v) & (v > 0)
+            ok_good = ok & (f == 0)
+            if np.any(ok_good):
+                return float(np.nanmedian(v[ok_good])), 0
+            if np.any(ok):
+                return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+            return float("nan"), 9
+
+        qv, qf = (np.nan, 9)
+        sscv, sscf = (np.nan, 9)
+        sslv, sslf = (np.nan, 9)
+
+        if 'Q' in df.columns and 'Q_flag' in df.columns:
+            qv, qf = _repr(df['Q'].values, df['Q_flag'].values)
+        if 'SSC' in df.columns and 'SSC_flag' in df.columns:
+            sscv, sscf = _repr(df['SSC'].values, df['SSC_flag'].values)
+        if 'SSL' in df.columns and 'SSL_flag' in df.columns:
+            sslv, sslf = _repr(df['SSL'].values, df['SSL_flag'].values)
+
+        print(f"\n✅ QC summary (Yajiang_{station_id})")
+        print(f"   Samples: {n_total}")
+        if 'Q' in df.columns:   print(f"   Q  : {qv:.2f} m3/s (flag={qf})")
+        if 'SSC' in df.columns: print(f"   SSC: {sscv:.2f} mg/L (flag={sscf})")
+        if 'SSL' in df.columns: print(f"   SSL: {sslv:.2f} ton/day (flag={sslf})")
+# -------------------------------
+
         output_file = output_dir / f'Yajiang_{station_id}.nc'
         new_ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': f'days since {start_date.year}-01-01'}})
+        
 
 
         # Summary for CSV

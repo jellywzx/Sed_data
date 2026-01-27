@@ -31,17 +31,15 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    check_nc_completeness
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
-
-
 # --- Configuration ---
-# --- Configuration ---
-BASE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/"
-
-SOURCE_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Eurasian_River"
-OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/monthly/Eurasian_River/qc"
-SCRIPT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/Dataset/Eurasian_River"
+BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+SOURCE_DIR = os.path.join(BASE_DIR, "Source", "Eurasian_River")
+OUTPUT_DIR = os.path.join(BASE_DIR, "Output_r", "monthly", "Eurasian_River", "qc")
+SCRIPT_DIR = os.path.join(BASE_DIR, "Script", "Dataset", "Eurasian_River")
 
 # --- Helper Functions ---
 
@@ -69,6 +67,17 @@ def read_discharge_data():
                  discharge_data[river_name]['meta'] = meta
 
     return discharge_data
+
+def print_qc_summary(river_name, station_id, n, skipped_log_iqr, skipped_ssc_q, q, q_flag, ssc, ssc_flag, ssl, ssl_flag, nc_path):
+    print(f"\nProcessing: {river_name} ({station_id}) +")
+    if skipped_log_iqr:
+        print(f"  - Sample size = {n} < 5, log-IQR statistical QC skipped.")
+    if skipped_ssc_q:
+        print(f"  - Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+    print(f"  - Created: {nc_path}")
+    print(f"    Q:   {q:.2f} m3/s (flag={int(q_flag)})")
+    print(f"    SSC: {ssc:.2f} mg/L (flag={int(ssc_flag)})")
+    print(f"    SSL: {ssl:.2f} ton/day (flag={int(ssl_flag)})")
 
 def parse_discharge_file(filepath):
     """Parses a discharge file (.dat or .txt)."""
@@ -177,7 +186,7 @@ def parse_special_txt_content(lines):
 
 def read_sediment_data():
     """Reads sediment flux data from the Excel file."""
-    sediment_path = os.path.join('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Eurasian_River/Sediment_Flux_Data.xls')
+    sediment_path = os.path.join(SOURCE_DIR, "Sediment_Flux_Data.xls")
     xl = pd.ExcelFile(sediment_path)
     sediment_data = {}
     sheet_to_river = {
@@ -277,50 +286,53 @@ def main():
 
         # --- Quality Control and Flagging ---  
 
-        # =====================================
-        # SSL log-IQR bounds (station-level)
-        # =====================================
-        ssl_lower, ssl_upper = compute_log_iqr_bounds(
-            df['SSL'].values,
-            k=1.5)
-        # =====================================
-        # Apply initial quality flags     
-        # =====================================  
-        df['Q_flag'] = df['Q'].apply(lambda x: apply_quality_flag(x, 'Q'))
-        df['SSC_flag'] = df['SSC'].apply(lambda x: apply_quality_flag(x, 'SSC'))
-        df['SSL_flag'] = df['SSL'].apply(lambda x: apply_quality_flag(x, 'SSL'))
-        # =====================================
-        # Flag SSL outliers based on log-IQR bounds
-        # =====================================
-        if ssl_lower is not None and ssl_upper is not None:
-            is_outlier = (
-                (df['SSL'] < ssl_lower) |
-                (df['SSL'] > ssl_upper)
-            ) & (df['SSL_flag'] == 0)
+        # 1) QC1-array：显式调用
+        Q_flag_qc1   = apply_quality_flag_array(df["Q"].values,   "Q")
+        SSC_flag_qc1 = apply_quality_flag_array(df["SSC"].values, "SSC")
+        SSL_flag_qc1 = apply_quality_flag_array(df["SSL"].values, "SSL")
+        # 2) time days since 1970-01-01
+        time_days = (df.index - base).days.astype(float).to_numpy()
 
-            df.loc[is_outlier, 'SSL_flag'] = 2  # suspect
-        # =====================================
-        # SSC-Q consistency check
-        # =====================================
-        ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=df['Q'].values,
-        SSC_mgL=df['SSC'].values,
-        k=1.5,
-        min_samples=5
+        # 3) 设置布尔参数
+        qc = apply_hydro_qc_with_provenance(
+            time=time_days,
+            Q=df["Q"].values.astype(float),
+            SSC=df["SSC"].values.astype(float),
+            SSL=df["SSL"].values.astype(float),
+            Q_is_independent=True,
+            SSC_is_independent=False,
+            SSL_is_independent=True,
+            ssl_is_derived_from_q_ssc=False,  
+            qc2_k=1.5,
+            qc2_min_samples=5,
+            qc3_k=1.5,
+            qc3_min_samples=5,
         )
 
-        for i, row in df.iterrows():
-            is_bad, resid = check_ssc_q_consistency(
-                Q=row['Q'],
-                SSC=row['SSC'],
-                Q_flag=row['Q_flag'],
-                SSC_flag=row['SSC_flag'],
-                ssc_q_bounds=ssc_q_bounds
-            )
+        if qc is None:
+            # 退回 QC1
+            df["Q_flag"]   = Q_flag_qc1
+            df["SSC_flag"] = SSC_flag_qc1
+            df["SSL_flag"] = SSL_flag_qc1
+            ssc_q_bounds = None
+        else:
+            # 注意：qc 返回的是“trimmed(valid_time)”后的数组 :contentReference[oaicite:6]{index=6}
+            # 所以这里要用 qc["time"] 去找回 df 的索引
+            qc_time = base + pd.to_timedelta(qc["time"], unit="D")
+            df = df.loc[qc_time].copy()
 
-            if is_bad:
-                df.at[i, 'SSC_flag'] = 2  # suspect
+            df["Q_flag"]   = qc["Q_flag"]
+            df["SSC_flag"] = qc["SSC_flag"]
+            df["SSL_flag"] = qc["SSL_flag"]
 
+            ssc_q_bounds = qc.get("ssc_q_bounds", None)
+
+        print(
+            f"[QC] {station_id} QC1(good cnt): "
+            f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+            f"Final(good cnt): Q={(df['Q_flag'].to_numpy()==0).sum()}, "
+            f"SSC={(df['SSC_flag'].to_numpy()==0).sum()}, SSL={(df['SSL_flag'].to_numpy()==0).sum()}"
+        )
 
         # --- Time Trimming ---
         df.dropna(how='all', subset=['Q', 'SSL', 'SSC'], inplace=True)
@@ -421,6 +433,24 @@ def main():
             ssl_flag_var[:,0,0] = df['SSL_flag'].values
 
         print(f"  - Created {nc_filename}")
+
+        n = len(df)
+        skipped_log_iqr = (n < 5) or (ssl_lower is None) or (ssl_upper is None)
+        skipped_ssc_q = (n < 5) or (ssc_q_bounds is None)
+
+        last = df.iloc[-1]
+        print_qc_summary(
+            river_name=river_name,
+            station_id=station_id,
+            n=n,
+            skipped_log_iqr=skipped_log_iqr,
+            skipped_ssc_q=skipped_ssc_q,
+            q=float(last['Q']), q_flag=int(last['Q_flag']),
+            ssc=float(last['SSC']), ssc_flag=int(last['SSC_flag']),
+            ssl=float(last['SSL']), ssl_flag=int(last['SSL_flag']),
+            nc_path=nc_filename
+        )
+
 
         # ==========================================================
         # Post-write CF-1.8 / ACDD-1.3 compliance check

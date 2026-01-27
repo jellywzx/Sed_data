@@ -30,8 +30,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     # convert_ssl_units_if_needed,
-    check_nc_completeness,
-    add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl,
 )
 
 def parse_period(period_str):
@@ -170,6 +169,7 @@ def apply_hma_climatology_qc(
     output_dir,
     min_samples=5
 ):
+    
     """
     HMA climatological QC using tool.py logic, with explicit
     statistical diagnostics and conditional SSC–Q plotting.
@@ -215,11 +215,9 @@ def apply_hma_climatology_qc(
 
     if iqr_lower is None:
         print(
-            f"  ℹ️  [{station_name}] "
-            f"Sample size = {n} < {min_samples}, "
-            "log-IQR statistical QC skipped."
+            f"  [✓] [{station_name} +] "
+            f"Sample size = {n} < {min_samples}, log-IQR statistical QC skipped."
         )
-
     # ============================================================
     # 4. SSC–Q envelope & consistency
     # ============================================================
@@ -229,10 +227,10 @@ def apply_hma_climatology_qc(
 
     if ssc_q_bounds is None:
         print(
-            f"  ℹ️  [{station_name}] "
-            f"Sample size = {n} < {min_samples}, "
-            "SSC–Q consistency check and diagnostic plot skipped."
+            f"  [✓] [{station_name} +] "
+            f"Sample size = {n} < {min_samples}, SSC–Q consistency check and diagnostic plot skipped."
         )
+
     else:
         # Consistency check (theoretically unreachable for climatology,
         # but keeps logic unified with time-series workflow)
@@ -240,12 +238,28 @@ def apply_hma_climatology_qc(
             Q, SSC, Q_flag, SSC_flag, ssc_q_bounds
         )
 
-        if is_inconsistent:
+        ssc_q_inconsistent, resid = check_ssc_q_consistency(
+            Q, SSC, Q_flag, SSC_flag, ssc_q_bounds
+        )
+
+        if ssc_q_inconsistent and SSC_flag == 0:
             SSC_flag = np.int8(2)  # suspect
+            SSL_flag = propagate_ssc_q_inconsistency_to_ssl(
+                inconsistent=ssc_q_inconsistent,
+                Q=Q,
+                SSC=SSC,
+                SSL=SSL,
+                Q_flag=Q_flag,
+                SSC_flag=SSC_flag,
+                SSL_flag=SSL_flag,
+                ssl_is_derived_from_q_ssc=False,
+            )
+
             print(
                 f"  ⚠️  [{station_name}] "
-                "SSC–Q inconsistency detected (flag set to suspect)."
+                "SSC–Q inconsistency detected (SSC_flag->2, SSL_flag propagated)."
             )
+
 
         # ========================================================
         # 5. SSC–Q diagnostic plot (only when statistics valid)
@@ -685,8 +699,22 @@ def generate_station_summary_csv(summaries, output_dir):
 # Main processing
 if __name__ == '__main__':
     # Paths
-    source_csv = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HMA/HMA_catchments.csv'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/HMA/qc'
+    # Paths (relative-style: derive from project root)
+    def _find_project_root(start_dir, marker="sediment_wzx_1111"):
+        d = os.path.abspath(start_dir)
+        while True:
+            if os.path.basename(d) == marker:
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None
+            d = parent
+
+    PROJECT_ROOT = _find_project_root(CURRENT_DIR) or os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+    source_csv = os.path.join(PROJECT_ROOT, "Source", "HMA", "HMA_catchments.csv")
+    output_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "HMA", "qc")
+
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -707,7 +735,7 @@ if __name__ == '__main__':
 
     for idx, row in df_filtered.iterrows():
         station_name = row['Stations']
-        print(f"\nProcessing: {station_name}")
+        print(f"\nProcessing: {station_name} +")
 
         try:
             summary = create_netcdf_for_station(row, output_dir, source_csv)

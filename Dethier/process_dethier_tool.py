@@ -33,9 +33,11 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed
+    convert_ssl_units_if_needed,
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
-
 
 # =========================
 # 全局 QC / FLAG 设置
@@ -195,7 +197,32 @@ def compute_summary_stats(df: pd.DataFrame, var: str, flag_col: str):
         f"{var}_min": good_series.min(),
         f"{var}_max": good_series.max(),
     }
+def print_station_qc_summary(
+    station_id,
+    station_name,
+    n_samples,
+    skipped_log_iqr,
+    skipped_ssc_q,
+    q_value, q_flag,
+    ssc_value, ssc_flag,
+    ssl_value, ssl_flag,
+    created_nc_path
+):
+    """
+    打印单站点 QC 结果（面向人类阅读）
+    """
+    print(f"\nProcessing: {station_name} ({station_id})")
+    print(f"  Sample size = {n_samples}")
 
+    if skipped_log_iqr:
+        print("  ⚠ log-IQR statistical QC skipped (sample size < 5).")
+    if skipped_ssc_q:
+        print("  ⚠ SSC–Q consistency check skipped (sample size < 5).")
+
+    print(f"  ✓ Created: {os.path.basename(created_nc_path)}")
+    print(f"    Q   : {q_value:.2f} m3/s (flag={q_flag})")
+    print(f"    SSC : {ssc_value:.2f} mg/L (flag={ssc_flag})")
+    print(f"    SSL : {ssl_value:.2f} ton/day (flag={ssl_flag})")
 
 # =========================
 # 核心处理函数
@@ -345,64 +372,64 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
     ssl_arr = df["SSL"].values.astype(float)
 
     # --------------------------------------------------
-    # Build station-level SSC–Q envelope (standard units)
+    # Build station-level SSC–Q envelope (for diagnostic plot)
     # --------------------------------------------------
-    ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=q_arr,
-        SSC_mgL=ssc_arr,
-        k=1.5
+    ssc_q_bounds = build_ssc_q_envelope(Q_m3s=q_arr, SSC_mgL=ssc_arr, k=1.5)
+    # 1) QC1-array
+    Q_flag_qc1   = apply_quality_flag_array(q_arr,  "Q")
+    SSC_flag_qc1 = apply_quality_flag_array(ssc_arr,"SSC")
+    SSL_flag_qc1 = apply_quality_flag_array(ssl_arr,"SSL")
+
+    # 2) QC1 的 missing(9) 做一次 trim
+    valid_time = (Q_flag_qc1 != 9) | (SSC_flag_qc1 != 9) | (SSL_flag_qc1 != 9)
+    if not valid_time.any():
+        LOGGER.warning("No valid data (QC1 all missing) for station %s, skip.", station_id)
+        return None
+
+    df_qc = df.loc[valid_time].copy()
+
+    Q_qc   = df_qc["Q"].to_numpy(dtype=float)
+    SSC_qc = df_qc["SSC"].to_numpy(dtype=float)
+    SSL_qc = df_qc["SSL"].to_numpy(dtype=float)
+
+    # time:days since 1970-01-01
+    base = np.datetime64("1970-01-01T00:00:00")
+    time_qc = ((df_qc.index.values.astype("datetime64[ns]") - base) / np.timedelta64(1, "D")).astype(float)
+
+    # 3) End-to-end QC
+    qc = apply_hydro_qc_with_provenance(
+        time=time_qc,
+        Q=Q_qc,
+        SSC=SSC_qc,
+        SSL=SSL_qc,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=True,
+        ssl_is_derived_from_q_ssc=False,
+        qc2_k=1.5,
+        qc2_min_samples=5,
+        qc3_k=1.5, 
+        qc3_min_samples=5,
     )
 
-    # =========================
-    # QC: log-IQR + SSC–Q consistency
-    # =========================
+    if qc is None:
+        LOGGER.warning("No valid time remains after hydro QC for station %s, skip.", station_id)
+        return None
 
-    # Step 1: log-IQR bounds
-    ssc_lower, ssc_upper = compute_log_iqr_bounds(ssc_arr)
-    ssl_lower, ssl_upper = compute_log_iqr_bounds(ssl_arr)
+    df["Q_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
+    df["SSC_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
+    df["SSL_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
 
-    q_flag = np.full(len(q_arr), FLAG_MISS, dtype=np.int8)
-    ssc_flag = np.full(len(ssc_arr), FLAG_MISS, dtype=np.int8)
-    ssl_flag = np.full(len(ssl_arr), FLAG_MISS, dtype=np.int8)
+    df.loc[df_qc.index, "Q_flag"] = qc["Q_flag"].astype(np.int8)
+    df.loc[df_qc.index, "SSC_flag"] = qc["SSC_flag"].astype(np.int8)
+    df.loc[df_qc.index, "SSL_flag"] = qc["SSL_flag"].astype(np.int8)
 
-    for i in range(len(q_arr)):
-        q = q_arr[i]
-        ssc = ssc_arr[i]
-        ssl = ssl_arr[i]
-
-        # ---- basic QC (missing / physical) ----
-        qf = apply_quality_flag(q, "Q")
-        sscf = apply_quality_flag(ssc, "SSC")
-        sslf = apply_quality_flag(ssl, "SSL")
-
-        # ---- log-IQR statistical outliers ----
-        if sscf == FLAG_GOOD and ssc_lower and ssc_upper:
-            if ssc < ssc_lower or ssc > ssc_upper:
-                sscf = FLAG_SUSPECT
-
-        if sslf == FLAG_GOOD and ssl_lower and ssl_upper:
-            if ssl < ssl_lower or ssl > ssl_upper:
-                sslf = FLAG_SUSPECT
-
-        # ---- SSC–Q hydrological consistency (station-level) ----
-        is_inconsistent, resid = check_ssc_q_consistency(
-            Q=q,
-            SSC=ssc,
-            Q_flag=qf,
-            SSC_flag=sscf,
-            ssc_q_bounds=ssc_q_bounds
-        )
-
-        if is_inconsistent and sscf == FLAG_GOOD:
-            sscf = FLAG_SUSPECT
-
-        q_flag[i] = qf
-        ssc_flag[i] = sscf
-        ssl_flag[i] = sslf
-
-    df["Q_flag"] = q_flag
-    df["SSC_flag"] = ssc_flag
-    df["SSL_flag"] = ssl_flag
+    print(
+        f"[QC] {station_id} QC1(good cnt): Q={int(np.sum(Q_flag_qc1==0))}, "
+        f"SSC={int(np.sum(SSC_flag_qc1==0))}, SSL={int(np.sum(SSL_flag_qc1==0))} | "
+        f"Final(good cnt): Q={int(np.sum(df['Q_flag'].to_numpy()==0))}, "
+        f"SSC={int(np.sum(df['SSC_flag'].to_numpy()==0))}, SSL={int(np.sum(df['SSL_flag'].to_numpy()==0))}"
+    )
 
     # ---- 时间切片：至少有一个变量非 NaN 且 flag 不是 missing/bad ----
     valid_mask = (
@@ -421,12 +448,15 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     # 最终时间序列：从第一条有效到最后一条有效，中间允许 NaN 和非 good flag
     df_final = df.loc[start_date:end_date].copy()
-    
+    q_flags   = df_final["Q_flag"].to_numpy(np.int8)
+    ssc_flags = df_final["SSC_flag"].to_numpy(np.int8)
+    ssl_flags = df_final["SSL_flag"].to_numpy(np.int8)
+
     LOGGER.debug(
         "QC flags count: Q=%d, SSC=%d, SSL=%d",
-        np.sum(q_flag == FLAG_GOOD),
-        np.sum(ssc_flag == FLAG_GOOD),
-        np.sum(ssl_flag == FLAG_GOOD)
+            np.sum(q_flags == FLAG_GOOD),
+            np.sum(ssc_flags == FLAG_GOOD),
+            np.sum(ssl_flags == FLAG_GOOD),
     )
 
     # ---- 构建最终 Dataset ----
@@ -548,6 +578,23 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     ds_out.to_netcdf(out_path, format="NETCDF4", encoding=encoding)
     LOGGER.info("Saved standardized NetCDF: %s", out_path)
+    # =========================
+    # Print QC summary (console)
+    # =========================
+    print_station_qc_summary(
+        station_id=station_id,
+        station_name=ds_out.attrs["station_name"],
+        n_samples=len(df),
+        skipped_log_iqr=(len(df) < 5),
+        skipped_ssc_q=(len(df) < 5),
+        q_value=np.nanmean(df_final["Q"].values),
+        q_flag=int(np.nanmax(df_final["Q_flag"].values)),
+        ssc_value=np.nanmean(df_final["SSC"].values),
+        ssc_flag=int(np.nanmax(df_final["SSC_flag"].values)),
+        ssl_value=np.nanmean(df_final["SSL"].values),
+        ssl_flag=int(np.nanmax(df_final["SSL_flag"].values)),
+        created_nc_path=out_path
+    )
 
     # ---- 汇总信息用于 CSV ----
     stats_q = compute_summary_stats(df_final, "Q", "Q_flag")
@@ -628,7 +675,10 @@ def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv
 # =========================
 
 if __name__ == "__main__":
-    INPUT_NC_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Dethier/nc_convert"
-    OUTPUT_DIR = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/main_test/Dethier/Output_r"
-    SUMMARY_CSV = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/main_test/Dethier/Output_r/Dethier_station_summary.csv"
+    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+
+    INPUT_NC_DIR = os.path.join(PROJECT_ROOT, "Source", "Dethier", "nc_convert")
+    OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "Output_r", "Dethier", "qc")
+    SUMMARY_CSV  = os.path.join(OUTPUT_DIR, "Dethier_station_summary.csv")
+
     process_dethier_data_from_nc(INPUT_NC_DIR, OUTPUT_DIR, SUMMARY_CSV)

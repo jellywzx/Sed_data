@@ -36,7 +36,9 @@ from tool import (
     generate_station_summary_csv,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    propagate_ssc_q_inconsistency_to_ssl
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 
 
@@ -94,37 +96,58 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
     SSC = calculate_ssc(SSL, Q)
 
     # Apply quality flags
-    Q_flag = apply_quality_flag(Q, 'Q')
-    SSC_flag = apply_quality_flag(SSC, 'SSC')
-    SSL_flag = apply_quality_flag(SSL, 'SSL')
-    # Downgrade SSL flag if statistically anomalous (log-IQR)
+    Q_flag_qc1   = int(apply_quality_flag_array([Q],   "Q")[0])
+    SSC_flag_qc1 = int(apply_quality_flag_array([SSC], "SSC")[0])
+    SSL_flag_qc1 = int(apply_quality_flag_array([SSL], "SSL")[0])
+
+    # 2) 构造 time（你后面本来就要算 days_since_1970，这里先算出来用于 hydro qc）
+    if start_year and end_year:
+        mid_year = (start_year + end_year) // 2
+        mid_date = datetime(mid_year, 7, 1)
+        base_date = datetime(1970, 1, 1)
+        days_since_1970 = (mid_date - base_date).days
+    else:
+        days_since_1970 = np.nan
+
+    # 3) 调用 apply_hydro_qc_with_provenance（QC2/QC3 + provenance）
+    qc = apply_hydro_qc_with_provenance(
+        time=np.array([days_since_1970], dtype=float),
+        Q=np.array([Q], dtype=float),
+        SSC=np.array([SSC], dtype=float),
+        SSL=np.array([SSL], dtype=float),
+        Q_is_independent=True,#calculate_discharge
+        SSC_is_independent=False,#calculate_ssc
+        SSL_is_independent=True,#calculate_ssl，only change unit
+        ssl_is_derived_from_q_ssc=False,
+        qc2_k=1.5,
+        qc2_min_samples=5,
+        qc3_k=1.5,
+        qc3_min_samples=5,
+    )
+
+    # 如果 time 无效，tool 可能返回 None
+    if qc is None:
+        # 退回到 QC1 结果
+        Q_flag = np.int8(Q_flag_qc1)
+        SSC_flag = np.int8(SSC_flag_qc1)
+        SSL_flag = np.int8(SSL_flag_qc1)
+    else:
+        # 用 tool 的最终 flag（同样取 [0]）
+        Q_flag = np.int8(qc["Q_flag"][0])
+        SSC_flag = np.int8(qc["SSC_flag"][0])
+        SSL_flag = np.int8(qc["SSL_flag"][0])
+
+    # 4) 保留你原来的 log-IQR outlier 降级逻辑（仍然有效）
     if ssl_log_iqr_outlier and SSL_flag == 0:
         SSL_flag = np.int8(2)  # suspect
 
-    # ==========================================================
-    # SSC–Q consistency check
-    # ========================================================== 
-
-    ssc_q_inconsistent, ssc_q_resid = check_ssc_q_consistency(
-        Q=Q,
-        SSC=SSC,
-        Q_flag=Q_flag,
-        SSC_flag=SSC_flag,
-        ssc_q_bounds=ssc_q_bounds
+    print(
+        f"[QC] {source_id} QC1-array: Q={Q_flag_qc1}, SSC={SSC_flag_qc1}, SSL={SSL_flag_qc1} | "
+        f"Final: Q={int(Q_flag)}, SSC={int(SSC_flag)}, SSL={int(SSL_flag)}"
     )
-
-    if ssc_q_inconsistent and SSC_flag == 0:
-        SSC_flag = np.int8(2)  # suspect
-        SSL_flag = propagate_ssc_q_inconsistency_to_ssl(
-            inconsistent=ssc_q_inconsistent,
-            Q=Q,
-            SSC=SSC,
-            SSL=SSL,
-            Q_flag=Q_flag,
-            SSC_flag=SSC_flag,
-            SSL_flag=SSL_flag,
-            ssl_is_derived_from_q_ssc=True,  
-        ) #lcz added
+    # Downgrade SSL flag if statistically anomalous (log-IQR)
+    if ssl_log_iqr_outlier and SSL_flag == 0:
+        SSL_flag = np.int8(2)  # suspect
 
     # Calculate time (middle of period)
     if start_year and end_year:
@@ -471,11 +494,25 @@ def main():
     """Main conversion function."""
 
     # Define paths (relative to script location)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    source_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/ALi_De_Boer'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/annually_climatology/ALi_De_Boer/qc/'
+def main():
+    """Main conversion function."""
 
-    input_file = os.path.join(source_dir, 'ALi_De_Boer.xlsx')
+    # 当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 项目根目录：从 Script/Ali_De_Boer 往上两级 -> sediment_wzx_1111
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
+
+    # Source 和 Output_r 都在项目根目录下
+    source_dir = os.path.join(project_root, "Source", "ALi_De_Boer")
+    output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "ALi_De_Boer", "qc")
+
+    input_file = os.path.join(source_dir, "ALi_De_Boer.xlsx")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("Input file:", input_file)
+    print("Output directory:", output_dir)
 
     print("=" * 80)
     print("ALi_De_Boer Dataset Conversion to CF-1.8 NetCDF")

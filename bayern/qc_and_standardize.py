@@ -38,8 +38,56 @@ from tool import (
     compute_log_iqr_bounds,
     calculate_ssc,
     build_ssc_q_envelope,
-    check_ssc_q_consistency
+    check_ssc_q_consistency,
+    plot_ssc_q_diagnostic,
+    propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
+
+def fmt_float(x, nd=2):
+    try:
+        if x is None:
+            return "NA"
+        if isinstance(x, float) and (x != x):  # NaN
+            return "NA"
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+def log_station_qc(site_name, site_code=None, n=None,
+                   skipped_log_iqr=False, skipped_ssc_q=False,
+                   q=None, q_flag=None, ssc=None, ssc_flag=None, ssl=None, ssl_flag=None,
+                   created_path=None):
+    tag = f"{site_name}" + (f" ({site_code})" if site_code is not None else "")
+    print(f"\nProcessing: {tag}")
+
+    if n is not None:
+        if skipped_log_iqr:
+            print(f"  ⚠️ [{tag}] Sample size = {n} < 5, log-IQR statistical QC skipped.")
+        if skipped_ssc_q:
+            print(f"  ⚠️ [{tag}] Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+
+    if created_path:
+        print(f"  ✓ Created: {created_path}")
+
+    # values + flag
+    if q is not None or q_flag is not None:
+        print(f"  Q:   {fmt_float(q)} m3/s (flag={q_flag})")
+    if ssc is not None or ssc_flag is not None:
+        print(f"  SSC: {fmt_float(ssc)} mg/L (flag={ssc_flag})")
+    if ssl is not None or ssl_flag is not None:
+        print(f"  SSL: {fmt_float(ssl)} ton/day (flag={ssl_flag})")
+
+def log_summary(n_success, n_failed, summary_csv=None, out_dir=None):
+    print("\n" + "=" * 70)
+    print(f"Summary: {n_success} successful, {n_failed} failed")
+    print("=" * 70)
+    if summary_csv:
+        print(f"Generated station summary CSV: {summary_csv}")
+    if out_dir:
+        print(f"All files saved to: {out_dir}")
+    print("Processing complete!\n")
 
 def find_valid_time_range(ds_in):
     """
@@ -61,7 +109,7 @@ def find_valid_time_range(ds_in):
         Start and end indices for valid data range
     """
 
-    # Read time series data
+    # Read time series data 
     q_data = ds_in.variables['discharge'][:]
     ssc_data = ds_in.variables['ssc'][:]
     ssl_data = ds_in.variables['sediment_load'][:]
@@ -153,40 +201,58 @@ def process_station(input_file, output_dir):
             SSC_mgL=ssc_data,
             k=1.5
         )
+        # QC1-array（显式调用）：
+        Q_flag_qc1   = apply_quality_flag_array(q_data,  "Q")
+        SSC_flag_qc1 = apply_quality_flag_array(ssc_data,"SSC")
+        SSL_flag_qc1 = apply_quality_flag_array(ssl_data,"SSL")
+        # ==========================================================
+        qc = apply_hydro_qc_with_provenance(
+            time=time_data,  
+            Q=q_data,
+            SSC=ssc_data,
+            SSL=ssl_data,
+            Q_is_independent=True, # discharge is independent variable
+            SSC_is_independent=True, # ssc is independent variable
+            SSL_is_independent=True, # ssl is independent variable
+            ssl_is_derived_from_q_ssc=False,
+            qc2_k=1.5, 
+            qc2_min_samples=5,
+            qc3_k=1.5, 
+            qc3_min_samples=5,
+        )
+        print("[DBG] qc is None?", qc is None)   # <- 加在 if qc is None 之前
+        if qc is None:
+            return None
 
-        # ---- unified QC loop ----
-        # quality control 1st step: negative values and missing values
-        for i in range(len(q_data)):
-            qf = apply_quality_flag(q_data[i], 'Q')
-            sscf = apply_quality_flag(ssc_data[i], 'SSC')
-            sslf = apply_quality_flag(ssl_data[i], 'SSL')
 
-            # log-IQR statistical outliers → suspect
-            if ssc_lower and ssc_upper:
-                if np.isfinite(ssc_data[i]) and (ssc_data[i] < ssc_lower or ssc_data[i] > ssc_upper):
-                    if sscf == 0:
-                        sscf = np.int8(2)
+        # 把最终结果写回 flags 数组（后面统计/写文件都靠它）
+        q_flags   = qc["Q_flag"]
+        ssc_flags = qc["SSC_flag"]
+        ssl_flags = qc["SSL_flag"]
 
-            if ssl_lower and ssl_upper:
-                if np.isfinite(ssl_data[i]) and (ssl_data[i] < ssl_lower or ssl_data[i] > ssl_upper):
-                    if sslf == 0:
-                        sslf = np.int8(2)
-                        
-            # SSC–Q hydrological consistency (station-level, log–log envelope)
-            is_inconsistent, resid = check_ssc_q_consistency(
-                Q=q_data[i],
-                SSC=ssc_data[i],
-                Q_flag=qf,
-                SSC_flag=sscf,
-                ssc_q_bounds=ssc_q_bounds
+        print(
+            f"[QC] {station_id} QC1(good cnt): "
+            f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
+            f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
+        )
+
+
+        # ==========================================================
+        # SSC–Q diagnostic plot (station-level, optional but recommended)
+        # ==========================================================
+        try:
+            plot_ssc_q_diagnostic(
+                Q=q_data,
+                SSC_mgL=ssc_data,
+                Q_flag=q_flags,
+                SSC_flag=ssc_flags,
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=station_id,
+                station_name=station_name,
+                out_png=output_dir
             )
-
-            if is_inconsistent and sscf == 0:
-                sscf = np.int8(2)
-            
-            q_flags[i] = qf
-            ssc_flags[i] = sscf
-            ssl_flags[i] = sslf
+        except Exception as e:
+            print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
 
         # Convert time to dates for reporting
         time_units = ds_in.variables['time'].units
@@ -220,6 +286,43 @@ def process_station(input_file, output_dir):
 
         # Create output file
         output_file = os.path.join(output_dir, os.path.basename(input_file))
+        # === QC printout (per-station) ===
+        n_samples = len(q_data)
+        skipped_log_iqr = (n_samples < 5)
+        skipped_ssc_q = (n_samples < 5)
+
+        # 用最后一个有效值来展示（更像你截图那种“一行一个站点”）
+        def last_valid(arr):
+            arr = np.asarray(arr)
+            m = np.isfinite(arr)
+            return arr[m][-1] if np.any(m) else np.nan
+
+        q_show = last_valid(q_data)
+        ssc_show = last_valid(ssc_data)
+        ssl_show = last_valid(ssl_data)
+
+        # 对应的 flag 也取最后一个有效位置
+        def last_valid_flag(arr, flags):
+            arr = np.asarray(arr)
+            flags = np.asarray(flags)
+            m = np.isfinite(arr)
+            return int(flags[m][-1]) if np.any(m) else 9
+
+        qf_show = last_valid_flag(q_data, q_flags)
+        sscf_show = last_valid_flag(ssc_data, ssc_flags)
+        sslf_show = last_valid_flag(ssl_data, ssl_flags)
+
+        log_station_qc(
+            site_name=station_name if station_name else station_id,
+            site_code=station_id,
+            n=n_samples,
+            skipped_log_iqr=skipped_log_iqr,
+            skipped_ssc_q=skipped_ssc_q,
+            q=q_show, q_flag=qf_show,
+            ssc=ssc_show, ssc_flag=sscf_show,
+            ssl=ssl_show, ssl_flag=sslf_show,
+            created_path=output_file
+        )
 
         with nc.Dataset(output_file, 'w', format='NETCDF4') as ds:
 
@@ -406,8 +509,10 @@ def main():
     print()
 
     # Paths
-    input_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/bayern/done'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Bayern/qc'
+    project_root = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+
+    input_dir = os.path.join(project_root, "Source", "bayern", "done")
+    output_dir = os.path.join(project_root, "Output_r", "daily", "Bayern", "qc")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

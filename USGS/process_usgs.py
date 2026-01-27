@@ -9,9 +9,10 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 import logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
+SCRIPT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+REPO_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
@@ -21,8 +22,7 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    propagate_ssc_q_inconsistency_to_ssl
 )
 
 # --------------------------
@@ -67,7 +67,15 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None):
         lower, upper = compute_log_iqr_bounds(values)
         if lower is not None:
             out.loc[(values < lower) | (values > upper), f'{var}_flag'] = 2
-
+    # ======================================================
+    # 2.5 SSL & SSL_flag (derived, for propagation only)
+    # ======================================================
+    out["SSL"] = out["Q"] * out["SSC"] * 0.0864
+    out["SSL_flag"] = np.array(
+        [apply_quality_flag(v, "SSL") for v in out["SSL"].values],
+        dtype=np.int8
+    )
+    out.loc[out["SSL_flag"] == 3, "SSL"] = np.nan
     # ======================================================
     # 3. SSC–Q consistency check
     # ======================================================
@@ -83,13 +91,29 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None):
                 envelope
             )
             if inconsistent:
-                out.loc[out.index[i], 'SSC_flag'] = 2
+                # 先把 SSC 标为 suspect（仅当原来是 good）
+                sscf = int(out["SSC_flag"].iloc[i])
+                if sscf == 0:
+                    out.loc[out.index[i], "SSC_flag"] = np.int8(2)
+                    sscf = 2
+
+                # 再把不一致传播到 SSL_flag
+                out.loc[out.index[i], "SSL_flag"] = propagate_ssc_q_inconsistency_to_ssl(
+                    inconsistent=inconsistent,
+                    Q=float(out["Q"].iloc[i]),
+                    SSC=float(out["SSC"].iloc[i]),
+                    SSL=float(out["SSL"].iloc[i]) if np.isfinite(out["SSL"].iloc[i]) else np.nan,
+                    Q_flag=int(out["Q_flag"].iloc[i]),
+                    SSC_flag=int(sscf),
+                    SSL_flag=int(out["SSL_flag"].iloc[i]),
+                    ssl_is_derived_from_q_ssc=True,   # USGS 这里 SSL = Q*SSC 派生的
+                )
 
         # Diagnostic plot
         if diagnostic_dir is not None:
             diagnostic_dir.mkdir(parents=True, exist_ok=True)
             plot_ssc_q_diagnostic(
-                time=out.index.values if hasattr(out.index, 'values') else np.arange(len(out)),
+                time=out["datetime"].values if "datetime" in out.columns else (out.index.values if hasattr(out.index, "values") else np.arange(len(out))),
                 Q=out['Q'].values,
                 SSC=out['SSC'].values,
                 Q_flag=out['Q_flag'].values,
@@ -101,6 +125,31 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None):
             )
 
     return out
+
+def print_qc_summary(station_id, df):
+    n_total = len(df)
+
+    def _repr(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        ok = np.isfinite(v) & (v > 0)
+        ok_good = ok & (f == 0)
+        if np.any(ok_good):
+            return float(np.nanmedian(v[ok_good])), 0
+        if np.any(ok):
+            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
+        return float("nan"), 9
+
+    qv, qf = _repr(df["Q"].values, df["Q_flag"].values)
+    sscv, sscf = _repr(df["SSC"].values, df["SSC_flag"].values)
+    sslv, sslf = _repr(df["SSL"].values, df["SSL_flag"].values)
+
+    print(f"\nProcessing station {station_id}")
+    print(f"✅ QC summary (USGS_{station_id})")
+    print(f"   Samples: {n_total}")
+    print(f"   Q  : {qv:.2f} m3/s (flag={qf})")
+    print(f"   SSC: {sscv:.2f} mg/L (flag={sscf})")
+    print(f"   SSL: {sslv:.2f} ton/day (flag={sslf})")
 
 
 def process_single_station(args):
@@ -121,7 +170,7 @@ def process_single_station(args):
         if not (discharge_file.exists() and sediment_file.exists()):
             return {'status': 'skipped', 'station_id': station_id, 'reason': 'missing discharge or sediment file'}
 
-        discharge_df = pd.read_csv(discharge_file, comment='#')
+        discharge_df = pd.read_csv(discharge_file, comment="#", low_memory=False)
         sediment_df = pd.read_csv(sediment_file, comment='#')
 
         # --------------------------
@@ -174,17 +223,7 @@ def process_single_station(args):
             station_id=station_id,
             diagnostic_dir=diagnostic_dir
         )
-
-        # --------------------------------------------------
-        # SSL is a derived variable → calculate AFTER QC
-        # --------------------------------------------------
-        df['SSL'] = df['Q'] * df['SSC'] * 0.0864
-
-        df['SSL_flag'] = np.where(
-            df['SSL'].isna(),
-            FILL_VALUE_INT,
-            0
-        ).astype(np.int8)
+        print_qc_summary(station_id, df)
 
         start_date, end_date = df['datetime'].min(), df['datetime'].max()
 
@@ -280,12 +319,12 @@ def process_usgs(num_workers=None):
     """
     # --------------------------
     # Paths
-    # --------------------------
-    source_dir = Path("/mnt/d/sediment_wzx_1111/Source/USGS/usgs_data_by_station")
-    output_dir = Path("/mnt/d/sediment_wzx_1111/Output_r/daily/USGS/qc")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metadata_file = Path("/mnt/d/sediment_wzx_1111/Source/USGS/common_sites_info.xlsx")
+    source_dir = Path(REPO_ROOT) / "Source" / "USGS" / "usgs_data_by_station"
+    output_dir = Path(REPO_ROOT) / "Output_r" / "daily" / "USGS" / "qc"
+    metadata_file = Path(REPO_ROOT) / "Source" / "USGS" / "common_sites_info.xlsx"
     log_file = output_dir / "processing_log.txt"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
 
     with open(log_file, "w", encoding="utf-8") as log:
         with redirect_stdout(log):
