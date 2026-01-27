@@ -43,6 +43,10 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    summarize_warning_types as summarize_warning_types_tool,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+    generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
 def fmt_float(x, nd=2):
@@ -235,6 +239,38 @@ def process_station(input_file, output_dir):
             f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
             f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
         )
+        # ------------------------------------------------------------
+        # Build station-level warnings for summary tools
+        # ------------------------------------------------------------
+        warnings = []
+
+        n_samples = len(q_data)
+        if n_samples < 5:
+            warnings.append("Sample size < 5: some statistical QC / SSC-Q checks may be skipped or unreliable")
+
+        # 如果你希望把“是否产生诊断图失败”也算 warning：
+        # 你现在 plot 的 except 只 print，不记录；改成同时 append
+        # （见下方“plot except 小改动”）
+
+        def _flag_warn(var, flags):
+            flags = np.asarray(flags)
+            # 统计站点级别的“坏/缺测”数量，作为警告摘要
+            n_bad = int((flags == 3).sum())
+            n_missing = int((flags == 9).sum())
+            n_suspect = int((flags == 2).sum())
+            if n_bad > 0:
+                warnings.append(f"{var}: bad={n_bad}")
+            if n_suspect > 0:
+                warnings.append(f"{var}: suspect={n_suspect}")
+            if n_missing > 0:
+                warnings.append(f"{var}: missing={n_missing}")
+
+        _flag_warn("Q", q_flags)
+        _flag_warn("SSC", ssc_flags)
+        _flag_warn("SSL", ssl_flags)
+
+        warnings_str = "; ".join(warnings)
+        n_warnings = len(warnings)
 
         # Convert time to dates for reporting
         time_units = ds_in.variables['time'].units
@@ -264,7 +300,14 @@ def process_station(input_file, output_dir):
                 out_png=out_png
             )
         except Exception as e:
+            msg = f"Diagnostic plot failed: {e}"
             print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
+            # 记录 warning（如果 warnings 还没定义，就先临时存一下）
+            try:
+                warnings.append(msg)
+            except Exception:
+                pass
+
 
         ds_in.close()
 
@@ -495,7 +538,15 @@ def process_station(input_file, output_dir):
             'SSC_percent_complete': f"{100.0 * ssc_good / len(ssc_data):.1f}" if ssc_good > 0 else 'N/A',
             'SSL_start_date': dates[0].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
             'SSL_end_date': dates[-1].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
-            'SSL_percent_complete': f"{100.0 * ssl_good / len(ssl_data):.1f}" if ssl_good > 0 else 'N/A'
+            'SSL_percent_complete': f"{100.0 * ssl_good / len(ssl_data):.1f}" if ssl_good > 0 else 'N/A',
+            
+            'filepath': output_file,
+            'warnings': warnings_str,
+            'n_warnings': n_warnings,
+            'Q_good': int(q_good), 'Q_suspect': int(q_suspect), 'Q_bad': int(q_bad), 'Q_missing': int(q_missing),
+            'SSC_good': int(ssc_good), 'SSC_suspect': int(ssc_suspect), 'SSC_bad': int(ssc_bad), 'SSC_missing': int(ssc_missing),
+            'SSL_good': int(ssl_good), 'SSL_suspect': int(ssl_suspect), 'SSL_bad': int(ssl_bad), 'SSL_missing': int(ssl_missing),
+
         }
 
         return station_info
@@ -584,6 +635,32 @@ def main():
 
         print(f"Station summary saved to: {csv_file}")
         print(f"Total stations: {len(df)}")
+        # ------------------------------------------------------------
+    # Standardized tool outputs (same pattern as HYDAT example)
+    # ------------------------------------------------------------
+    if len(station_info_list) > 0:
+        print("\n" + "=" * 80)
+        print("Generating Tool QC Summaries")
+        print("=" * 80)
+
+        # 1) warning type summary (console)
+        warning_type_summary = summarize_warning_types_tool(station_info_list)
+        print("\n[WARN] Summary by type:")
+        print(warning_type_summary)
+
+        # 2) tool CSVs
+        tool_csv_summary = os.path.join(output_dir, "tool_csv_summary.csv")
+        tool_qc_results = os.path.join(output_dir, "tool_qc_results.csv")
+        tool_warning_summary = os.path.join(output_dir, "tool_warning_summary.csv")
+
+        generate_csv_summary_tool(station_info_list, tool_csv_summary)
+        generate_qc_results_csv_tool(station_info_list, tool_qc_results)
+        generate_warning_summary_csv_tool(station_info_list, tool_warning_summary)
+
+        print("\n[CSV] Tool outputs written:")
+        print("  -", tool_csv_summary)
+        print("  -", tool_qc_results)
+        print("  -", tool_warning_summary)
     else:
         print("WARNING: No successful stations processed, CSV not created")
 
