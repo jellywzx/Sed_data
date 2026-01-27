@@ -236,28 +236,35 @@ def process_station(input_file, output_dir):
             f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
         )
 
-
+        # Convert time to dates for reporting
+        time_units = ds_in.variables['time'].units
+        time_calendar = ds_in.variables['time'].calendar
+        dates = nc.num2date(time_data, units=time_units, calendar=time_calendar)
+        import matplotlib.dates as mdates
+        numeric_dates = mdates.date2num(dates)
         # ==========================================================
         # SSC–Q diagnostic plot (station-level, optional but recommended)
         # ==========================================================
         try:
+            
+            plot_dir = os.path.join(output_dir, "diagnostic_plots")
+            os.makedirs(plot_dir, exist_ok=True)
+
+            out_png = os.path.join(plot_dir, f"{station_id}_SSC_Q_diagnostic.png")
+
             plot_ssc_q_diagnostic(
+                time=numeric_dates,
                 Q=q_data,
-                SSC_mgL=ssc_data,
+                SSC=ssc_data,
                 Q_flag=q_flags,
                 SSC_flag=ssc_flags,
                 ssc_q_bounds=ssc_q_bounds,
                 station_id=station_id,
                 station_name=station_name,
-                out_png=output_dir
+                out_png=out_png
             )
         except Exception as e:
             print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
-
-        # Convert time to dates for reporting
-        time_units = ds_in.variables['time'].units
-        time_calendar = ds_in.variables['time'].calendar
-        dates = nc.num2date(time_data, units=time_units, calendar=time_calendar)
 
         ds_in.close()
 
