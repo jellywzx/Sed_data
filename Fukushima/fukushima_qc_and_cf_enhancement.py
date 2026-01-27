@@ -186,6 +186,7 @@ def perform_qc_checks(daily_df):
     ssc_flag_qc1 = apply_quality_flag_array(qc_df["ssc_mg_L"].to_numpy(dtype=float), "SSC")
     ssl_flag_qc1 = apply_quality_flag_array(qc_df["sediment_load"].to_numpy(dtype=float), "SSL")
 
+
     # ---- 2) QC2/QC3 + provenance ----
     qc = apply_hydro_qc_with_provenance(
         time=time_days,
