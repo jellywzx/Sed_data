@@ -4,7 +4,7 @@ import numpy.ma as ma
 import re
 import os
 import xarray as xr
-
+from netCDF4 import Dataset
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
@@ -179,7 +179,6 @@ def compute_log_iqr_bounds(values, k=1.5):
 
     return lower, upper
 
-
 def apply_log_iqr_screening(
     values,
     base_flag,
@@ -341,7 +340,6 @@ def apply_qc2_log_iqr_if_independent(
 
     return qc2_step_flag, updated_flag, (None, None)
 
-
 def apply_quality_flag_array(values, variable_name=""):
     """
     Vectorized wrapper for apply_quality_flag (returns int8 flag array).
@@ -353,7 +351,6 @@ def apply_quality_flag_array(values, variable_name=""):
         values = ma.filled(values, np.nan)
     arr = np.asarray(values)
     return np.array([apply_quality_flag(v, variable_name) for v in arr], dtype=np.int8)
-
 
 def apply_hydro_qc_with_provenance(
     time,
@@ -534,7 +531,6 @@ def apply_hydro_qc_with_provenance(
         "ssc_q_bounds": ssc_q_bounds,
     }
 
-
 def apply_quality_flag(value, variable_name):
     """
     Apply quality flag based only on missing values and physical impossibility.
@@ -637,8 +633,6 @@ def build_ssc_q_envelope(
         "upper": q3 + k * iqr,
     }
 
-
-
 def check_ssc_q_consistency(
     Q,
     SSC,
@@ -700,7 +694,6 @@ def check_ssc_q_consistency(
         )
 
     return is_inconsistent, resid
-
 
 def propagate_ssc_q_inconsistency_to_ssl(
     inconsistent,
@@ -779,6 +772,317 @@ def propagate_ssc_q_inconsistency_to_ssl(
         return np.int8(2)
 
     return SSL_flag
+
+def check_nc_completeness(
+    nc_path,
+    required_vars=None,
+    required_attrs=None,
+    strict=False,
+):
+    """
+    Check whether a NetCDF dataset contains the expected variables and global attributes.
+
+    Parameters
+    ----------
+    nc_path : str
+        Path to the NetCDF file to validate.
+    required_vars : list[str] or None
+        Explicit list of variables that must exist. Defaults to standard variables
+        used across dataset processors.
+    required_attrs : list[str] or None
+        Explicit list of global attributes that must exist. Defaults to common
+        CF/ACDD metadata fields used in dataset processors.
+    strict : bool
+        If True, missing extended attributes are treated as errors. If False,
+        they are reported as warnings.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        (errors, warnings)
+    """
+    default_var_requirements = {
+        "time": ["units", "calendar"],
+        "lat": ["units"],
+        "lon": ["units"],
+        "Q": ["units", "long_name", "ancillary_variables"],
+        "Q_flag": ["flag_values", "flag_meanings"],
+        "SSC": ["units", "long_name", "ancillary_variables"],
+        "SSC_flag": ["flag_values", "flag_meanings"],
+        "SSL": ["units", "long_name", "ancillary_variables"],
+        "SSL_flag": ["flag_values", "flag_meanings"],
+    }
+
+    default_required_attrs = [
+        "Conventions",
+        "title",
+        "summary",
+        "source",
+        "data_source_name",
+        "variables_provided",
+        "number_of_data",
+        "reference",
+        "source_data_link",
+        "creator_name",
+        "creator_email",
+        "creator_institution",
+        "processing_level",
+        "comment",
+    ]
+
+    strict_attrs = [
+        "temporal_resolution",
+        "time_coverage_start",
+        "time_coverage_end",
+        "geographic_coverage",
+        "geospatial_lat_min",
+        "geospatial_lat_max",
+        "geospatial_lon_min",
+        "geospatial_lon_max",
+    ]
+
+    errors = []
+    warnings = []
+
+    required_vars = required_vars or list(default_var_requirements.keys())
+    required_attrs = required_attrs or default_required_attrs
+
+    with Dataset(nc_path, mode="r") as ds:
+        available_attrs = set(ds.ncattrs())
+
+        for attr in required_attrs:
+            if attr not in available_attrs:
+                errors.append(f"Missing global attribute: {attr}")
+
+        for attr in strict_attrs:
+            if attr not in available_attrs:
+                message = f"Missing global attribute: {attr}"
+                if strict:
+                    errors.append(message)
+                else:
+                    warnings.append(message)
+
+        for var_name in required_vars:
+            if var_name not in ds.variables:
+                errors.append(f"Missing variable: {var_name}")
+                continue
+
+            attrs_required = default_var_requirements.get(var_name, [])
+            var_attrs = set(ds.variables[var_name].ncattrs())
+            for attr in attrs_required:
+                if attr not in var_attrs:
+                    errors.append(
+                        f"Variable '{var_name}' missing attribute: {attr}"
+                    )
+
+        if "variables_provided" in available_attrs:
+            provided = [
+                item.strip()
+                for item in str(ds.getncattr("variables_provided")).split(",")
+                if item.strip()
+            ]
+            for var_name in provided:
+                if var_name not in ds.variables:
+                    errors.append(
+                        "variables_provided lists missing variable: "
+                        f"{var_name}"
+                    )
+
+    return errors, warnings
+
+def check_variable_metadata_tiered(
+    nc_path,
+    *,
+    tier: str = "basic",
+    extra_requirements: dict | None = None,
+    treat_empty_as_missing: bool = True,
+    strict_empty: bool = False,
+):
+    """
+    Tiered variable metadata completeness checker.
+
+    Tiers
+    -----
+    basic:
+        - Minimal, low false-positive checks.
+        - Focus on: time/lat/lon units + time calendar
+                  Q/SSC/SSL units + long_name + ancillary_variables
+                  flag vars flag_values + flag_meanings
+    recommended:
+        - Adds common CF/ACDD-friendly attributes that improve interoperability.
+        - Focus on: coordinates, standard_name presence (not validation),
+                    axis for coordinate vars, fill_value presence for flags
+    strict:
+        - Stronger expectations; still no external CF standard_name table.
+        - Adds: valid_range (lat/lon), positive for altitude if present,
+                comment presence for data vars, standard_name presence for data vars
+                (as a requirement; can be strict in some pipelines)
+
+    Parameters
+    ----------
+    nc_path : str or Path
+        NetCDF file to check.
+    tier : {"basic","recommended","strict"}
+    extra_requirements : dict or None
+        Additional/override requirements, merged into tier rules.
+        Format: {var_name: {"require": [...], "warn": [...]} }
+        - "require" missing -> errors
+        - "warn" missing -> warnings
+    treat_empty_as_missing : bool
+        Whether empty strings / None-like values are treated as missing.
+    strict_empty : bool
+        If True, empty values are treated as errors (when the key exists).
+        If False, empty values become warnings (unless tier/attr is required and you want to enforce).
+
+    Returns
+    -------
+    errors : list[str]
+    warnings : list[str]
+    """
+    tier = str(tier).lower().strip()
+    if tier not in {"basic", "recommended", "strict"}:
+        raise ValueError("tier must be one of: 'basic', 'recommended', 'strict'")
+
+    # -----------------------------
+    # Tier rule definitions
+    # -----------------------------
+    # Each var has:
+    #   - require: missing -> error
+    #   - warn:    missing -> warning
+    # Note: "existence" of a variable is checked if it appears in any rule.
+    BASIC = {
+        "time": {"require": ["units", "calendar"], "warn": ["long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+    }
+
+    RECOMMENDED = {
+        # coordinates & axis are very common; still keep as warnings unless strict.
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        # optional station scalar vars if present (warn only)
+        "altitude": {"require": [], "warn": ["units", "positive", "long_name", "standard_name"]},
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    STRICT = {
+        # Make more things "require"
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        # If altitude exists, enforce core attrs
+        "altitude": {"require": [], "warn": []},  # handled dynamically below
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    rules = BASIC if tier == "basic" else RECOMMENDED if tier == "recommended" else STRICT
+
+    # Merge extra_requirements (override/extend)
+    if extra_requirements:
+        for vname, spec in extra_requirements.items():
+            if vname not in rules:
+                rules[vname] = {"require": [], "warn": []}
+            for k in ("require", "warn"):
+                if k in spec and spec[k]:
+                    # merge unique
+                    merged = list(dict.fromkeys(list(rules[vname].get(k, [])) + list(spec[k])))
+                    rules[vname][k] = merged
+
+    errors = []
+    warnings = []
+
+    def _is_empty(val) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, str) and val.strip() == "":
+            return True
+        return False
+
+    with Dataset(str(nc_path), mode="r") as ds:
+        # Dynamic strict rules for altitude if present
+        if tier == "strict" and "altitude" in ds.variables:
+            STRICT["altitude"] = {"require": ["units", "long_name"], "warn": ["positive", "standard_name", "comment"]}
+
+        # ---------- existence check ----------
+        for vname in rules.keys():
+            # Only require existence for core vars; for optional vars we can allow missing:
+            # Heuristic: if a var has any "require" attrs, treat var itself as required.
+            var_is_required = len(rules[vname].get("require", [])) > 0
+            if vname not in ds.variables:
+                if var_is_required:
+                    errors.append(f"Missing required variable: {vname}")
+                else:
+                    # optional variable absent -> ok
+                    continue
+
+        # ---------- attribute check ----------
+        for vname, spec in rules.items():
+            if vname not in ds.variables:
+                continue
+
+            var = ds.variables[vname]
+            present_attrs = set(var.ncattrs())
+
+            for attr in spec.get("require", []):
+                if attr not in present_attrs:
+                    errors.append(f"Variable '{vname}' missing required attribute: {attr}")
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        msg = f"Variable '{vname}' required attribute '{attr}' is empty/None"
+                        if strict_empty:
+                            errors.append(msg)
+                        else:
+                            warnings.append(msg)
+
+            for attr in spec.get("warn", []):
+                if attr not in present_attrs:
+                    warnings.append(f"Variable '{vname}' missing recommended attribute: {attr}")
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        warnings.append(f"Variable '{vname}' recommended attribute '{attr}' is empty/None")
+
+        # ---------- light sanity checks (non-fatal) ----------
+        # Units should exist and be non-empty for common vars
+        for vname in ("Q", "SSC", "SSL", "lat", "lon", "time"):
+            if vname in ds.variables and "units" in ds.variables[vname].ncattrs():
+                u = str(getattr(ds.variables[vname], "units", "")).strip()
+                if u == "":
+                    warnings.append(f"Variable '{vname}' has empty 'units' attribute")
+
+    return errors, warnings
+
+
 
 #=====================================
 # plot_session
@@ -906,8 +1210,6 @@ def plot_ssc_q_diagnostic(
     fig.tight_layout()
     fig.savefig(out_png, dpi=300)
     plt.close(fig)
-
-
 
 
 #=====================================

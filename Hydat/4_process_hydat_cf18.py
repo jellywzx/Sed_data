@@ -25,6 +25,7 @@ import os
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+from collections import Counter
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 from tool import (
@@ -39,7 +40,8 @@ from tool import (
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    # check_nc_completeness,
+    check_nc_completeness,
+    check_variable_metadata_tiered,
     # add_global_attributes,
     propagate_ssc_q_inconsistency_to_ssl,
     apply_hydro_qc_with_provenance
@@ -308,6 +310,7 @@ class HYDATQualityControl:
                     var_lat.standard_name = 'latitude'
                     var_lat.long_name = 'station latitude'
                     var_lat.units = 'degrees_north'
+                    var_lat.axis = 'Y'
                     var_lat.valid_range = np.array([-90.0, 90.0], dtype=np.float32)
                     var_lat[:] = lat
 
@@ -315,6 +318,7 @@ class HYDATQualityControl:
                     var_lon.standard_name = 'longitude'
                     var_lon.long_name = 'station longitude'
                     var_lon.units = 'degrees_east'
+                    var_lon.axis = 'X'
                     var_lon.valid_range = np.array([-180.0, 180.0], dtype=np.float32)
                     var_lon[:] = lon
 
@@ -474,17 +478,17 @@ class HYDATQualityControl:
                     river_name = station_name.split(' AT ')[0] if ' AT ' in station_name else station_name.split(' NEAR ')[0] if ' NEAR ' in station_name else ''
                     ds_out.river_name = river_name
                     ds_out.location_id = station_id
-                    ds_out.Type = 'In-situ station data'
-                    ds_out.Temporal_Resolution = 'daily'
-                    ds_out.Temporal_Span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-                    ds_out.Variables_Provided = 'altitude, upstream_area, Q, SSC, SSL'
-                    ds_out.Geographic_Coverage = f"{province}, Canada"
+                    ds_out.type = 'In-situ station data'
+                    ds_out.temporal_resolution = 'daily'
+                    ds_out.temporal_span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                    ds_out.variables_provided = 'altitude, upstream_area, Q, SSC, SSL'
+                    ds_out.geographic_coverage = f"{province}, Canada"
                     ds_out.country = 'Canada'
                     ds_out.continent_region = 'North America'
                     ds_out.time_coverage_start = start_date.strftime('%Y-%m-%d')
                     ds_out.time_coverage_end = end_date.strftime('%Y-%m-%d')
                     ds_out.number_of_data = '1'
-                    ds_out.Reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
+                    ds_out.reference = 'HYDAT - Canadian Hydrometric Database, Water Survey of Canada'
                     ds_out.source_data_link = 'https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html'
                     ds_out.creator_name = 'Zhongwang Wei'
                     ds_out.creator_email = 'weizhw6@mail.sysu.edu.cn'
@@ -507,40 +511,53 @@ class HYDATQualityControl:
                     ds_out.date_created = datetime.now().strftime('%Y-%m-%d')
                     ds_out.date_modified = datetime.now().strftime('%Y-%m-%d')
                     ds_out.processing_level = 'Quality controlled and standardized'
-                    # ds_out.comment = (
-                    #     f"Data quality flags indicate reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
-                    #     f"Quality control applied: Q<0 flagged as bad, Q=0 flagged as suspect, Q>{self.Q_extreme_high} flagged as suspect; "
-                    #     f"SSC<0 flagged as bad, SSC<{self.SSC_min} or SSC>{self.SSC_extreme_high} flagged as suspect; "
-                    #     f"SSL<0 flagged as bad."
-                    # )
+                    ds_out.comment = (
+                        "Quality flags: 0=good, 1=estimated (derived), 2=suspect, 3=bad, 9=missing. "
+                        "QC1: physical feasibility; QC2: log-IQR screening (independent variables only); "
+                        "QC3: SSC–Q consistency and propagation to derived SSL."
+                    )
+
                 # ==========================================================
                 # NetCDF completeness check (CF-1.8 / ACDD-1.3)
                 # ==========================================================
-                # errors, warnings = check_nc_completeness(output_file, strict=True)
 
-                # if errors:
-                #     print(f"  ✗ NetCDF completeness check FAILED for {station_id}")
-                #     for e in errors:
-                #         print(f"    ERROR: {e}")
+                errors, warnings = check_nc_completeness(
+                    output_file,
+                    strict=False   # ← 建议先用 False
+                )
+                var_errs, var_warns = check_variable_metadata_tiered(output_file, tier="recommended")
+                errors.extend(var_errs)
+                warnings.extend(var_warns)
 
-                #     # 可选：删除不合格文件
-                #     try:
-                #         output_file.unlink()
-                #         print(f"    → Invalid NetCDF removed: {output_file.name}")
-                #     except Exception:
-                #         pass
+                if errors:
+                    print(f"  ✗ NetCDF completeness check FAILED for {station_id}")
+                    for e in errors:
+                        print(f"    ERROR: {e}")
 
-                #     return False, None
+                    # 删除不合格文件（强一致性）
+                    try:
+                        output_file.unlink()
+                        print(f"    → Invalid NetCDF removed: {output_file.name}")
+                    except Exception:
+                        pass
 
-                #     if warnings:
-                #         with nc.Dataset(output_file, "a") as ds_out:
-                #             ds_out.history = (
-                #                 ds_out.history
-                #                 + f"; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
-                #                 f"Completeness check warnings: {len(warnings)} issues"
-                #             )
+                    return False, None
 
+                if warnings:
+                    print(f"  ⚠ NetCDF completeness warnings for {station_id}: {len(warnings)}")
+                    for w in warnings:
+                        print(f"    WARNING: {w}")
 
+                    # 把 warning 写入 history（非常加分）
+                    with nc.Dataset(output_file, "a") as ds_out:
+                        ds_out.history = (
+                            ds_out.history
+                            + f"; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
+                            + f"Completeness check warnings ({len(warnings)}): "
+                            + "; ".join(warnings[:3])
+                        )
+
+                station_warnings = warnings.copy() if warnings else []
 
                 # 收集站点信息用于CSV
                 station_info = {
@@ -585,6 +602,11 @@ class HYDATQualityControl:
                     **{f"SSC_qc3_{k}": v for k, v in _count_flags(SSC_flag_qc3_ssc_q, step_map).items()},
                     **{f"SSL_qc3_{k}": v for k, v in _count_flags(SSL_flag_qc3_from_ssc_q, ssl_qc3_map).items()},
                 }
+                station_info.update({
+                        "n_warnings": len(station_warnings),
+                        "warnings": " | ".join(station_warnings[:5])  # 最多存前5条，防爆
+                    })
+
 
                 self.stats['processed_stations'] += 1
                 print(f"  ✓ 成功处理")
@@ -642,6 +664,22 @@ class HYDATQualityControl:
         print(f"{'='*80}\n")
 
         return self.stats
+
+
+    def summarize_warning_types(self):
+        counter = Counter()
+
+        for s in self.stats['stations_info']:
+            if s.get("warnings"):
+                for w in s["warnings"].split(" | "):
+                    counter[w] += 1
+
+        print("\nMetadata warning type summary:")
+        for w, n in counter.most_common():
+            print(f"  {n:4d} × {w}")
+
+        return counter
+
 
     def generate_csv_summary(self, output_csv):
         """生成CSV站点摘要文件"""
@@ -702,6 +740,34 @@ class HYDATQualityControl:
         df.to_csv(output_csv, index=False)
         print(f"  ✓ QC结果CSV已生成: {len(df)} 个站点")
 
+    def generate_warning_summary_csv(self, output_csv):
+        """
+        Generate a CSV summarizing NetCDF metadata warnings by station.
+        """
+        if not self.stats['stations_info']:
+            print("⚠ No station info available for warning summary.")
+            return
+
+        rows = []
+        for s in self.stats['stations_info']:
+            if s.get("n_warnings", 0) > 0:
+                rows.append({
+                    "station_name": s.get("station_name", ""),
+                    "Source_ID": s.get("Source_ID", ""),
+                    "n_warnings": s.get("n_warnings", 0),
+                    "warnings": s.get("warnings", ""),
+                })
+
+        if not rows:
+            print("✓ No warnings found across all stations.")
+            return
+
+        df = pd.DataFrame(rows)
+        df.sort_values("n_warnings", ascending=False, inplace=True)
+        df.to_csv(output_csv, index=False)
+        print(f"✓ Warning summary CSV written: {output_csv} ({len(df)} stations)")
+
+
 
 def main():
     """主函数"""
@@ -712,6 +778,7 @@ def main():
     output_dir = project_root / 'Output_r/daily/HYDAT/output_update'
     csv_file = output_dir / 'HYDAT_station_summary.csv'
     qc_csv_file = output_dir / 'HYDAT_station_qc_results.csv'
+    warning_csv = output_dir / "HYDAT_metadata_warnings.csv"
 
     # 创建处理对象
     qc = HYDATQualityControl(input_dir, output_dir)
@@ -722,6 +789,8 @@ def main():
     # 生成CSV摘要
     qc.generate_csv_summary(csv_file)
     qc.generate_qc_results_csv(qc_csv_file)
+    qc.generate_warning_summary_csv(warning_csv)
+    qc.summarize_warning_types()
 
     print(f"\n✓ 全部完成!")
     print(f"  输出目录: {output_dir}")
