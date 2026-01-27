@@ -28,8 +28,8 @@ from tool import (
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    apply_quality_flag_array,        
+    apply_hydro_qc_with_provenance, 
 )
 
 warnings.filterwarnings('ignore')
@@ -165,85 +165,61 @@ def log_station_qc(station_name, source_id, n_samples,
 
 
 def perform_qc_checks(daily_df):
-    """
-    Perform quality control checks and create flag variables.
-    
-    Parameters:
-    -----------
-    daily_df : pd.DataFrame
-        Daily data with measurements
-    
-    Returns:
-    --------
-    qc_df : pd.DataFrame
-        Data with added flag columns
-    """
     qc_df = daily_df.copy()
-    
-    # -------------------------
-    # 1. Basic physical QC
-    # -------------------------
-    qc_df["Q_flag"] = qc_df["discharge"].apply(
-        lambda x: apply_quality_flag(x, "Q")
+
+    # ---- 0) 统一时间：保证 qc_df 有 datetime 列，并且也把它设为 index ----
+    if "datetime" not in qc_df.columns:
+        # 说明时间在 index 里
+        qc_df = qc_df.copy()
+        qc_df["datetime"] = pd.to_datetime(qc_df.index)
+    else:
+        qc_df["datetime"] = pd.to_datetime(qc_df["datetime"])
+
+    qc_df = qc_df.sort_values("datetime").reset_index(drop=True)
+
+    # time -> days since 1970-01-01（tool.py 需要数值 time）
+    base = pd.Timestamp("1970-01-01")
+    time_days = (qc_df["datetime"] - base).dt.days.astype(float).to_numpy()
+
+    # ---- 1) QC1 ----
+    q_flag_qc1   = apply_quality_flag_array(qc_df["discharge"].to_numpy(dtype=float), "Q")
+    ssc_flag_qc1 = apply_quality_flag_array(qc_df["ssc_mg_L"].to_numpy(dtype=float), "SSC")
+    ssl_flag_qc1 = apply_quality_flag_array(qc_df["sediment_load"].to_numpy(dtype=float), "SSL")
+
+    # ---- 2) QC2/QC3 + provenance ----
+    qc = apply_hydro_qc_with_provenance(
+        time=time_days,
+        Q=qc_df["discharge"].to_numpy(dtype=float),
+        SSC=qc_df["ssc_mg_L"].to_numpy(dtype=float),
+        SSL=qc_df["sediment_load"].to_numpy(dtype=float),
+
+        Q_is_independent=True,
+        SSC_is_independent=True,    # g/L -> mg/L 是单位换算 => True（按你新规则）
+        SSL_is_independent=False,   # SSL 是 Q×SSC 算出来的 => False
+        ssl_is_derived_from_q_ssc=True,
+
+        qc2_k=1.5, qc2_min_samples=5,
+        qc3_k=1.5, qc3_min_samples=5,
     )
-    qc_df["SSC_flag"] = qc_df["ssc_mg_L"].apply(
-        lambda x: apply_quality_flag(x, "SSC")
-    )
-    qc_df["SSL_flag"] = qc_df["sediment_load"].apply(
-        lambda x: apply_quality_flag(x, "SSL")
-    )
 
-    # -------------------------
-    # 2. SSL log-IQR screening
-    # -------------------------
-    lower, upper = compute_log_iqr_bounds(qc_df["sediment_load"].values)
+    if qc is None:
+        qc_df["Q_flag"]   = q_flag_qc1
+        qc_df["SSC_flag"] = ssc_flag_qc1
+        qc_df["SSL_flag"] = ssl_flag_qc1
+        qc_df = qc_df.set_index("datetime").sort_index()
+        return qc_df, None
 
-    if lower is not None:
-        is_outlier = (
-            (qc_df["sediment_load"] < lower) |
-            (qc_df["sediment_load"] > upper)
-        ) & (qc_df["SSL_flag"] == 0)
+    # tool 返回 trimmed(valid_time)，用 time 对齐回 qc_df
+    qc_time = base + pd.to_timedelta(qc["time"], unit="D")
+    qc_df = qc_df.set_index("datetime").loc[qc_time].copy()
 
-        qc_df.loc[is_outlier, "SSL_flag"] = 2  # suspect
+    qc_df["Q_flag"]   = qc["Q_flag"]
+    qc_df["SSC_flag"] = qc["SSC_flag"]
+    qc_df["SSL_flag"] = qc["SSL_flag"]
 
-    # -------------------------
-    # 3. SSC–Q consistency check
-    # -------------------------
-    ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=qc_df["discharge"].values,
-        SSC_mgL=qc_df["ssc_mg_L"].values,
-        k=1.5,
-        min_samples=5
-    )
+    ssc_q_bounds = qc.get("ssc_q_bounds", None)
+    return qc_df.sort_index(), ssc_q_bounds
 
-    for i, row in qc_df.iterrows():
-        is_bad, _ = check_ssc_q_consistency(
-            Q=row["discharge"],
-            SSC=row["ssc_mg_L"],
-            Q_flag=row["Q_flag"],
-            SSC_flag=row["SSC_flag"],
-            ssc_q_bounds=ssc_q_bounds
-        )
-        if is_bad:
-            ssc_q_inconsistent = True
-
-            # 先把 SSC_flag 改为 suspect（仅当原来是 good）
-            if qc_df.at[i, "SSC_flag"] == 0:
-                qc_df.at[i, "SSC_flag"] = np.int8(2)  # suspect
-
-            # 再把不一致性传播到 SSL_flag
-            qc_df.at[i, "SSL_flag"] = propagate_ssc_q_inconsistency_to_ssl(
-                inconsistent=ssc_q_inconsistent,
-                Q=row["discharge"],
-                SSC=row["ssc_mg_L"],
-                SSL=row["sediment_load"],
-                Q_flag=qc_df.at[i, "Q_flag"],
-                SSC_flag=qc_df.at[i, "SSC_flag"],
-                SSL_flag=qc_df.at[i, "SSL_flag"],
-                ssl_is_derived_from_q_ssc=True,
-            )
-
-    return qc_df, ssc_q_bounds
 
 
 def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None):
@@ -278,19 +254,15 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     time_var = dataset.createVariable('time', 'f8', ('time',))
     time_var.standard_name = 'time'
     time_var.long_name = 'time'
-    time_var.units = f'days since {data["datetime"].min().strftime("%Y-%m-%d")} 00:00:00'
+    t0 = pd.to_datetime(data.index).min()
+    time_var.units = f"days since {t0.strftime('%Y-%m-%d')} 00:00:00"
     time_var.calendar = 'gregorian'
     time_var.axis = 'T'
-    
-    # Convert dates to days since epoch
-    ref = pd.to_datetime(data["datetime"].min().date())
 
-    time_var.units = f"days since {ref.strftime('%Y-%m-%d')} 00:00:00"
-    time_var.calendar = "gregorian"
-
-    time_var[:] = (data["datetime"].dt.floor("D") - ref).dt.days.values
-
-
+    # Convert dates to days since epoch (use index only)
+    dt = pd.to_datetime(data.index)          # DatetimeIndex / array
+    ref = dt.min().floor("D")               # Timestamp (00:00:00)
+    time_var[:] = (dt.floor("D") - ref).days.astype(float)
     
     # Create scalar coordinate variables
     lat_var = dataset.createVariable('lat', 'f4')
@@ -531,18 +503,16 @@ def process_fukushima_data():
             )
 
             plot_ssc_q_diagnostic(
-                time=qc_data["datetime"].values,
-                Q=qc_data["discharge"].values,
-                SSC=qc_data["ssc_mg_L"].values,
-                Q_flag=qc_data["Q_flag"].values,
-                SSC_flag=qc_data["SSC_flag"].values,
+                time=qc_data.index.to_numpy(),
+                Q=qc_data["discharge"].to_numpy(),
+                SSC=qc_data["ssc_mg_L"].to_numpy(),       # L 大写
+                Q_flag=qc_data["Q_flag"].to_numpy(),      # 用 tool 输出列名
+                SSC_flag=qc_data["SSC_flag"].to_numpy(),  # 大写 SSC
                 ssc_q_bounds=ssc_q_bounds,
                 station_id=source_id,
                 station_name=station_name,
                 out_png=diag_png,
             )
-
-
         # Create NetCDF file
         output_file = os.path.join(output_dir, f"Fukushima_{safe_name}.nc")
         
