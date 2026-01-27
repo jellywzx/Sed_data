@@ -5,11 +5,20 @@ import re
 import os
 import xarray as xr
 from netCDF4 import Dataset
+from collections import Counter
+import logging
+LOGGER = logging.getLogger(__name__)
+if not LOGGER.handlers:  # 防止在 notebook/重复 import 时重复加 handler
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
 
 FILL_VALUE_FLOAT = np.float32(-9999.0)
 FILL_VALUE_INT = np.int8(9)
 NOT_CHECKED_INT = np.int8(8)
 ESTIMATED_INT = np.int8(1)  # derived/estimated data
+
 
 
 #=====================================
