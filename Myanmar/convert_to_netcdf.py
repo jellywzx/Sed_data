@@ -76,12 +76,7 @@ def calculate_ssl(q, ssc):
     return q * ssc * 0.0864
 
 def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
-    """
-    Apply QC using tool.py end-to-end pipeline WITH step-level provenance flags.
-    Also robust to scalar / mismatched shapes.
-    """
-
-    # --- force 1D & align length (avoid len() of scalar / 0d array) ---
+    # --- force 1D & align length ---
     time = np.atleast_1d(np.asarray(time)).reshape(-1)
     Q    = np.atleast_1d(np.asarray(Q, dtype=float)).reshape(-1)
     SSC  = np.atleast_1d(np.asarray(SSC, dtype=float)).reshape(-1)
@@ -89,10 +84,9 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
 
     n = min(time.size, Q.size, SSC.size, SSL.size)
     if n == 0:
-        return None
+        return None, None
     time, Q, SSC, SSL = time[:n], Q[:n], SSC[:n], SSL[:n]
 
-    # --- tool.py pipeline: QC1/QC2/QC3 + provenance ---
     qc = apply_hydro_qc_with_provenance(
         time=time,
         Q=Q,
@@ -102,13 +96,96 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
         SSC_is_independent=True,
         SSL_is_independent=False,
         ssl_is_derived_from_q_ssc=True,
-        qc2_k=1.5,
-        qc2_min_samples=5,
-        qc3_k=1.5,
-        qc3_min_samples=5,
+        qc2_k=1.5, qc2_min_samples=5,
+        qc3_k=1.5, qc3_min_samples=5,
     )
     if qc is None:
-        return None
+        return None, None
+
+    # ---- valid_time (value-based) ----
+    def _present(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        return (
+            (f != FILL_VALUE_INT)
+            & np.isfinite(v)
+            & (~np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5))
+        )
+
+    present_Q   = _present(qc["Q"],   qc["Q_flag"])
+    present_SSC = _present(qc["SSC"], qc["SSC_flag"])
+    present_SSL = _present(qc["SSL"], qc["SSL_flag"])
+    valid_time = np.atleast_1d(present_Q | present_SSC | present_SSL)
+
+    if not np.any(valid_time):
+        return None, None
+
+    # trim ALL arrays including step flags
+    for k in list(qc.keys()):
+        v = qc[k]
+        if isinstance(v, np.ndarray) and v.shape[0] == valid_time.shape[0]:
+            qc[k] = v[valid_time]
+
+    # ---- qc_report (用于 CSV) ----
+    def _cnt(arr, val):
+        a = np.asarray(arr, dtype=np.int8)
+        return int(np.sum(a == np.int8(val)))
+
+    qc_report = {
+        "station_id": station_id,
+        "station_name": station_name,
+        "QC_n_days": int(len(qc["time"])),
+        # final counts
+        "Q_final_good": _cnt(qc["Q_flag"], 0),
+        "Q_final_estimated": _cnt(qc["Q_flag"], 1),
+        "Q_final_suspect": _cnt(qc["Q_flag"], 2),
+        "Q_final_bad": _cnt(qc["Q_flag"], 3),
+        "Q_final_missing": _cnt(qc["Q_flag"], 9),
+
+        "SSC_final_good": _cnt(qc["SSC_flag"], 0),
+        "SSC_final_estimated": _cnt(qc["SSC_flag"], 1),
+        "SSC_final_suspect": _cnt(qc["SSC_flag"], 2),
+        "SSC_final_bad": _cnt(qc["SSC_flag"], 3),
+        "SSC_final_missing": _cnt(qc["SSC_flag"], 9),
+
+        "SSL_final_good": _cnt(qc["SSL_flag"], 0),
+        "SSL_final_estimated": _cnt(qc["SSL_flag"], 1),
+        "SSL_final_suspect": _cnt(qc["SSL_flag"], 2),
+        "SSL_final_bad": _cnt(qc["SSL_flag"], 3),
+        "SSL_final_missing": _cnt(qc["SSL_flag"], 9),
+    }
+
+    # step counts（存在就加）
+    if "Q_flag_qc1_physical" in qc:
+        qc_report.update({
+            "Q_qc1_pass": _cnt(qc["Q_flag_qc1_physical"], 0),
+            "Q_qc1_bad": _cnt(qc["Q_flag_qc1_physical"], 3),
+            "Q_qc1_missing": _cnt(qc["Q_flag_qc1_physical"], 9),
+        })
+    if "Q_flag_qc2_log_iqr" in qc:
+        qc_report.update({
+            "Q_qc2_pass": _cnt(qc["Q_flag_qc2_log_iqr"], 0),
+            "Q_qc2_suspect": _cnt(qc["Q_flag_qc2_log_iqr"], 2),
+            "Q_qc2_not_checked": _cnt(qc["Q_flag_qc2_log_iqr"], 8),
+            "Q_qc2_missing": _cnt(qc["Q_flag_qc2_log_iqr"], 9),
+        })
+    if "SSC_flag_qc3_ssc_q" in qc:
+        qc_report.update({
+            "SSC_qc3_pass": _cnt(qc["SSC_flag_qc3_ssc_q"], 0),
+            "SSC_qc3_suspect": _cnt(qc["SSC_flag_qc3_ssc_q"], 2),
+            "SSC_qc3_not_checked": _cnt(qc["SSC_flag_qc3_ssc_q"], 8),
+            "SSC_qc3_missing": _cnt(qc["SSC_flag_qc3_ssc_q"], 9),
+        })
+    if "SSL_flag_qc3_from_ssc_q" in qc:
+        qc_report.update({
+            "SSL_qc3_not_propagated": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 0),
+            "SSL_qc3_propagated": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 2),
+            "SSL_qc3_not_checked": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 8),
+            "SSL_qc3_missing": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 9),
+        })
+
+    return qc, qc_report
+
 
     # --- valid-time logic: value-based "present" ---
     def _present(v, f):
@@ -392,7 +469,7 @@ def main():
         merged_df['SSL'] = merged_df.apply(lambda row: calculate_ssl(row['Q'], row['SSC']), axis=1)
 
         # Apply QC
-        qc = apply_tool_qc(
+        qc,qc_report = apply_tool_qc(
             time=merged_df['time'].values,
             Q=merged_df['Q'].values,
             SSC=merged_df['SSC'].values,
@@ -480,13 +557,15 @@ def main():
             'Geographic Coverage': 'Irrawaddy and Salween Rivers, Myanmar',
             'Reference/DOI': 'https://doi.org/10.5285/86f17d61-141f-4500-9aa5-26a82aef0b33'
         }
+        if qc_report is not None:
+            summary.update(qc_report)
         station_summaries.append(summary)
 
     # Generate summary CSV
     if station_summaries:
         csv_station = os.path.join(TARGET_CSV_PATH, "Myanmar_station_summary.csv")
         csv_qc = os.path.join(TARGET_CSV_PATH, "Myanmar_qc_results_summary.csv")
-
+        print("DEBUG keys:", sorted(station_summaries[0].keys()))
         generate_csv_summary_tool(station_summaries, csv_station)
         generate_qc_results_csv_tool(station_summaries, csv_qc)
 
