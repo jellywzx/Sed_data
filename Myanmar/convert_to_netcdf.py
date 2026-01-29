@@ -187,37 +187,6 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
     return qc, qc_report
 
 
-    # --- valid-time logic: value-based "present" ---
-    def _present(v, f):
-        v = np.asarray(v, dtype=float)
-        f = np.asarray(f, dtype=np.int8)
-        return (
-            (f != FILL_VALUE_INT)  # final flag 不是 missing
-            & np.isfinite(v)
-            & (~np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5))
-        )
-
-    present_Q   = _present(qc["Q"],   qc["Q_flag"])
-    present_SSC = _present(qc["SSC"], qc["SSC_flag"])
-    present_SSL = _present(qc["SSL"], qc["SSL_flag"])
-
-    valid_time = np.atleast_1d(present_Q | present_SSC | present_SSL)
-    if not np.any(valid_time):
-        return None
-
-    # trim ALL arrays incl. step flags
-    for k in list(qc.keys()):
-        if isinstance(qc[k], np.ndarray) and qc[k].shape[0] == valid_time.shape[0]:
-            qc[k] = qc[k][valid_time]
-
-    # optional plot (if tool returned bounds; 若 qc 里有 ssc_q_bounds 你也可用)
-    # 这里先保持你原逻辑：只要 plot_dir 不 None，就画 final 的诊断图（可选）
-    # 如果你想严格复用 tool 的 envelope/bounds，可以再加一层判断。
-
-    return qc
-
-
-
 def get_summary_stats(df, var_name):
     """Calculate summary statistics for a variable."""
     flag_name = f"{var_name}_flag"
@@ -318,7 +287,6 @@ def create_netcdf_file(filepath, df, station_meta):
         q_var.standard_name = "river_discharge"
         q_var.units = "m3 s-1"
         q_var.ancillary_variables = "Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr"
-        q_var.ancillary_variables = "Q_flag"
         q_var.comment = "Source: Original data from Baronas et al. (2020)."
         q_var[:] = df['Q'].fillna(fill_value).values
 
@@ -463,7 +431,17 @@ def main():
 
         if merged_df.empty or (merged_df['Q'].isna().all() and merged_df['SSC'].isna().all()):
             warnings.warn(f"No data for station {station_id}. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": 'Irrawaddy' if 'IRR' in station_id else 'Salween' if 'SAL' in station_id else 'Unknown',
+                "longitude": float(station_q_data['Longitude'].mean()) if not station_q_data.empty else np.nan,
+                "latitude": float(station_q_data['Latitude'].mean()) if not station_q_data.empty else np.nan,
+                "status": "skipped",
+                "skip_reason": "no_data_after_merge"
+            })
             continue
+
 
         # Calculate SSL
         merged_df['SSL'] = merged_df.apply(lambda row: calculate_ssl(row['Q'], row['SSC']), axis=1)
@@ -481,10 +459,18 @@ def main():
 
         if qc is None:
             warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": 'Irrawaddy' if 'IRR' in station_id else 'Salween' if 'SAL' in station_id else 'Unknown',
+                "longitude": float(station_q_data['Longitude'].mean()),
+                "latitude": float(station_q_data['Latitude'].mean()),
+                "status": "skipped",
+                "skip_reason": "qc_returned_none"
+            })
             continue
 
         qc_df = pd.DataFrame(qc)
-
 
         # --- MODIFIED LOGIC: NO PADDING ---
         # Filter to only rows that have at least one valid data point
@@ -497,6 +483,15 @@ def main():
 
         if final_df.empty:
             warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": river_name,
+                "longitude": float(lon),
+                "latitude": float(lat),
+                "status": "skipped",
+                "skip_reason": "final_df_empty_after_dropna"
+            })
             continue
         # --- 打印每个站点经过质量控制后的 flag 情况（仅打印，不写入文件） ---
         print(f"  QC flags summary for station: {station_id}")
