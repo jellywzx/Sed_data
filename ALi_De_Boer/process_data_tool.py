@@ -39,6 +39,9 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    qc_flag_counts,
+    generate_station_summary_csv,
+    generate_qc_results_csv,
 )
 
 
@@ -125,17 +128,51 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         qc3_min_samples=5,
     )
 
-    # 如果 time 无效，tool 可能返回 None
+    # -------------------------
+    # Collect QC arrays (final + step flags)
+    # -------------------------
     if qc is None:
-        # 退回到 QC1 结果
-        Q_flag = np.int8(Q_flag_qc1)
-        SSC_flag = np.int8(SSC_flag_qc1)
-        SSL_flag = np.int8(SSL_flag_qc1)
+        # fallback: only QC1 exists (scalar -> 1-length arrays)
+        Q_flag_arr   = np.array([np.int8(Q_flag_qc1)], dtype=np.int8)
+        SSC_flag_arr = np.array([np.int8(SSC_flag_qc1)], dtype=np.int8)
+        SSL_flag_arr = np.array([np.int8(SSL_flag_qc1)], dtype=np.int8)
+
+        qc_step = {
+            "Q_flag_qc1_physical":   Q_flag_arr.copy(),
+            "SSC_flag_qc1_physical": SSC_flag_arr.copy(),
+            "SSL_flag_qc1_physical": SSL_flag_arr.copy(),
+            "Q_flag_qc2_log_iqr":    np.array([np.int8(8)], dtype=np.int8),
+            "SSC_flag_qc2_log_iqr":  np.array([np.int8(8)], dtype=np.int8),
+            "SSL_flag_qc2_log_iqr":  np.array([np.int8(8)], dtype=np.int8),
+            "SSC_flag_qc3_ssc_q":    np.array([np.int8(8)], dtype=np.int8),
+            "SSL_flag_qc3_from_ssc_q": np.array([np.int8(8)], dtype=np.int8),
+        }
+
+        Q_flag   = Q_flag_arr[0]
+        SSC_flag = SSC_flag_arr[0]
+        SSL_flag = SSL_flag_arr[0]
+
     else:
-        # 用 tool 的最终 flag（同样取 [0]）
-        Q_flag = np.int8(qc["Q_flag"][0])
-        SSC_flag = np.int8(qc["SSC_flag"][0])
-        SSL_flag = np.int8(qc["SSL_flag"][0])
+        # tool output is already 1-length arrays after valid_time trim
+        Q_flag_arr   = qc["Q_flag"].astype(np.int8)
+        SSC_flag_arr = qc["SSC_flag"].astype(np.int8)
+        SSL_flag_arr = qc["SSL_flag"].astype(np.int8)
+
+        qc_step = {
+            "Q_flag_qc1_physical":   qc.get("Q_flag_qc1_physical"),
+            "SSC_flag_qc1_physical": qc.get("SSC_flag_qc1_physical"),
+            "SSL_flag_qc1_physical": qc.get("SSL_flag_qc1_physical"),
+            "Q_flag_qc2_log_iqr":    qc.get("Q_flag_qc2_log_iqr"),
+            "SSC_flag_qc2_log_iqr":  qc.get("SSC_flag_qc2_log_iqr"),
+            "SSL_flag_qc2_log_iqr":  qc.get("SSL_flag_qc2_log_iqr"),
+            "SSC_flag_qc3_ssc_q":    qc.get("SSC_flag_qc3_ssc_q"),
+            "SSL_flag_qc3_from_ssc_q": qc.get("SSL_flag_qc3_from_ssc_q"),
+        }
+
+        Q_flag   = Q_flag_arr[0]
+        SSC_flag = SSC_flag_arr[0]
+        SSL_flag = SSL_flag_arr[0]
+
 
     # 4) 保留你原来的 log-IQR outlier 降级逻辑（仍然有效）
     if ssl_log_iqr_outlier and SSL_flag == 0:
@@ -417,83 +454,89 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         'start_year': start_year,
         'end_year': end_year,
         'Q': Q,
-        'Q_flag': Q_flag,
+        'Q_flag': int(Q_flag),
         'SSC': SSC,
-        'SSC_flag': SSC_flag,
+        'SSC_flag': int(SSC_flag),
         'SSL': SSL,
-        'SSL_flag': SSL_flag,
-        'filepath': filepath
+        'SSL_flag': int(SSL_flag),
+        'filepath': filepath,
+
+        # ---- arrays for QC summary ----
+        'QC_n_days': int(len(Q_flag_arr)),
+        'Q_flag_arr': Q_flag_arr,
+        'SSC_flag_arr': SSC_flag_arr,
+        'SSL_flag_arr': SSL_flag_arr,
+
+        # ---- step provenance arrays ----
+        **{k: (v.copy() if v is not None else None) for k, v in qc_step.items()},
     }
 
 
-def generate_station_summary_csv(station_data, output_dir):
-    """Generate a CSV summary file of station metadata and data completeness."""
 
-    csv_file = os.path.join(output_dir, 'ALi_De_Boer_station_summary.csv')
+# def generate_station_summary_csv(station_data, output_dir):
+#     """Generate a CSV summary file of station metadata and data completeness."""
 
-    summary_data = []
-    for data in station_data:
-        # For climatology data, completeness is either 100% (good data) or 0% (not good)
-        Q_complete = 100.0 if data['Q_flag'] == 0 else 0.0
-        SSC_complete = 100.0 if data['SSC_flag'] == 0 else 0.0
-        SSL_complete = 100.0 if data['SSL_flag'] == 0 else 0.0
+#     csv_file = os.path.join(output_dir, 'ALi_De_Boer_station_summary.csv')
 
-        # Date formatting
-        Q_start = str(data['start_year']) if data['start_year'] else "N/A"
-        Q_end = str(data['end_year']) if data['end_year'] else "N/A"
+#     summary_data = []
+#     for data in station_data:
+#         # For climatology data, completeness is either 100% (good data) or 0% (not good)
+#         Q_complete = 100.0 if data['Q_flag'] == 0 else 0.0
+#         SSC_complete = 100.0 if data['SSC_flag'] == 0 else 0.0
+#         SSL_complete = 100.0 if data['SSL_flag'] == 0 else 0.0
 
-        # Temporal span
-        temporal_span = f"{Q_start}-{Q_end}" if Q_start != "N/A" and Q_end != "N/A" else "N/A"
+#         # Date formatting
+#         Q_start = str(data['start_year']) if data['start_year'] else "N/A"
+#         Q_end = str(data['end_year']) if data['end_year'] else "N/A"
 
-        # Variables provided (based on data availability)
-        vars_provided = []
-        if Q_complete > 0:
-            vars_provided.append('Q')
-        if SSC_complete > 0:
-            vars_provided.append('SSC')
-        if SSL_complete > 0:
-            vars_provided.append('SSL')
-        vars_str = ', '.join(vars_provided) if vars_provided else "N/A"
+#         # Temporal span
+#         temporal_span = f"{Q_start}-{Q_end}" if Q_start != "N/A" and Q_end != "N/A" else "N/A"
 
-        summary_data.append({
-            'station_name': data['station_name'],
-            'Source_ID': data['source_id'],
-            'river_name': data['river_name'],
-            'longitude': f"{data['longitude']:.6f}" if not pd.isna(data['longitude']) else "N/A",
-            'latitude': f"{data['latitude']:.6f}" if not pd.isna(data['latitude']) else "N/A",
-            'altitude': f"{data['altitude']:.1f}" if not pd.isna(data['altitude']) else "N/A",
-            'upstream_area': f"{data['upstream_area']:.1f}" if not pd.isna(data['upstream_area']) else "N/A",
-            'Data Source Name': 'ALi_De_Boer Dataset',
-            'Type': 'In-situ',
-            'Temporal Resolution': 'climatology',
-            'Temporal Span': temporal_span,
-            'Variables Provided': vars_str,
-            'Geographic Coverage': 'Upper Indus River Basin, Northern Pakistan',
-            'Reference/DOI': 'https://doi.org/10.1016/j.jhydrol.2006.10.013',
-            'Q_start_date': Q_start,
-            'Q_end_date': Q_end,
-            'Q_percent_complete': f"{Q_complete:.1f}",
-            'SSC_start_date': Q_start,
-            'SSC_end_date': Q_end,
-            'SSC_percent_complete': f"{SSC_complete:.1f}",
-            'SSL_start_date': Q_start,
-            'SSL_end_date': Q_end,
-            'SSL_percent_complete': f"{SSL_complete:.1f}",
-        })
+#         # Variables provided (based on data availability)
+#         vars_provided = []
+#         if Q_complete > 0:
+#             vars_provided.append('Q')
+#         if SSC_complete > 0:
+#             vars_provided.append('SSC')
+#         if SSL_complete > 0:
+#             vars_provided.append('SSL')
+#         vars_str = ', '.join(vars_provided) if vars_provided else "N/A"
 
-    # Create DataFrame and save to CSV
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(csv_file, index=False, encoding='utf-8')
+#         summary_data.append({
+#             'station_name': data['station_name'],
+#             'Source_ID': data['source_id'],
+#             'river_name': data['river_name'],
+#             'longitude': f"{data['longitude']:.6f}" if not pd.isna(data['longitude']) else "N/A",
+#             'latitude': f"{data['latitude']:.6f}" if not pd.isna(data['latitude']) else "N/A",
+#             'altitude': f"{data['altitude']:.1f}" if not pd.isna(data['altitude']) else "N/A",
+#             'upstream_area': f"{data['upstream_area']:.1f}" if not pd.isna(data['upstream_area']) else "N/A",
+#             'Data Source Name': 'ALi_De_Boer Dataset',
+#             'Type': 'In-situ',
+#             'Temporal Resolution': 'climatology',
+#             'Temporal Span': temporal_span,
+#             'Variables Provided': vars_str,
+#             'Geographic Coverage': 'Upper Indus River Basin, Northern Pakistan',
+#             'Reference/DOI': 'https://doi.org/10.1016/j.jhydrol.2006.10.013',
+#             'Q_start_date': Q_start,
+#             'Q_end_date': Q_end,
+#             'Q_percent_complete': f"{Q_complete:.1f}",
+#             'SSC_start_date': Q_start,
+#             'SSC_end_date': Q_end,
+#             'SSC_percent_complete': f"{SSC_complete:.1f}",
+#             'SSL_start_date': Q_start,
+#             'SSL_end_date': Q_end,
+#             'SSL_percent_complete': f"{SSL_complete:.1f}",
+#         })
 
-    print(f"\nCreated station summary CSV: {csv_file}")
+#     # Create DataFrame and save to CSV
+#     summary_df = pd.DataFrame(summary_data)
+#     summary_df.to_csv(csv_file, index=False, encoding='utf-8')
 
-    return csv_file
+#     print(f"\nCreated station summary CSV: {csv_file}")
+
+#     return csv_file
 
 
-def main():
-    """Main conversion function."""
-
-    # Define paths (relative to script location)
 def main():
     """Main conversion function."""
 
@@ -576,9 +619,107 @@ def main():
 
     print()
 
+        # ==========================================================
+    # Build stations_info for tool.generate_qc_results_csv()
+    # ==========================================================
+    stations_info = []
+    for d in station_data:
+        # final counts (arrays are length 1, but keep generic)
+        q_cnt   = qc_flag_counts(d.get("Q_flag_arr"))
+        ssc_cnt = qc_flag_counts(d.get("SSC_flag_arr"))
+        ssl_cnt = qc_flag_counts(d.get("SSL_flag_arr"))
+
+        # step counts
+        q_qc1   = qc_flag_counts(d.get("Q_flag_qc1_physical"))
+        ssc_qc1 = qc_flag_counts(d.get("SSC_flag_qc1_physical"))
+        ssl_qc1 = qc_flag_counts(d.get("SSL_flag_qc1_physical"))
+
+        q_qc2   = qc_flag_counts(d.get("Q_flag_qc2_log_iqr"))
+        ssc_qc2 = qc_flag_counts(d.get("SSC_flag_qc2_log_iqr"))
+        ssl_qc2 = qc_flag_counts(d.get("SSL_flag_qc2_log_iqr"))
+
+        ssc_qc3 = qc_flag_counts(d.get("SSC_flag_qc3_ssc_q"))
+        ssl_qc3 = qc_flag_counts(d.get("SSL_flag_qc3_from_ssc_q"))
+
+        stations_info.append({
+            "station_name": d.get("station_name", ""),
+            "Source_ID": d.get("source_id", ""),
+            "river_name": d.get("river_name", ""),
+            "longitude": d.get("longitude", np.nan),
+            "latitude": d.get("latitude", np.nan),
+            "QC_n_days": int(d.get("QC_n_days", 0)),
+
+            # ---- Final flags counts ----
+            "Q_final_good": q_cnt["pass"],
+            "Q_final_estimated": q_cnt["estimated"],
+            "Q_final_suspect": q_cnt["suspect"],
+            "Q_final_bad": q_cnt["bad"],
+            "Q_final_missing": q_cnt["missing"],
+
+            "SSC_final_good": ssc_cnt["pass"],
+            "SSC_final_estimated": ssc_cnt["estimated"],
+            "SSC_final_suspect": ssc_cnt["suspect"],
+            "SSC_final_bad": ssc_cnt["bad"],
+            "SSC_final_missing": ssc_cnt["missing"],
+
+            "SSL_final_good": ssl_cnt["pass"],
+            "SSL_final_estimated": ssl_cnt["estimated"],
+            "SSL_final_suspect": ssl_cnt["suspect"],
+            "SSL_final_bad": ssl_cnt["bad"],
+            "SSL_final_missing": ssl_cnt["missing"],
+
+            # ---- QC1 step ---- (0=pass,3=bad,9=missing；这里用 qc_flag_counts 的 bad/missing/pass)
+            "Q_qc1_pass": q_qc1["pass"],
+            "Q_qc1_bad": q_qc1["bad"],
+            "Q_qc1_missing": q_qc1["missing"],
+
+            "SSC_qc1_pass": ssc_qc1["pass"],
+            "SSC_qc1_bad": ssc_qc1["bad"],
+            "SSC_qc1_missing": ssc_qc1["missing"],
+
+            "SSL_qc1_pass": ssl_qc1["pass"],
+            "SSL_qc1_bad": ssl_qc1["bad"],
+            "SSL_qc1_missing": ssl_qc1["missing"],
+
+            # ---- QC2 step ---- (0=pass,2=suspect,8=not_checked,9=missing)
+            "Q_qc2_pass": q_qc2["pass"],
+            "Q_qc2_suspect": q_qc2["suspect"],
+            "Q_qc2_not_checked": q_qc2["not_checked"],
+            "Q_qc2_missing": q_qc2["missing"],
+
+            "SSC_qc2_pass": ssc_qc2["pass"],
+            "SSC_qc2_suspect": ssc_qc2["suspect"],
+            "SSC_qc2_not_checked": ssc_qc2["not_checked"],
+            "SSC_qc2_missing": ssc_qc2["missing"],
+
+            "SSL_qc2_pass": ssl_qc2["pass"],
+            "SSL_qc2_suspect": ssl_qc2["suspect"],
+            "SSL_qc2_not_checked": ssl_qc2["not_checked"],
+            "SSL_qc2_missing": ssl_qc2["missing"],
+
+            # ---- QC3 SSC–Q ----
+            "SSC_qc3_pass": ssc_qc3["pass"],
+            "SSC_qc3_suspect": ssc_qc3["suspect"],
+            "SSC_qc3_not_checked": ssc_qc3["not_checked"],
+            "SSC_qc3_missing": ssc_qc3["missing"],
+
+            # ---- QC3 SSL propagation ----
+            # 注意：SSL_qc3_from_ssc_q 的语义：2=propagated,0=not_propagated,8=not_checked,9=missing
+            # qc_flag_counts 的 "suspect" 其实就是统计到 2 的数量 -> 对应 propagated
+            "SSL_qc3_propagated": ssl_qc3["suspect"],
+            "SSL_qc3_not_propagated": ssl_qc3["pass"],
+            "SSL_qc3_not_checked": ssl_qc3["not_checked"],
+            "SSL_qc3_missing": ssl_qc3["missing"],
+        })
+
+
     # Generate station summary CSV
     print("Generating station summary CSV...")
     csv_file = generate_station_summary_csv(station_data, output_dir)
+    qc_csv = os.path.join(output_dir, "ALi_De_Boer_qc_results_summary.csv")
+    generate_qc_results_csv(stations_info, qc_csv)
+    print("QC results CSV:", qc_csv)
+
 
     # Summary statistics
     good_Q = sum(1 for d in station_data if d['Q_flag'] == 0)
