@@ -38,12 +38,15 @@ from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
     apply_quality_flag,
+    apply_quality_flag_array,                
     compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    apply_hydro_qc_with_provenance,           
+    generate_csv_summary as generate_csv_summary_tool,          
+    generate_qc_results_csv as generate_qc_results_csv_tool,
 )
 
 # --- CONFIGURATION ---
@@ -72,114 +75,116 @@ def calculate_ssl(q, ssc):
         return np.nan
     return q * ssc * 0.0864
 
-def apply_tool_qc(
-    time,
-    Q,
-    SSC,
-    SSL,
-    station_id,
-    station_name,
-    plot_dir=None,
-):
-    """
-    Apply QC using tool.py logic:
-    - Physical checks (apply_quality_flag)
-    - log-IQR screening (Q, SSC only)
-    - SSC–Q hydrological consistency
-    """
+def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
+    # --- force 1D & align length ---
+    time = np.atleast_1d(np.asarray(time)).reshape(-1)
+    Q    = np.atleast_1d(np.asarray(Q, dtype=float)).reshape(-1)
+    SSC  = np.atleast_1d(np.asarray(SSC, dtype=float)).reshape(-1)
+    SSL  = np.atleast_1d(np.asarray(SSL, dtype=float)).reshape(-1)
 
-    n = len(time)
+    n = min(time.size, Q.size, SSC.size, SSL.size)
+    if n == 0:
+        return None, None
+    time, Q, SSC, SSL = time[:n], Q[:n], SSC[:n], SSL[:n]
 
-    # -----------------------------
-    # 1. Physical QC
-    # -----------------------------
-    Q_flag = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
-    SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
-    SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
-
-    # -----------------------------
-    # 2. log-IQR screening
-    # -----------------------------
-    q_bounds = compute_log_iqr_bounds(Q)
-    if q_bounds[0] is not None:
-        Q_flag[(Q < q_bounds[0]) | (Q > q_bounds[1])] = 2
-
-    ssc_bounds = compute_log_iqr_bounds(SSC)
-    if ssc_bounds[0] is not None:
-        SSC_flag[(SSC < ssc_bounds[0]) | (SSC > ssc_bounds[1])] = 2
-
-    # -----------------------------
-    # 3. SSC–Q consistency
-    # -----------------------------
-    ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
-
-    if ssc_q_bounds is not None:
-        for i in range(n):
-            inconsistent, _ = check_ssc_q_consistency(
-                Q[i], SSC[i],
-                Q_flag[i], SSC_flag[i],
-                ssc_q_bounds
-            )
-            if inconsistent and SSC_flag[i] == 0:
-                SSC_flag[i] = np.int8(2)  # suspect
-                SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=inconsistent,
-                    Q=Q[i],
-                    SSC=SSC[i],
-                    SSL=SSL[i],
-                    Q_flag=Q_flag[i],
-                    SSC_flag=SSC_flag[i],
-                    SSL_flag=SSL_flag[i],
-                    ssl_is_derived_from_q_ssc=True,
-                )
-
-
-    # -----------------------------
-    # 4. Keep valid times
-    # -----------------------------
-    valid = (
-        (Q_flag != FILL_VALUE_INT)
-        | (SSC_flag != FILL_VALUE_INT)
-        | (SSL_flag != FILL_VALUE_INT)
+    qc = apply_hydro_qc_with_provenance(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=False,
+        ssl_is_derived_from_q_ssc=True,
+        qc2_k=1.5, qc2_min_samples=5,
+        qc3_k=1.5, qc3_min_samples=5,
     )
+    if qc is None:
+        return None, None
 
-    if not np.any(valid):
-        return None
-
-    time = time[valid]
-    Q = Q[valid]
-    SSC = SSC[valid]
-    SSL = SSL[valid]
-    Q_flag = Q_flag[valid]
-    SSC_flag = SSC_flag[valid]
-    SSL_flag = SSL_flag[valid]
-
-    # -----------------------------
-    # 5. Diagnostic plot (optional)
-    # -----------------------------
-    if plot_dir is not None and ssc_q_bounds is not None:
-        os.makedirs(plot_dir, exist_ok=True)
-        plot_ssc_q_diagnostic(
-            time=time,
-            Q=Q,
-            SSC=SSC,
-            Q_flag=Q_flag,
-            SSC_flag=SSC_flag,
-            ssc_q_bounds=ssc_q_bounds,
-            station_id=station_id,
-            station_name=station_name,
-            out_png=os.path.join(plot_dir, f"{station_id}_ssc_q.png"),
+    # ---- valid_time (value-based) ----
+    def _present(v, f):
+        v = np.asarray(v, dtype=float)
+        f = np.asarray(f, dtype=np.int8)
+        return (
+            (f != FILL_VALUE_INT)
+            & np.isfinite(v)
+            & (~np.isclose(v, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5))
         )
 
-    return {
-        "time": time,
-        "Q": Q,
-        "SSC": SSC,
-        "SSL": SSL,
-        "Q_flag": Q_flag,
-        "SSC_flag": SSC_flag,
-        "SSL_flag": SSL_flag,
+    present_Q   = _present(qc["Q"],   qc["Q_flag"])
+    present_SSC = _present(qc["SSC"], qc["SSC_flag"])
+    present_SSL = _present(qc["SSL"], qc["SSL_flag"])
+    valid_time = np.atleast_1d(present_Q | present_SSC | present_SSL)
+
+    if not np.any(valid_time):
+        return None, None
+
+    # trim ALL arrays including step flags
+    for k in list(qc.keys()):
+        v = qc[k]
+        if isinstance(v, np.ndarray) and v.shape[0] == valid_time.shape[0]:
+            qc[k] = v[valid_time]
+
+    # ---- qc_report (用于 CSV) ----
+    def _cnt(arr, val):
+        a = np.asarray(arr, dtype=np.int8)
+        return int(np.sum(a == np.int8(val)))
+
+    qc_report = {
+        "station_id": station_id,
+        "station_name": station_name,
+        "QC_n_days": int(len(qc["time"])),
+        # final counts
+        "Q_final_good": _cnt(qc["Q_flag"], 0),
+        "Q_final_estimated": _cnt(qc["Q_flag"], 1),
+        "Q_final_suspect": _cnt(qc["Q_flag"], 2),
+        "Q_final_bad": _cnt(qc["Q_flag"], 3),
+        "Q_final_missing": _cnt(qc["Q_flag"], 9),
+
+        "SSC_final_good": _cnt(qc["SSC_flag"], 0),
+        "SSC_final_estimated": _cnt(qc["SSC_flag"], 1),
+        "SSC_final_suspect": _cnt(qc["SSC_flag"], 2),
+        "SSC_final_bad": _cnt(qc["SSC_flag"], 3),
+        "SSC_final_missing": _cnt(qc["SSC_flag"], 9),
+
+        "SSL_final_good": _cnt(qc["SSL_flag"], 0),
+        "SSL_final_estimated": _cnt(qc["SSL_flag"], 1),
+        "SSL_final_suspect": _cnt(qc["SSL_flag"], 2),
+        "SSL_final_bad": _cnt(qc["SSL_flag"], 3),
+        "SSL_final_missing": _cnt(qc["SSL_flag"], 9),
     }
+
+    # step counts（存在就加）
+    if "Q_flag_qc1_physical" in qc:
+        qc_report.update({
+            "Q_qc1_pass": _cnt(qc["Q_flag_qc1_physical"], 0),
+            "Q_qc1_bad": _cnt(qc["Q_flag_qc1_physical"], 3),
+            "Q_qc1_missing": _cnt(qc["Q_flag_qc1_physical"], 9),
+        })
+    if "Q_flag_qc2_log_iqr" in qc:
+        qc_report.update({
+            "Q_qc2_pass": _cnt(qc["Q_flag_qc2_log_iqr"], 0),
+            "Q_qc2_suspect": _cnt(qc["Q_flag_qc2_log_iqr"], 2),
+            "Q_qc2_not_checked": _cnt(qc["Q_flag_qc2_log_iqr"], 8),
+            "Q_qc2_missing": _cnt(qc["Q_flag_qc2_log_iqr"], 9),
+        })
+    if "SSC_flag_qc3_ssc_q" in qc:
+        qc_report.update({
+            "SSC_qc3_pass": _cnt(qc["SSC_flag_qc3_ssc_q"], 0),
+            "SSC_qc3_suspect": _cnt(qc["SSC_flag_qc3_ssc_q"], 2),
+            "SSC_qc3_not_checked": _cnt(qc["SSC_flag_qc3_ssc_q"], 8),
+            "SSC_qc3_missing": _cnt(qc["SSC_flag_qc3_ssc_q"], 9),
+        })
+    if "SSL_flag_qc3_from_ssc_q" in qc:
+        qc_report.update({
+            "SSL_qc3_not_propagated": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 0),
+            "SSL_qc3_propagated": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 2),
+            "SSL_qc3_not_checked": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 8),
+            "SSL_qc3_missing": _cnt(qc["SSL_flag_qc3_from_ssc_q"], 9),
+        })
+
+    return qc, qc_report
 
 
 def get_summary_stats(df, var_name):
@@ -281,8 +286,7 @@ def create_netcdf_file(filepath, df, station_meta):
         q_var.long_name = "River Discharge"
         q_var.standard_name = "river_discharge"
         q_var.units = "m3 s-1"
-        q_var.coordinates = "lat lon altitude"
-        q_var.ancillary_variables = "Q_flag"
+        q_var.ancillary_variables = "Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr"
         q_var.comment = "Source: Original data from Baronas et al. (2020)."
         q_var[:] = df['Q'].fillna(fill_value).values
 
@@ -292,7 +296,7 @@ def create_netcdf_file(filepath, df, station_meta):
         ssc_var.standard_name = "mass_concentration_of_suspended_matter_in_water_body"
         ssc_var.units = "mg L-1"
         ssc_var.coordinates = "lat lon altitude"
-        ssc_var.ancillary_variables = "SSC_flag"
+        ssc_var.ancillary_variables = "SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q"
         ssc_var.comment = "Source: Original data from Baronas et al. (2020)."
         ssc_var[:] = df['SSC'].fillna(fill_value).values
 
@@ -301,9 +305,66 @@ def create_netcdf_file(filepath, df, station_meta):
         ssl_var.long_name = "Suspended Sediment Load"
         ssl_var.units = "ton day-1"
         ssl_var.coordinates = "lat lon altitude"
-        ssl_var.ancillary_variables = "SSL_flag"
+        ssl_var.ancillary_variables = "SSL_flag SSL_flag_qc1_physical SSL_flag_qc3_from_ssc_q"
         ssl_var.comment = "Source: Calculated. Formula: SSL = Q * SSC * 0.0864."
         ssl_var[:] = df['SSL'].fillna(fill_value).values
+        # === STEP/PROVENANCE FLAG VARIABLES ===
+        def _add_step_flag(ds, name, values, *, flag_values, flag_meanings, long_name):
+            v = ds.createVariable(name, 'b', ('time',), fill_value=flag_fill_value)
+            v.long_name = long_name
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(flag_values, dtype='b')
+            v.flag_meanings = flag_meanings
+            v.missing_value = np.int8(9)
+            v[:] = np.asarray(values, dtype=np.int8)
+            return v
+
+        # QC1 physical: 0 pass, 3 bad, 9 missing
+        if "Q_flag_qc1_physical" in df.columns:
+            _add_step_flag(ds, "Q_flag_qc1_physical", df["Q_flag_qc1_physical"].fillna(9).values,
+                          flag_values=[0, 3, 9],
+                          flag_meanings="pass bad missing",
+                          long_name="QC1 physical flag for river discharge")
+
+        if "SSC_flag_qc1_physical" in df.columns:
+            _add_step_flag(ds, "SSC_flag_qc1_physical", df["SSC_flag_qc1_physical"].fillna(9).values,
+                          flag_values=[0, 3, 9],
+                          flag_meanings="pass bad missing",
+                          long_name="QC1 physical flag for suspended sediment concentration")
+
+        if "SSL_flag_qc1_physical" in df.columns:
+            _add_step_flag(ds, "SSL_flag_qc1_physical", df["SSL_flag_qc1_physical"].fillna(9).values,
+                          flag_values=[0, 3, 9],
+                          flag_meanings="pass bad missing",
+                          long_name="QC1 physical flag for suspended sediment load")
+
+        # QC2 log-IQR: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        if "Q_flag_qc2_log_iqr" in df.columns:
+            _add_step_flag(ds, "Q_flag_qc2_log_iqr", df["Q_flag_qc2_log_iqr"].fillna(9).values,
+                          flag_values=[0, 2, 8, 9],
+                          flag_meanings="pass suspect not_checked missing",
+                          long_name="QC2 log-IQR flag for river discharge")
+
+        if "SSC_flag_qc2_log_iqr" in df.columns:
+            _add_step_flag(ds, "SSC_flag_qc2_log_iqr", df["SSC_flag_qc2_log_iqr"].fillna(9).values,
+                          flag_values=[0, 2, 8, 9],
+                          flag_meanings="pass suspect not_checked missing",
+                          long_name="QC2 log-IQR flag for suspended sediment concentration")
+
+        # QC3 SSC–Q (for SSC): 0 pass, 2 suspect, 8 not_checked, 9 missing
+        if "SSC_flag_qc3_ssc_q" in df.columns:
+            _add_step_flag(ds, "SSC_flag_qc3_ssc_q", df["SSC_flag_qc3_ssc_q"].fillna(9).values,
+                          flag_values=[0, 2, 8, 9],
+                          flag_meanings="pass suspect not_checked missing",
+                          long_name="QC3 SSC–Q consistency flag for SSC")
+
+        # QC3 propagation to SSL: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+        if "SSL_flag_qc3_from_ssc_q" in df.columns:
+            _add_step_flag(ds, "SSL_flag_qc3_from_ssc_q", df["SSL_flag_qc3_from_ssc_q"].fillna(9).values,
+                          flag_values=[0, 2, 8, 9],
+                          flag_meanings="not_propagated propagated not_checked missing",
+                          long_name="QC3 propagated flag to SSL from SSC–Q inconsistency")
+
 
         # === FLAG VARIABLES ===
         # Q_flag
@@ -370,13 +431,23 @@ def main():
 
         if merged_df.empty or (merged_df['Q'].isna().all() and merged_df['SSC'].isna().all()):
             warnings.warn(f"No data for station {station_id}. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": 'Irrawaddy' if 'IRR' in station_id else 'Salween' if 'SAL' in station_id else 'Unknown',
+                "longitude": float(station_q_data['Longitude'].mean()) if not station_q_data.empty else np.nan,
+                "latitude": float(station_q_data['Latitude'].mean()) if not station_q_data.empty else np.nan,
+                "status": "skipped",
+                "skip_reason": "no_data_after_merge"
+            })
             continue
+
 
         # Calculate SSL
         merged_df['SSL'] = merged_df.apply(lambda row: calculate_ssl(row['Q'], row['SSC']), axis=1)
 
         # Apply QC
-        qc = apply_tool_qc(
+        qc,qc_report = apply_tool_qc(
             time=merged_df['time'].values,
             Q=merged_df['Q'].values,
             SSC=merged_df['SSC'].values,
@@ -388,18 +459,39 @@ def main():
 
         if qc is None:
             warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": 'Irrawaddy' if 'IRR' in station_id else 'Salween' if 'SAL' in station_id else 'Unknown',
+                "longitude": float(station_q_data['Longitude'].mean()),
+                "latitude": float(station_q_data['Latitude'].mean()),
+                "status": "skipped",
+                "skip_reason": "qc_returned_none"
+            })
             continue
 
         qc_df = pd.DataFrame(qc)
-
 
         # --- MODIFIED LOGIC: NO PADDING ---
         # Filter to only rows that have at least one valid data point
         final_df = qc_df.dropna(subset=['Q', 'SSC', 'SSL'], how='all').copy()
         final_df.sort_values(by='time', inplace=True)
+        # also pad step/provenance flags (NaN -> 9)
+        for col in final_df.columns:
+            if col.endswith("_flag") or ("flag_qc" in col):
+                final_df[col] = final_df[col].fillna(9).astype(np.int8)
 
         if final_df.empty:
             warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
+            station_summaries.append({
+                "Source_ID": station_id,
+                "station_name": station_id.replace('_', ' '),
+                "river_name": river_name,
+                "longitude": float(lon),
+                "latitude": float(lat),
+                "status": "skipped",
+                "skip_reason": "final_df_empty_after_dropna"
+            })
             continue
         # --- 打印每个站点经过质量控制后的 flag 情况（仅打印，不写入文件） ---
         print(f"  QC flags summary for station: {station_id}")
@@ -460,17 +552,21 @@ def main():
             'Geographic Coverage': 'Irrawaddy and Salween Rivers, Myanmar',
             'Reference/DOI': 'https://doi.org/10.5285/86f17d61-141f-4500-9aa5-26a82aef0b33'
         }
+        if qc_report is not None:
+            summary.update(qc_report)
         station_summaries.append(summary)
 
     # Generate summary CSV
     if station_summaries:
-        summary_df = pd.DataFrame(station_summaries)
-        csv_filename = "Myanmar_station_summary.csv"
-        csv_filepath = os.path.join(TARGET_CSV_PATH, csv_filename)
-        summary_df.to_csv(csv_filepath, index=False)
-        print(f"\nSuccessfully created summary file: {csv_filepath}")
+        csv_station = os.path.join(TARGET_CSV_PATH, "Myanmar_station_summary.csv")
+        csv_qc = os.path.join(TARGET_CSV_PATH, "Myanmar_qc_results_summary.csv")
+        print("DEBUG keys:", sorted(station_summaries[0].keys()))
+        generate_csv_summary_tool(station_summaries, csv_station)
+        generate_qc_results_csv_tool(station_summaries, csv_qc)
 
-    print("\nProcessing complete.")
+        print(f"\n✓ Generated CSV summary: {csv_station}")
+        print(f"✓ Generated QC results : {csv_qc}")
+
 
 if __name__ == "__main__":
     main()

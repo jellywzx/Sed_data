@@ -4,6 +4,7 @@ import numpy as np
 import xarray as xr
 import json
 import os
+import inspect
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -29,126 +30,217 @@ from tool import (
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
     propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,
+    apply_hydro_qc_with_provenance,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+
 )
 
 def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
     """
-    Unified QC for Shashi–Jianli using tool.py
-
-    Includes:
-    - Physical validity (apply_quality_flag)
-    - log-IQR outlier detection
-    - SSC–Q consistency
-    - Optional SSC–Q diagnostic plot
+    Unified QC using apply_hydro_qc_with_provenance (tool pipeline).
     """
-
     out = df.copy()
 
-    # ======================================================
-    # 1. Physical QC
-    # ======================================================
-    out['Q_flag'] = np.array(
-        [apply_quality_flag(v, "Q") for v in out['Q'].values],
-        dtype=np.int8
+    # ---- time / Q / SSC: 强制 1D(time)
+    # 这里优先用 Date 列作为 time；如果你后面改成 index=time，也能兼容
+    if "Date" in out.columns:
+        time = np.atleast_1d(pd.to_datetime(out["Date"]).values).reshape(-1)
+    else:
+        time = np.atleast_1d(out.index.values).reshape(-1)
+
+    Q = np.atleast_1d(out["Q"].values).reshape(-1)
+    SSC = np.atleast_1d(out["SSC"].values).reshape(-1)
+
+    #SL：派生量（由 Q 和 SSC 计算得到）
+    SSL = Q * SSC * 0.0864
+
+    #进 QC 管线
+    qc_kwargs = dict(
+        time=time,
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=False,
+        ssl_is_derived_from_q_ssc=True,
+        diagnostic_dir=str(diagnostic_dir) if diagnostic_dir is not None else None,
+
+        # 这些参数 tool.py 可能不收；先放进来，后面会自动过滤掉
+        station_id=station_id,
+        station_name=station_id,
     )
-    out['SSC_flag'] = np.array(
-        [apply_quality_flag(v, "SSC") for v in out['SSC'].values],
-        dtype=np.int8
-    )
 
-    # Bad data → NaN
-    out.loc[out['Q_flag'] == 3, 'Q'] = np.nan
-    out.loc[out['SSC_flag'] == 3, 'SSC'] = np.nan
+    sig = inspect.signature(apply_hydro_qc_with_provenance)
+    qc_kwargs = {k: v for k, v in qc_kwargs.items() if k in sig.parameters}
 
-    # ======================================================
-    # 2. log-IQR screening
-    # ======================================================
-    for var in ['Q', 'SSC']:
-        values = out[var].values
-        lower, upper = compute_log_iqr_bounds(values)
-        if lower is not None:
-            out.loc[(values < lower) | (values > upper), f'{var}_flag'] = 2
+    res = apply_hydro_qc_with_provenance(**qc_kwargs)
 
 
-    out['SSL'] = out['Q'] * out['SSC'] * 0.0864
-    out['SSL_flag'] = np.array(
-        [apply_quality_flag(v, "SSL") for v in out['SSL'].values],
-        dtype=np.int8
-    )
-    out.loc[out['SSL_flag'] == 3, 'SSL'] = np.nan
+    # ---- 兼容两种返回：res = (qc, prov) 或 res = qc
+    if isinstance(res, tuple) and len(res) == 2:
+        qc, prov = res
+    else:
+        qc, prov = res, None
 
+    # ---- 从 qc 中取回最终值与最终 flag（按 dict/object 两种都兼容）
+    def _get(obj, key, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
 
-    # ======================================================
-    # 3. SSC–Q consistency
-    # ======================================================
-    envelope = build_ssc_q_envelope(out['Q'].values, out['SSC'].values)
+    out["Q"] = _get(qc, "Q", out["Q"].values)
+    out["SSC"] = _get(qc, "SSC", out["SSC"].values)
+    out["SSL"] = _get(qc, "SSL", SSL)
 
-    if envelope is not None:
-        for i in range(len(out)):
-            inconsistent, _ = check_ssc_q_consistency(
-                out['Q'].iloc[i],
-                out['SSC'].iloc[i],
-                out['Q_flag'].iloc[i],
-                out['SSC_flag'].iloc[i],
-                envelope
-            )
-            if inconsistent:
-                sscf = int(out['SSC_flag'].iloc[i])
-                if sscf == 0:
-                    sscf = np.int8(2)
+    out["Q_flag"] = _get(qc, "Q_flag", out.get("Q_flag", np.full_like(Q, FILL_VALUE_INT, dtype=np.int8)))
+    out["SSC_flag"] = _get(qc, "SSC_flag", out.get("SSC_flag", np.full_like(SSC, FILL_VALUE_INT, dtype=np.int8)))
+    out["SSL_flag"] = _get(qc, "SSL_flag", out.get("SSL_flag", np.full_like(SSL, FILL_VALUE_INT, dtype=np.int8)))
 
-                qv = out['Q'].iloc[i]
-                sscv = out['SSC'].iloc[i]
-                sslv = out['SSL'].iloc[i]
-
-                qf = int(out['Q_flag'].iloc[i])
-                sslf = int(out['SSL_flag'].iloc[i])
-
-                sslf = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=inconsistent,
-                    Q=qv,
-                    SSC=sscv,
-                    SSL=sslv,
-                    Q_flag=qf,
-                    SSC_flag=sscf,
-                    SSL_flag=sslf,
-                    ssl_is_derived_from_q_ssc=True,
-                )
-
-                out.loc[out.index[i], 'SSC_flag'] = sscf
-                out.loc[out.index[i], 'SSL_flag'] = np.int8(sslf)
-
-
-        # --------------------------------------------------
-        # 4. Diagnostic plot
-        # --------------------------------------------------
-        if diagnostic_dir is not None:
-            diagnostic_dir.mkdir(parents=True, exist_ok=True)
-            fig_path = diagnostic_dir / f"SSC_Q_{station_id}.png"
-
-            plot_ssc_q_diagnostic(
-                time=out.index.values,
-                Q=out['Q'].values,
-                SSC=out['SSC'].values,
-                Q_flag=out['Q_flag'].values,
-                SSC_flag=out['SSC_flag'].values,
-                ssc_q_bounds=envelope,
-                station_id=station_id,
-                station_name=station_id,
-                out_png=str(fig_path)
-            )
-
-    # ======================================================
-    # 5. SSL & SSL_flag
-    # ======================================================
-    out['SSL'] = out['Q'] * out['SSC'] * 0.0864
-    out['SSL_flag'] = np.array(
-        [apply_quality_flag(v, "SSL") for v in out['SSL'].values],
-        dtype=np.int8
-    )
-    out.loc[out['SSL_flag'] == 3, 'SSL'] = np.nan
+    # ---- provenance（分步 flags）如果有，就全部塞回 dataframe
+    if isinstance(prov, dict):
+        for k, v in prov.items():
+            out[k] = np.atleast_1d(v).reshape(-1)
 
     return out
+
+def _count_flags(flag_arr, fill_value=-127):
+    """Return counts for (good, estimated, suspect, bad, missing) using 0/1/2/3/fill_value."""
+    a = np.asarray(flag_arr)
+    return {
+        "good": int(np.sum(a == 0)),
+        "estimated": int(np.sum(a == 1)),
+        "suspect": int(np.sum(a == 2)),
+        "bad": int(np.sum(a == 3)),
+        "missing": int(np.sum(a == fill_value)),
+    }
+
+def _count_step(step_arr, fill_value=-127):
+    """
+    Generic step flag counts (pass/bad/missing) or (pass/suspect/not_checked/missing)
+    We'll count by values: 0=pass, 1=not_checked, 2=suspect, 3=bad, fill=missing.
+    """
+    a = np.asarray(step_arr)
+    return {
+        "pass": int(np.sum(a == 0)),
+        "not_checked": int(np.sum(a == 1)),
+        "suspect": int(np.sum(a == 2)),
+        "bad": int(np.sum(a == 3)),
+        "missing": int(np.sum(a == fill_value)),
+    }
+
+def _pick_step_col(df_station, prefix):
+    """Pick the first provenance column that starts with prefix, e.g., 'Q_qc1'."""
+    cols = [c for c in df_station.columns if str(c).startswith(prefix)]
+    return cols[0] if len(cols) > 0 else None
+
+def build_qc_results_summary_row(df_station, station_info, station_id, lon, lat, fill_value=-127):
+    """
+    Build ONE row for qc_results_summary.csv with the columns you specified.
+    Assumptions:
+      - final flags are Q_flag / SSC_flag / SSL_flag with 0/1/2/3/fill
+      - step flags exist as columns starting with:
+          Q_qc1..., SSC_qc1..., SSL_qc1...
+          Q_qc2..., SSC_qc2..., SSL_qc2...
+          SSC_qc3..., SSL_qc3...
+        If not found, those counts will be 0.
+    """
+    n_days = int(len(df_station))
+
+    # ---- final flags
+    qf = _count_flags(df_station["Q_flag"].values, fill_value)
+    sf = _count_flags(df_station["SSC_flag"].values, fill_value)
+    lf = _count_flags(df_station["SSL_flag"].values, fill_value)
+
+    row = {
+        "station_name": station_info["name"],
+        "Source_ID": station_id,
+        "river_name": station_info["river_name"],
+        "longitude": float(lon),
+        "latitude": float(lat),
+        "QC_n_days": n_days,
+
+        "Q_final_good": qf["good"],
+        "Q_final_estimated": qf["estimated"],
+        "Q_final_suspect": qf["suspect"],
+        "Q_final_bad": qf["bad"],
+        "Q_final_missing": qf["missing"],
+
+        "SSC_final_good": sf["good"],
+        "SSC_final_estimated": sf["estimated"],
+        "SSC_final_suspect": sf["suspect"],
+        "SSC_final_bad": sf["bad"],
+        "SSC_final_missing": sf["missing"],
+
+        "SSL_final_good": lf["good"],
+        "SSL_final_estimated": lf["estimated"],
+        "SSL_final_suspect": lf["suspect"],
+        "SSL_final_bad": lf["bad"],
+        "SSL_final_missing": lf["missing"],
+    }
+
+    # ---- qc1
+    for v in ["Q", "SSC", "SSL"]:
+        col = _pick_step_col(df_station, f"{v}_qc1")
+        if col is None:
+            row[f"{v}_qc1_pass"] = 0
+            row[f"{v}_qc1_bad"] = 0
+            row[f"{v}_qc1_missing"] = 0
+        else:
+            c = _count_step(df_station[col].values, fill_value)
+            row[f"{v}_qc1_pass"] = c["pass"]
+            row[f"{v}_qc1_bad"] = c["bad"]
+            row[f"{v}_qc1_missing"] = c["missing"]
+
+    # ---- qc2
+    for v in ["Q", "SSC", "SSL"]:
+        col = _pick_step_col(df_station, f"{v}_qc2")
+        if col is None:
+            row[f"{v}_qc2_pass"] = 0
+            row[f"{v}_qc2_suspect"] = 0
+            row[f"{v}_qc2_not_checked"] = 0
+            row[f"{v}_qc2_missing"] = 0
+        else:
+            c = _count_step(df_station[col].values, fill_value)
+            row[f"{v}_qc2_pass"] = c["pass"]
+            row[f"{v}_qc2_suspect"] = c["suspect"]
+            row[f"{v}_qc2_not_checked"] = c["not_checked"]
+            row[f"{v}_qc2_missing"] = c["missing"]
+
+    # ---- qc3 (SSC)
+    col = _pick_step_col(df_station, "SSC_qc3")
+    if col is None:
+        row["SSC_qc3_pass"] = 0
+        row["SSC_qc3_suspect"] = 0
+        row["SSC_qc3_not_checked"] = 0
+        row["SSC_qc3_missing"] = 0
+    else:
+        c = _count_step(df_station[col].values, fill_value)
+        row["SSC_qc3_pass"] = c["pass"]
+        row["SSC_qc3_suspect"] = c["suspect"]
+        row["SSC_qc3_not_checked"] = c["not_checked"]
+        row["SSC_qc3_missing"] = c["missing"]
+
+    # ---- qc3 (SSL propagation style)
+    col = _pick_step_col(df_station, "SSL_qc3")
+    if col is None:
+        row["SSL_qc3_not_propagated"] = 0
+        row["SSL_qc3_propagated"] = 0
+        row["SSL_qc3_not_checked"] = 0
+        row["SSL_qc3_missing"] = 0
+    else:
+        c = _count_step(df_station[col].values, fill_value)
+        # 约定：0=not_propagated/pass, 2=propagated/suspect, 1=not_checked
+        row["SSL_qc3_not_propagated"] = c["pass"]
+        row["SSL_qc3_propagated"] = c["suspect"]
+        row["SSL_qc3_not_checked"] = c["not_checked"]
+        row["SSL_qc3_missing"] = c["missing"]
+
+    return row
 
 
 def process_shashi_jianli():
@@ -171,6 +263,7 @@ def process_shashi_jianli():
     }
 
     summary_data = []
+    qc_results_summary_rows = []
 
     for station_id, station_info in stations.items():
         print(f"\n{'='*80}")
@@ -203,18 +296,6 @@ def process_shashi_jianli():
             station_id=station_id,
             diagnostic_dir=output_dir / "diagnostic"
         )
-
-        # --------------------------------------------------
-        # SSL is a derived variable → calculated AFTER QC
-        # --------------------------------------------------
-        df_station['SSL'] = df_station['Q'] * df_station['SSC'] * 0.0864
-
-        # SSL flag: derived from inputs
-        df_station['SSL_flag'] = np.where(
-            df_station['SSL'].isna(),
-            FILL_VALUE_INT,
-            0
-        ).astype(np.int8)
 
         # Print QC results
         n_total = len(df_station)
@@ -275,6 +356,16 @@ def process_shashi_jianli():
         df_station = df_station.reindex(date_index)
         df_station.index.name = 'time'
 
+        # ---- QC results summary row (per station)
+        row = build_qc_results_summary_row(
+            df_station=df_station,
+            station_info=station_info,
+            station_id=station_id,
+            lon=coords[station_id]["lon"],
+            lat=coords[station_id]["lat"],
+            fill_value=FILL_VALUE_INT,
+        )
+        qc_results_summary_rows.append(row)
 
         # Create xarray Dataset
         ds = xr.Dataset()
@@ -339,6 +430,26 @@ def process_shashi_jianli():
         output_file = output_dir / f'Shashi_Jianli_{station_id}.nc'
         ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': f'days since {start_date.year}-01-01'}})
         print(f"\n  ✓ NetCDF file created: {output_file}")
+        # QC results CSV (append per station)
+        qc_csv = output_dir / "Shashi_Jianli_qc_results.csv"
+
+        try:
+            generate_qc_results_csv_tool(
+                station_id=station_id,
+                time=df_station.index.values if "time" in df_station.index.name else df_station["Date"].values,
+                Q=df_station["Q"].values,
+                SSC=df_station["SSC"].values,
+                SSL=df_station["SSL"].values,
+                Q_flag=df_station["Q_flag"].values,
+                SSC_flag=df_station["SSC_flag"].values,
+                SSL_flag=df_station["SSL_flag"].values,
+                out_csv=str(qc_csv),
+                mode="append",
+            )
+        except Exception:
+            # 兜底：不影响主流程（你也可以在这里 print 一句提示）
+            pass
+
 
         # Summary data for CSV
         for var in ['Q', 'SSC', 'SSL']:
@@ -362,8 +473,16 @@ def process_shashi_jianli():
                 })
 
     # Create and save summary CSV
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(output_dir / 'Shashi_Jianli_station_summary.csv', index=False)
+    summary_csv = output_dir / 'Shashi_Jianli_station_summary.csv'
+    qc_sum_csv = output_dir / "qc_results_summary.csv"
+    pd.DataFrame(qc_results_summary_rows).to_csv(qc_sum_csv, index=False)
+    print(f"\n✓ QC results summary saved: {qc_sum_csv}")
+
+    try:
+        generate_csv_summary_tool(summary_data, out_csv=str(summary_csv))
+    except Exception:
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_csv(summary_csv, index=False)
     
     print("\n" + "="*80)
     print("Processing complete.")

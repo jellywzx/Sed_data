@@ -32,13 +32,14 @@ from tool import (
     calculate_ssl_from_mt_yr,
     calculate_ssc,
     compute_log_iqr_bounds,
-    apply_quality_flag,
     generate_station_summary_csv,
     build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    summarize_warning_types as summarize_warning_types_tool,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+    generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
 
@@ -145,6 +146,42 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         f"[QC] {source_id} QC1-array: Q={Q_flag_qc1}, SSC={SSC_flag_qc1}, SSL={SSL_flag_qc1} | "
         f"Final: Q={int(Q_flag)}, SSC={int(SSC_flag)}, SSL={int(SSL_flag)}"
     )
+    
+    # --------------------------
+    # Build warnings for summary tools
+    # --------------------------
+    warnings = []
+
+    # 1) QC fallback
+    if qc is None:
+        warnings.append("QC: invalid time -> fallback to QC1 flags")
+
+    # 2) SSL log-IQR outlier screening
+    if ssl_log_iqr_outlier:
+        warnings.append("SSL: log-IQR outlier (source Mt/yr)")
+
+    # 3) Flag-based warnings
+    def _flag_warn(var, flag):
+        # 0 good, 1 estimated, 2 suspect, 3 bad, 9 missing
+        if flag == 1:
+            return f"{var}: estimated (flag=1)"
+        if flag == 2:
+            return f"{var}: suspect (flag=2)"
+        if flag == 3:
+            return f"{var}: bad (flag=3)"
+        if flag == 9:
+            return f"{var}: missing (flag=9)"
+        return None
+
+    for var, flag in [("Q", int(Q_flag)), ("SSC", int(SSC_flag)), ("SSL", int(SSL_flag))]:
+        w = _flag_warn(var, flag)
+        if w:
+            warnings.append(w)
+
+    # 给工具函数用的两个字段
+    n_warnings = len(warnings)
+    warnings_str = "; ".join(warnings[:20])  # 也可以不截断
+
     # Downgrade SSL flag if statistically anomalous (log-IQR)
     if ssl_log_iqr_outlier and SSL_flag == 0:
         SSL_flag = np.int8(2)  # suspect
@@ -422,7 +459,9 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         'SSC_flag': SSC_flag,
         'SSL': SSL,
         'SSL_flag': SSL_flag,
-        'filepath': filepath
+        'filepath': filepath,
+        "warnings": warnings_str,
+        "n_warnings": n_warnings
     }
 
 
@@ -493,17 +532,8 @@ def generate_station_summary_csv(station_data, output_dir):
 def main():
     """Main conversion function."""
 
-    # Define paths (relative to script location)
-def main():
-    """Main conversion function."""
-
-    # 当前脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # 项目根目录：从 Script/Ali_De_Boer 往上两级 -> sediment_wzx_1111
     project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-
-    # Source 和 Output_r 都在项目根目录下
     source_dir = os.path.join(project_root, "Source", "ALi_De_Boer")
     output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "ALi_De_Boer", "qc")
 
@@ -584,6 +614,30 @@ def main():
     good_Q = sum(1 for d in station_data if d['Q_flag'] == 0)
     good_SSC = sum(1 for d in station_data if d['SSC_flag'] == 0)
     good_SSL = sum(1 for d in station_data if d['SSL_flag'] == 0)
+
+    # ------------------------------------------------------------
+    # Extra standardized QC outputs (same as HYDAT example tools)
+    # ------------------------------------------------------------
+    stations_info = station_data  
+
+    # 1) print warning types summary (returns whatever tool defines)
+    warning_summary = summarize_warning_types_tool(stations_info)
+    print("\n[WARN] summary by type:")
+    print(warning_summary)
+
+    # 2) CSVs
+    csv_summary_path = os.path.join(output_dir, "csv_summary_tool.csv")
+    qc_results_path = os.path.join(output_dir, "qc_results_tool.csv")
+    warning_summary_path = os.path.join(output_dir, "warning_summary_tool.csv")
+
+    generate_csv_summary_tool(stations_info, csv_summary_path)
+    generate_qc_results_csv_tool(stations_info, qc_results_path)
+    generate_warning_summary_csv_tool(stations_info, warning_summary_path)
+
+    print("\n[CSV] Tool summaries written:")
+    print("  -", csv_summary_path)
+    print("  -", qc_results_path)
+    print("  -", warning_summary_path)
 
     print()
     print("=" * 80)
