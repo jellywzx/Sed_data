@@ -583,7 +583,7 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     dt_index = pd.to_datetime(data.index)
     time_start = dt_index.min().strftime('%Y-%m-%d')
     time_end = dt_index.max().strftime('%Y-%m-%d')
-
+    
     
     dataset.summary = f'River discharge and suspended sediment data for {station_name} station on the {river_name} in Fukushima, Japan. This dataset contains daily averages of water discharge, suspended sediment concentration, and calculated sediment load over the period {time_start} to {time_end}. Data has been quality checked and flagged.'
     
