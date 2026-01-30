@@ -43,6 +43,10 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    # summarize_warning_types as summarize_warning_types_tool,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+    # generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
 
 def fmt_float(x, nd=2):
@@ -213,28 +217,75 @@ def process_station(input_file, output_dir):
             SSL=ssl_data,
             Q_is_independent=True, # discharge is independent variable
             SSC_is_independent=True, # ssc is independent variable
-            SSL_is_independent=True, # ssl is independent variable
-            ssl_is_derived_from_q_ssc=False,
+            SSL_is_independent=False, # ssl is independent variable
+            ssl_is_derived_from_q_ssc=True,
             qc2_k=1.5, 
             qc2_min_samples=5,
             qc3_k=1.5, 
             qc3_min_samples=5,
         )
+
         print("[DBG] qc is None?", qc is None)   # <- 加在 if qc is None 之前
         if qc is None:
             return None
-
 
         # 把最终结果写回 flags 数组（后面统计/写文件都靠它）
         q_flags   = qc["Q_flag"]
         ssc_flags = qc["SSC_flag"]
         ssl_flags = qc["SSL_flag"]
+        # -----------------------------
+        # Step-level provenance flags (if present in qc dict)
+        # -----------------------------
+        Q_qc1  = qc.get("Q_flag_qc1_physical")
+        SSC_qc1 = qc.get("SSC_flag_qc1_physical")
+        SSL_qc1 = qc.get("SSL_flag_qc1_physical")
+
+        Q_qc2  = qc.get("Q_flag_qc2_log_iqr")
+        SSC_qc2 = qc.get("SSC_flag_qc2_log_iqr")
+        SSL_qc2 = qc.get("SSL_flag_qc2_log_iqr")
+
+        # QC3: SSC–Q consistency step & SSL propagation step（key 名以 tool.py 实际为准）
+        SSC_qc3 = qc.get("SSC_flag_qc3_ssc_q_consistency") or qc.get("SSC_flag_qc3_ssc_q")
+        SSL_qc3 = qc.get("SSL_flag_qc3_propagation") or qc.get("SSL_flag_qc3_ssl_propagation")
 
         print(
             f"[QC] {station_id} QC1(good cnt): "
             f"Q={(Q_flag_qc1==0).sum()}, SSC={(SSC_flag_qc1==0).sum()}, SSL={(SSL_flag_qc1==0).sum()} | "
             f"Final(good cnt): Q={(q_flags==0).sum()}, SSC={(ssc_flags==0).sum()}, SSL={(ssl_flags==0).sum()}"
         )
+
+        # ------------------------------------------------------------
+        # Build station-level warnings for summary tools
+        # ------------------------------------------------------------
+        warnings = []
+
+        n_samples = len(q_data)
+        if n_samples < 5:
+            warnings.append("Sample size < 5: some statistical QC / SSC-Q checks may be skipped or unreliable")
+
+        # 如果你希望把“是否产生诊断图失败”也算 warning：
+        # 你现在 plot 的 except 只 print，不记录；改成同时 append
+        # （见下方“plot except 小改动”）
+
+        def _flag_warn(var, flags):
+            flags = np.asarray(flags)
+            # 统计站点级别的“坏/缺测”数量，作为警告摘要
+            n_bad = int((flags == 3).sum())
+            n_missing = int((flags == 9).sum())
+            n_suspect = int((flags == 2).sum())
+            if n_bad > 0:
+                warnings.append(f"{var}: bad={n_bad}")
+            if n_suspect > 0:
+                warnings.append(f"{var}: suspect={n_suspect}")
+            if n_missing > 0:
+                warnings.append(f"{var}: missing={n_missing}")
+
+        _flag_warn("Q", q_flags)
+        _flag_warn("SSC", ssc_flags)
+        _flag_warn("SSL", ssl_flags)
+
+        warnings_str = "; ".join(warnings)
+        n_warnings = len(warnings)
 
         # Convert time to dates for reporting
         time_units = ds_in.variables['time'].units
@@ -264,7 +315,14 @@ def process_station(input_file, output_dir):
                 out_png=out_png
             )
         except Exception as e:
+            msg = f"Diagnostic plot failed: {e}"
             print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
+            # 记录 warning（如果 warnings 还没定义，就先临时存一下）
+            try:
+                warnings.append(msg)
+            except Exception:
+                pass
+
 
         ds_in.close()
 
@@ -273,6 +331,12 @@ def process_station(input_file, output_dir):
         q_suspect = np.sum(q_flags == 2)
         q_bad = np.sum(q_flags == 3)
         q_missing = np.sum(q_flags == 9)
+        # estimated（final flag == 1）
+        q_estimated   = np.sum(q_flags == 1)
+        ssc_estimated = np.sum(ssc_flags == 1)
+        ssl_estimated = np.sum(ssl_flags == 1)
+        # 站点最终用于统计的天数（trim 后）
+        qc_n_days = int(len(q_flags))   # 或 len(time_data)，两者这里等价
 
         ssc_good = np.sum(ssc_flags == 0)
         ssc_suspect = np.sum(ssc_flags == 2)
@@ -283,6 +347,7 @@ def process_station(input_file, output_dir):
         ssl_suspect = np.sum(ssl_flags == 2)
         ssl_bad = np.sum(ssl_flags == 3)
         ssl_missing = np.sum(ssl_flags == 9)
+
 
         print(f"  Station: {station_name} ({river_name})")
         print(f"  Location: {lat:.3f}°, {lon:.3f}°")
@@ -428,6 +493,26 @@ def process_station(input_file, output_dir):
             ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
             ssl_flag_var.comment = 'Quality flags: 0=good (SSL≥0), 1=estimated, 2=suspect, 3=bad (SSL<0), 9=missing'
             ssl_flag_var[:] = ssl_flags
+            # ------------------------------------------------------------
+            # Step-level provenance flags (optional)
+            # ------------------------------------------------------------
+            def _write_step_flag(name, arr):
+                if arr is None:
+                    return
+                v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4)
+                v.long_name = f"step-level provenance flag: {name}"
+                v[:] = np.asarray(arr, dtype=np.int8)
+
+            _write_step_flag("Q_flag_qc1_physical", Q_qc1)
+            _write_step_flag("Q_flag_qc2_log_iqr",  Q_qc2)
+
+            _write_step_flag("SSC_flag_qc1_physical", SSC_qc1)
+            _write_step_flag("SSC_flag_qc2_log_iqr",  SSC_qc2)
+            _write_step_flag("SSC_flag_qc3_ssc_q_consistency", SSC_qc3)
+
+            _write_step_flag("SSL_flag_qc1_physical", SSL_qc1)
+            _write_step_flag("SSL_flag_qc2_log_iqr",  SSL_qc2)
+            _write_step_flag("SSL_flag_qc3_propagation", SSL_qc3)
 
             # Global attributes (CF-1.8 and ACDD-1.3 compliant)
             ds.Conventions = 'CF-1.8, ACDD-1.3'
@@ -495,11 +580,105 @@ def process_station(input_file, output_dir):
             'SSC_percent_complete': f"{100.0 * ssc_good / len(ssc_data):.1f}" if ssc_good > 0 else 'N/A',
             'SSL_start_date': dates[0].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
             'SSL_end_date': dates[-1].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
-            'SSL_percent_complete': f"{100.0 * ssl_good / len(ssl_data):.1f}" if ssl_good > 0 else 'N/A'
+            'SSL_percent_complete': f"{100.0 * ssl_good / len(ssl_data):.1f}" if ssl_good > 0 else 'N/A',
+            
+            'filepath': output_file,
+            'warnings': warnings_str,
+            'n_warnings': n_warnings,
+            'Q_good': int(q_good), 'Q_suspect': int(q_suspect), 'Q_bad': int(q_bad), 'Q_missing': int(q_missing),
+            'SSC_good': int(ssc_good), 'SSC_suspect': int(ssc_suspect), 'SSC_bad': int(ssc_bad), 'SSC_missing': int(ssc_missing),
+            'SSL_good': int(ssl_good), 'SSL_suspect': int(ssl_suspect), 'SSL_bad': int(ssl_bad), 'SSL_missing': int(ssl_missing),
+            "QC_n_days": int(len(time_data)),
+
+            "Q_final_good": int(q_good),
+            "Q_final_estimated": int(q_estimated),
+            "Q_final_suspect": int(q_suspect),
+            "Q_final_bad": int(q_bad),
+            "Q_final_missing": int(q_missing),
+
+            "SSC_final_good": int(ssc_good),
+            "SSC_final_estimated": int(ssc_estimated),
+            "SSC_final_suspect": int(ssc_suspect),
+            "SSC_final_bad": int(ssc_bad),
+            "SSC_final_missing": int(ssc_missing),
+
+            "SSL_final_good": int(ssl_good),
+            "SSL_final_estimated": int(ssl_estimated),
+            "SSL_final_suspect": int(ssl_suspect),
+            "SSL_final_bad": int(ssl_bad),
+            "SSL_final_missing": int(ssl_missing),
         }
+        # ===== b 部分：把“范例式字段”补齐（final_* + estimated）=====
+        q_estimated   = int((q_flags == 1).sum())
+        ssc_estimated = int((ssc_flags == 1).sum())
+        ssl_estimated = int((ssl_flags == 1).sum())
+        def _count_step_flags(arr, mapping):
+            if arr is None:
+                return None
+            arr = np.asarray(arr)
+            return {k: int((arr == v).sum()) for k, v in mapping.items()}
+
+        qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+        qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+        qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+        qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+        for var, arr, mp, prefix in [
+            ("Q",   Q_qc1,   qc1_map,     "qc1"),
+            ("SSC", SSC_qc1, qc1_map,     "qc1"),
+            ("SSL", SSL_qc1, qc1_map,     "qc1"),
+
+            ("Q",   Q_qc2,   qc2_map,     "qc2"),
+            ("SSC", SSC_qc2, qc2_map,     "qc2"),
+            ("SSL", SSL_qc2, qc2_map,     "qc2"),
+
+            ("SSC", SSC_qc3, qc3_map,     "qc3"),
+            ("SSL", SSL_qc3, qc3_ssl_map, "qc3"),
+        ]:
+            c = _count_step_flags(arr, mp)
+            if c is not None:
+                station_info.update({f"{var}_{prefix}_{k}": v for k, v in c.items()})
+
+        # -----------------------------
+        # Step-level flag counts -> station_info (HYDAT-style)
+        # -----------------------------
+        def _count_step_flags(arr, mapping):
+            if arr is None:
+                return None
+            arr = np.asarray(arr, dtype=np.int8)
+            return {k: int((arr == v).sum()) for k, v in mapping.items()}
+
+        # QC1: 0 pass, 3 bad, 9 missing
+        qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+
+        # QC2: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+        # QC3 SSC–Q: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+        # QC3 SSL propagation: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+        qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+        # 逐个变量逐步写入（有就写，没有就跳过）
+        for var, arr, mp, prefix in [
+            ("Q",   Q_qc1,   qc1_map,     "qc1"),
+            ("SSC", SSC_qc1, qc1_map,     "qc1"),
+            ("SSL", SSL_qc1, qc1_map,     "qc1"),
+
+            ("Q",   Q_qc2,   qc2_map,     "qc2"),
+            ("SSC", SSC_qc2, qc2_map,     "qc2"),
+            ("SSL", SSL_qc2, qc2_map,     "qc2"),
+
+            ("SSC", SSC_qc3, qc3_map,     "qc3"),
+            ("SSL", SSL_qc3, qc3_ssl_map, "qc3"),
+        ]:
+            c = _count_step_flags(arr, mp)
+            if c is not None:
+                station_info.update({f"{var}_{prefix}_{k}": v for k, v in c.items()})
 
         return station_info
-
+    
     except Exception as e:
         print(f"  ERROR processing {os.path.basename(input_file)}: {e}")
         import traceback
@@ -584,8 +763,26 @@ def main():
 
         print(f"Station summary saved to: {csv_file}")
         print(f"Total stations: {len(df)}")
+    # ------------------------------------------------------------
+    # Tool outputs (HYDAT-style): ONLY two CSVs
+    # ------------------------------------------------------------
+    if len(station_info_list) > 0:
+        print("\n" + "=" * 80)
+        print("Generating Tool CSV Summaries (2 files)")
+        print("=" * 80)
+
+        station_csv = os.path.join(output_dir, "Bayern_station_summary.csv")
+        qc_csv      = os.path.join(output_dir, "Bayern_qc_results_summary.csv")
+
+        generate_csv_summary_tool(station_info_list, station_csv)
+        generate_qc_results_csv_tool(station_info_list, qc_csv)
+
+        print("\n[CSV] Tool outputs written:")
+        print("  -", station_csv)
+        print("  -", qc_csv)
     else:
-        print("WARNING: No successful stations processed, CSV not created")
+        print("WARNING: No successful stations processed, tool CSV not created")
+
 
     print()
     print("="*80)

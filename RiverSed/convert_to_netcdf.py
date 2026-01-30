@@ -21,17 +21,21 @@ from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
     apply_quality_flag,
+    apply_quality_flag_array,                
     compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    apply_hydro_qc_with_provenance,           
+    generate_csv_summary as generate_csv_summary_tool,          
+    generate_qc_results_csv as generate_qc_results_csv_tool,
 )
 
 PROJECT_ROOT = Path(CURRENT_DIR).parents[1]  
 SOURCE_DIR = str(PROJECT_ROOT / "Source" / "RiverSed")
-OUTPUT_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "nc")
+OUTPUT_NC_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "nc")
+OUTPUT_QC_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "qc")
 
 def load_aquasat_data(file_path):
     """Load Aquasat TSS data"""
@@ -93,64 +97,73 @@ def create_daily_timeseries(start_date, end_date):
 
 def apply_satellite_ssc_qc(df, station_id, diagnostic_dir=None):
     """
-    QC for satellite-only SSC (TSS) data using tool.py
+    QC for satellite-only SSC (TSS) data using tool.py logic.
 
-    Rules:
-    - Physical validity (apply_quality_flag)
-    - log-IQR outlier screening
-    - NO SSC–Q consistency (no discharge)
+    Final flag convention:
+      0 good, 2 suspect, 3 bad, 9 missing
+
+    Step flags:
+      - QC1 physical: 0 pass, 3 bad, 9 missing
+      - QC2 log-IQR : 0 pass, 2 suspect, 8 not_checked, 9 missing
+      - QC3 SSC–Q   : 0 pass, 2 suspect, 8 not_checked, 9 missing (satellite-only => mostly 8/9)
     """
 
-    ssc = df['tss'].values.astype(float)
+    # ---- force strict 1D (避免 0D / len() 报错) ----
+    ssc = np.atleast_1d(np.asarray(df["tss"], dtype=float)).reshape(-1)
+    if ssc.size == 0:
+        return None
 
     # -----------------------------
-    # 1. Physical QC
+    # QC1. physical feasibility (vectorized)
     # -----------------------------
-    ssc_flag = np.array(
-        [apply_quality_flag(v, "SSC") for v in ssc],
-        dtype=np.int8
-    )
+    ssc_flag_qc1 = apply_quality_flag_array(ssc, variable_name="SSC")  # 0/3/9
 
     # -----------------------------
-    # 2. log-IQR screening
+    # QC2. log-IQR screening
     # -----------------------------
+    ssc_flag_qc2 = np.full(ssc.shape, 8, dtype=np.int8)  # default not_checked
+    # missing remains 9
+    ssc_flag_qc2[ssc_flag_qc1 == 9] = 9
+
     lower, upper = compute_log_iqr_bounds(ssc)
-
-    if lower is not None:
+    if (lower is not None) and (upper is not None) and (ssc.size >= 5):
+        # for non-missing, mark pass first
+        ssc_flag_qc2[(ssc_flag_qc1 != 9)] = 0
         outlier = (ssc < lower) | (ssc > upper)
-        ssc_flag[outlier] = 2  # suspect
+        # only mark suspect where it is not missing & not already bad
+        ssc_flag_qc2[outlier & (ssc_flag_qc1 != 9)] = 2
 
     # -----------------------------
-    # 3. Mask bad data
+    # QC3. SSC–Q consistency (satellite-only => not_checked)
+    # -----------------------------
+    ssc_flag_qc3 = np.full(ssc.shape, 8, dtype=np.int8)
+    ssc_flag_qc3[ssc_flag_qc1 == 9] = 9
+
+    # -----------------------------
+    # Final flag combine (QC1 dominates bad/missing; QC2 may set suspect)
+    # -----------------------------
+    ssc_flag_final = ssc_flag_qc1.copy()  # start with 0/3/9
+    # if QC1 pass and QC2 says suspect => final suspect
+    ssc_flag_final[(ssc_flag_qc1 == 0) & (ssc_flag_qc2 == 2)] = 2
+
+    # -----------------------------
+    # Mask bad & missing values
     # -----------------------------
     ssc_clean = ssc.copy()
-    ssc_clean[ssc_flag == 3] = np.nan  # bad → NaN
+    ssc_clean[(ssc_flag_final == 3) | (ssc_flag_final == 9)] = np.nan
 
-    df['tss'] = ssc_clean
-    df['SSC_flag'] = ssc_flag
+    df["tss"] = ssc_clean
+    df["SSC_flag"] = ssc_flag_final.astype(np.int8)
+    df["SSC_flag_qc1_physical"] = ssc_flag_qc1.astype(np.int8)
+    df["SSC_flag_qc2_log_iqr"] = ssc_flag_qc2.astype(np.int8)
+    df["SSC_flag_qc3_ssc_q"] = ssc_flag_qc3.astype(np.int8)
 
     # 至少保留一个非缺测值
-    if np.all(np.isnan(df['tss'].values)):
+    if np.all(np.isnan(df["tss"].values)):
         print(f"  -> All SSC invalid after QC for station {station_id}")
         return None
 
-    # Generate diagnostic plot using plot_ssc_q_diagnostic
-    # Note: For satellite data without Q, ssc_q_bounds will be None and plot will be skipped
-    if diagnostic_dir is not None:
-        try:
-            diagnostic_dir = Path(diagnostic_dir)
-            diagnostic_dir.mkdir(parents=True, exist_ok=True)
-            
-            # For satellite data without Q, we cannot generate SSC-Q consistency plots
-            # since ssc_q_bounds = None causes plot_ssc_q_diagnostic to return early
-            # This is expected behavior for satellite-only data
-            pass
-            
-        except Exception as e:
-            print(f"  Warning: Failed to create diagnostic plot for {station_id}: {e}")
-
     return df
-
 
 def create_netcdf_file(station_id, tss_df, output_dir):
     """Create netCDF file following HYBAM format"""
@@ -158,14 +171,14 @@ def create_netcdf_file(station_id, tss_df, output_dir):
     # Check if all TSS values are NaN
     if tss_df['tss'].isna().all():
         print(f"  All TSS values are NaN for station {station_id}")
-        return False
+        return None
 
     # Find time period
     start_date, end_date = find_overlap_period(tss_df['date'])
 
     if start_date is None:
         print(f"  No valid dates for station {station_id}")
-        return False
+        return None
 
     # 只保留有数据的日期（按日平均）
     tss_df['date'] = pd.to_datetime(tss_df['date'], errors='coerce')
@@ -184,8 +197,12 @@ def create_netcdf_file(station_id, tss_df, output_dir):
     daily_df = apply_satellite_ssc_qc(daily_df, station_id, diagnostic_dir=diagnostic_dir)
 
     if daily_df is None:
-        return False
-        # -----------------------------
+        return None
+    # --- pad flags to int8 (NaN -> 9) ---
+    for col in list(daily_df.columns):
+        if col.endswith("_flag") or ("flag_qc" in col):
+            daily_df[col] = daily_df[col].fillna(FILL_VALUE_INT).astype(np.int8)
+    # -----------------------------
     # Print QC summary (station-level)
     # -----------------------------
     n_total = len(daily_df)
@@ -323,6 +340,45 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         SSL_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         SSL_flag_var.comment = 'All set to 9 (missing) - cannot be calculated without discharge'
         SSL_flag_var[:] = np.full(len(daily_df), FILL_VALUE_INT, dtype=np.int8)
+        # =============================
+        # Step / provenance flags (SSC)
+        # =============================
+        def _add_step_flag(name, values, flag_values, flag_meanings, long_name):
+            v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
+            v.long_name = long_name
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(flag_values, dtype='b')
+            v.flag_meanings = flag_meanings
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray(values, dtype=np.int8)
+            return v
+
+        if "SSC_flag_qc1_physical" in daily_df.columns:
+            _add_step_flag(
+                "SSC_flag_qc1_physical",
+                daily_df["SSC_flag_qc1_physical"].values,
+                flag_values=[0, 3, 9],
+                flag_meanings="pass bad missing",
+                long_name="QC1 physical flag for suspended sediment concentration",
+            )
+
+        if "SSC_flag_qc2_log_iqr" in daily_df.columns:
+            _add_step_flag(
+                "SSC_flag_qc2_log_iqr",
+                daily_df["SSC_flag_qc2_log_iqr"].values,
+                flag_values=[0, 2, 8, 9],
+                flag_meanings="pass suspect not_checked missing",
+                long_name="QC2 log-IQR flag for suspended sediment concentration",
+            )
+
+        if "SSC_flag_qc3_ssc_q" in daily_df.columns:
+            _add_step_flag(
+                "SSC_flag_qc3_ssc_q",
+                daily_df["SSC_flag_qc3_ssc_q"].values,
+                flag_values=[0, 2, 8, 9],
+                flag_meanings="pass suspect not_checked missing",
+                long_name="QC3 SSC–Q consistency flag for suspended sediment concentration (satellite-only)",
+            )
 
         # Global attributes
         ds.Conventions = 'CF-1.8'
@@ -336,31 +392,85 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         ds.data_period_start = start_date.strftime('%Y-%m-%d')
         ds.data_period_end = end_date.strftime('%Y-%m-%d')
 
-        # errors, warnings_nc = check_nc_completeness(output_file, strict=False)
+    # --- build station_info for CSV outputs ---
+    n = len(daily_df)
 
-        # if errors:
-        #     print(f"  ✗ Completeness check failed for {station_id}")
-        #     for e in errors:
-        #         print(f"    ERROR: {e}")
-        #     os.remove(output_file)
-        #     return False
+    def _cnt(arr, v):
+        a = np.asarray(arr, dtype=np.int8)
+        return int(np.sum(a == np.int8(v)))
 
-        # if warnings_nc:
-        #     for w in warnings_nc:
-        #         print(f"    WARNING: {w}")
+    # final flags
+    ssc_f = daily_df["SSC_flag"].values.astype(np.int8)
 
+    station_info = {
+        # metadata summary fields
+        "station_name": str(station_id).replace("_", " "),
+        "Source_ID": str(station_id),
+        "river_name": "",
+        "longitude": float(longitude) if not np.isnan(longitude) else np.nan,
+        "latitude": float(latitude) if not np.isnan(latitude) else np.nan,
+        "altitude": float(altitude) if not np.isnan(altitude) else np.nan,
+        "upstream_area": np.nan,
+        "Data Source Name": "RiverSed / Aquasat (satellite-derived TSS)",
+        "Type": "Satellite",
+        "Temporal Resolution": "daily",
+        "Temporal Span": f"{daily_df['date'].min().strftime('%Y-%m-%d')} to {daily_df['date'].max().strftime('%Y-%m-%d')}",
+        "Variables Provided": "SSC",
+        "Geographic Coverage": "",
+        "Reference/DOI": "Gardner et al. (2021) doi:10.1029/2020GL088946",
+
+        # QC summary fields (QC results CSV会自动挑存在的列)
+        "QC_n_days": int(n),
+
+        "SSC_final_good": _cnt(ssc_f, 0),
+        "SSC_final_estimated": _cnt(ssc_f, 1),
+        "SSC_final_suspect": _cnt(ssc_f, 2),
+        "SSC_final_bad": _cnt(ssc_f, 3),
+        "SSC_final_missing": _cnt(ssc_f, 9),
+    }
+
+    # step flags counts (如果列存在就加进去)
+    if "SSC_flag_qc1_physical" in daily_df.columns:
+        f = daily_df["SSC_flag_qc1_physical"].values.astype(np.int8)
+        station_info.update({
+            "SSC_qc1_pass": _cnt(f, 0),
+            "SSC_qc1_bad": _cnt(f, 3),
+            "SSC_qc1_missing": _cnt(f, 9),
+        })
+
+    if "SSC_flag_qc2_log_iqr" in daily_df.columns:
+        f = daily_df["SSC_flag_qc2_log_iqr"].values.astype(np.int8)
+        station_info.update({
+            "SSC_qc2_pass": _cnt(f, 0),
+            "SSC_qc2_suspect": _cnt(f, 2),
+            "SSC_qc2_not_checked": _cnt(f, 8),
+            "SSC_qc2_missing": _cnt(f, 9),
+        })
+
+    if "SSC_flag_qc3_ssc_q" in daily_df.columns:
+        f = daily_df["SSC_flag_qc3_ssc_q"].values.astype(np.int8)
+        station_info.update({
+            "SSC_qc3_pass": _cnt(f, 0),
+            "SSC_qc3_suspect": _cnt(f, 2),
+            "SSC_qc3_not_checked": _cnt(f, 8),
+            "SSC_qc3_missing": _cnt(f, 9),
+        })
 
     print(f"  Created {output_file}")
-    return True
+    return station_info
+
 
 def main():
     # Configuration with WSL absolute paths
     aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
     riversed_file = os.path.join(SOURCE_DIR, 'RiverSed_USA_V1.1.txt')
-    output_dir = OUTPUT_DIR
+    output_nc_dir = OUTPUT_NC_DIR
+    output_qc_dir = OUTPUT_QC_DIR
 
-    # Create output directory
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(output_nc_dir).mkdir(parents=True, exist_ok=True)
+    Path(output_qc_dir).mkdir(parents=True, exist_ok=True)
+
+    stations_info = []   # 用于两个CSV（summary + qc_results）
 
     # Load data
     print("\n" + "="*80)
@@ -393,7 +503,7 @@ def main():
 
     with ProcessPoolExecutor() as executor:
         futures = {
-            executor.submit(create_netcdf_file, station_id, aquasat_df[aquasat_df['station_id'] == station_id].copy(), output_dir): station_id
+            executor.submit(create_netcdf_file, station_id, aquasat_df[aquasat_df['station_id'] == station_id].copy(), output_nc_dir): station_id
             for station_id in aquasat_stations
         }
 
@@ -401,7 +511,8 @@ def main():
             station_id = futures[future]
             try:
                 result = future.result()
-                if result:
+                if isinstance(result, dict):
+                    stations_info.append(result)
                     aquasat_success += 1
                 else:
                     aquasat_failed += 1
@@ -434,7 +545,7 @@ def main():
 
     with ProcessPoolExecutor() as executor:
         futures = {
-            executor.submit(create_netcdf_file, station_id, riversed_df[riversed_df['station_id'] == station_id].copy(), output_dir): station_id
+            executor.submit(create_netcdf_file, station_id, riversed_df[riversed_df['station_id'] == station_id].copy(), output_nc_dir): station_id
             for station_id in riversed_stations
         }
 
@@ -442,10 +553,11 @@ def main():
             station_id = futures[future]
             try:
                 result = future.result()
-                if result:
-                    riversed_success += 1
+                if isinstance(result, dict):
+                    stations_info.append(result)
+                    aquasat_success += 1
                 else:
-                    riversed_failed += 1
+                    aquasat_failed += 1
             except Exception as e:
                 print(f"  Station {station_id} failed with error: {e}")
                 riversed_failed += 1
@@ -453,6 +565,15 @@ def main():
             if i % 1000 == 0:
                 print(f"  Processed {i}/{len(riversed_stations)} stations...")
 
+    # -----------------------------
+    # Generate CSV outputs (summary + QC results)
+    # -----------------------------
+    if stations_info:
+        csv_summary = os.path.join(OUTPUT_QC_DIR, "RiverSed_station_summary.csv")
+        csv_qc = os.path.join(OUTPUT_QC_DIR, "RiverSed_qc_results_summary.csv")
+
+        generate_csv_summary_tool(stations_info, csv_summary)
+        generate_qc_results_csv_tool(stations_info, csv_qc)
 
     print("\n" + "="*80)
     print("SUMMARY")

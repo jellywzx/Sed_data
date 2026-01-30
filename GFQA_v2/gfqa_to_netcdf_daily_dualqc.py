@@ -46,6 +46,10 @@ from tool import (
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
     propagate_ssc_q_inconsistency_to_ssl,
+    apply_quality_flag_array,
+    apply_hydro_qc_with_provenance,
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
 )
 
 
@@ -178,31 +182,49 @@ def parse_lat_lon(station_row):
     lon = float(str(station_row['Longitude']).replace(',', '.'))
     return lat, lon
 
-
-
 # ==========================================================
 # 计算与文件输出
 # ==========================================================
-
 def calculate_sediment_load(q, ssc):
     """计算每日泥沙通量 (ton/day)"""
     if q == -9999.0 or ssc == -9999.0:
         return -9999.0
     return q * ssc * 0.0864
 
-
-def create_netcdf_file(station_id, station_row, dates,
-                       discharge, ssc, ssl,
-                       q_flag, ssc_flag, ssl_flag,
-                       q_quality, ssc_quality,
-                       output_dir):
-    """创建 NetCDF 文件（含自动QC与Data.Quality）"""
+def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, output_dir):
+    """创建 NetCDF 文件（含最终QC + 分步QC flags + 原始Data.Quality）"""
 
     filename = f"GFQA_{station_id}.nc"
     filepath = os.path.join(output_dir, filename)
     ds = nc.Dataset(filepath, 'w', format='NETCDF4')
 
-    # 时间维度
+    # --------------------------
+    # unpack qc dict
+    # --------------------------
+    dates = qc["time"]
+    discharge = qc["Q"]
+    ssc = qc["SSC"]
+    ssl = qc["SSL"]
+
+    Q_flag   = qc["Q_flag"].astype(np.int8)
+    SSC_flag = qc["SSC_flag"].astype(np.int8)
+    SSL_flag = qc["SSL_flag"].astype(np.int8)
+
+    # step/provenance flags
+    Q_flag_qc1   = qc.get("Q_flag_qc1_physical")
+    SSC_flag_qc1 = qc.get("SSC_flag_qc1_physical")
+    SSL_flag_qc1 = qc.get("SSL_flag_qc1_physical")
+
+    Q_flag_qc2   = qc.get("Q_flag_qc2_log_iqr")
+    SSC_flag_qc2 = qc.get("SSC_flag_qc2_log_iqr")
+    SSL_flag_qc2 = qc.get("SSL_flag_qc2_log_iqr")
+
+    SSC_flag_qc3 = qc.get("SSC_flag_qc3_ssc_q")
+    SSL_flag_qc3 = qc.get("SSL_flag_qc3_from_ssc_q")
+
+    # --------------------------
+    # dimensions / time
+    # --------------------------
     ds.createDimension('time', len(dates))
     time_var = ds.createVariable('time', 'f8', ('time',))
     time_var.units = 'days since 1970-01-01 00:00:00'
@@ -210,36 +232,10 @@ def create_netcdf_file(station_id, station_row, dates,
     time_var.calendar = 'gregorian'
     time_var[:] = [(pd.Timestamp(d) - pd.Timestamp('1970-01-01')).days for d in dates]
 
-    # 主变量
-    q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
-    q_var.units = 'm3 s-1'
-    q_var.long_name = 'river discharge'
-    q_var.ancillary_variables = 'Q_flag'
-    q_var[:] = discharge
-
-    ssc_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=-9999.0)
-    ssc_var.units = 'mg L-1'
-    ssc_var.long_name = 'suspended sediment concentration'
-    ssc_var.ancillary_variables = 'SSC_flag'
-    ssc_var[:] = ssc
-
-    ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0)
-    ssl_var.units = 'ton day-1'
-    ssl_var.long_name = 'suspended sediment load'
-    ssl_var.ancillary_variables = 'SSL_flag'
-    ssl_var[:] = ssl
-
-    q_var.coordinates = "latitude longitude"
-    ssc_var.coordinates = "latitude longitude"
-    ssl_var.coordinates = "latitude longitude"
-
-    
+    # --------------------------
+    # coords
+    # --------------------------
     lat, lon = parse_lat_lon(station_row)
-
-    # ds.latitude = lat
-    # ds.longitude = lon
-    # ds.altitude = parse_float(station_row.get('Elevation', -9999.0))
-    # ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
 
     lat_var = ds.createVariable('latitude', 'f4')
     lat_var.units = 'degrees_north'
@@ -251,22 +247,129 @@ def create_netcdf_file(station_id, station_row, dates,
     lon_var.standard_name = 'longitude'
     lon_var[:] = lon
 
-    
-    # 自动QC标志
-    flag_meanings = "good_data suspect_data bad_data missing_data"
-    for name, values, desc in zip(
-        ['Q_flag', 'SSC_flag', 'SSL_flag'],
-        [q_flag, ssc_flag, ssl_flag],
-        ['discharge', 'SSC', 'sediment load']
-    ):
-        var = ds.createVariable(name, 'b', ('time',), fill_value=-127)
-        var.long_name = f'quality flag for {desc}'
-        var.flag_values = np.array([0, 2, 3, 9], dtype=np.byte)
-        var.flag_meanings = flag_meanings
-        var.comment = "good_data suspect_data bad_data missing_data"
-        var[:] = values
+    # --------------------------
+    # helper: add flag var
+    # --------------------------
+    def _add_flag_var(name, values, long_name, flag_values, flag_meanings, comment=""):
+        v = ds.createVariable(name, 'b', ('time',), fill_value=-127)
+        v.long_name = long_name
+        v.flag_values = np.array(flag_values, dtype=np.byte)
+        v.flag_meanings = flag_meanings
+        if comment:
+            v.comment = comment
+        v[:] = np.asarray(values, dtype=np.int8)
+        return v
 
-    # 原始Data.Quality字符串变量
+    # --------------------------
+    # main vars
+    # --------------------------
+    q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
+    q_var.units = 'm3 s-1'
+    q_var.long_name = 'river discharge'
+    q_var.coordinates = "latitude longitude"
+
+    ssc_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=-9999.0)
+    ssc_var.units = 'mg L-1'
+    ssc_var.long_name = 'suspended sediment concentration'
+    ssc_var.coordinates = "latitude longitude"
+
+    ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0)
+    ssl_var.units = 'ton day-1'
+    ssl_var.long_name = 'suspended sediment load'
+    ssl_var.coordinates = "latitude longitude"
+
+    q_var[:] = discharge
+    ssc_var[:] = ssc
+    ssl_var[:] = ssl
+
+    # --------------------------
+    # flags: final
+    # final flag convention: 0 good, 1 estimated, 2 suspect, 3 bad, 9 missing
+    # --------------------------
+    final_meanings = "good_data estimated_data suspect_data bad_data missing_data"
+    _add_flag_var(
+        "Q_flag", Q_flag, "final quality flag for discharge",
+        flag_values=[0, 1, 2, 3, 9],
+        flag_meanings=final_meanings
+    )
+
+    _add_flag_var(
+        "SSC_flag", SSC_flag, "final quality flag for SSC",
+        flag_values=[0, 1, 2, 3, 9],
+        flag_meanings=final_meanings
+    )
+    _add_flag_var(
+        "SSL_flag", SSL_flag, "final quality flag for sediment load",
+        flag_values=[0, 1, 2, 3, 9],
+        flag_meanings=final_meanings
+    )
+
+    # --------------------------
+    # flags: step/provenance
+    # QC1: 0 pass, 3 bad, 9 missing
+    # QC2: 0 pass, 2 suspect, 8 not_checked, 9 missing
+    # QC3 SSC–Q: 0 pass, 2 suspect, 8 not_checked, 9 missing
+    # QC3 SSL propagation: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+    # --------------------------
+    if Q_flag_qc1 is not None:
+        _add_flag_var("Q_flag_qc1_physical", Q_flag_qc1, "QC1 physical check flag for discharge",
+                      flag_values=[0, 3, 9],
+                      flag_meanings="pass bad missing")
+    if SSC_flag_qc1 is not None:
+        _add_flag_var("SSC_flag_qc1_physical", SSC_flag_qc1, "QC1 physical check flag for SSC",
+                      flag_values=[0, 3, 9],
+                      flag_meanings="pass bad missing")
+    if SSL_flag_qc1 is not None:
+        _add_flag_var("SSL_flag_qc1_physical", SSL_flag_qc1, "QC1 physical check flag for SSL",
+                      flag_values=[0, 3, 9],
+                      flag_meanings="pass bad missing")
+
+    if Q_flag_qc2 is not None:
+        _add_flag_var("Q_flag_qc2_log_iqr", Q_flag_qc2, "QC2 log-IQR screening flag for discharge",
+                      flag_values=[0, 2, 8, 9],
+                      flag_meanings="pass suspect not_checked missing")
+    if SSC_flag_qc2 is not None:
+        _add_flag_var("SSC_flag_qc2_log_iqr", SSC_flag_qc2, "QC2 log-IQR screening flag for SSC",
+                      flag_values=[0, 2, 8, 9],
+                      flag_meanings="pass suspect not_checked missing")
+    if SSL_flag_qc2 is not None:
+        _add_flag_var("SSL_flag_qc2_log_iqr", SSL_flag_qc2, "QC2 log-IQR screening flag for SSL",
+                      flag_values=[0, 2, 8, 9],
+                      flag_meanings="pass suspect not_checked missing")
+
+    if SSC_flag_qc3 is not None:
+        _add_flag_var("SSC_flag_qc3_ssc_q", SSC_flag_qc3, "QC3 SSC–Q consistency flag for SSC",
+                      flag_values=[0, 2, 8, 9],
+                      flag_meanings="pass suspect not_checked missing")
+
+    if SSL_flag_qc3 is not None:
+        _add_flag_var("SSL_flag_qc3_from_ssc_q", SSL_flag_qc3, "QC3 propagation flag to SSL from SSC–Q",
+                      flag_values=[0, 2, 8, 9],
+                      flag_meanings="not_propagated propagated not_checked missing")
+
+    # --------------------------
+    # attach ancillary_variables (关键：分步写入靠这个关联)
+    # --------------------------
+    q_anc = ["Q_flag"]
+    if Q_flag_qc1 is not None: q_anc.append("Q_flag_qc1_physical")
+    if Q_flag_qc2 is not None: q_anc.append("Q_flag_qc2_log_iqr")
+    q_var.ancillary_variables = " ".join(q_anc)
+
+    ssc_anc = ["SSC_flag"]
+    if SSC_flag_qc1 is not None: ssc_anc.append("SSC_flag_qc1_physical")
+    if SSC_flag_qc2 is not None: ssc_anc.append("SSC_flag_qc2_log_iqr")
+    if SSC_flag_qc3 is not None: ssc_anc.append("SSC_flag_qc3_ssc_q")
+    ssc_var.ancillary_variables = " ".join(ssc_anc)
+
+    ssl_anc = ["SSL_flag"]
+    if SSL_flag_qc1 is not None: ssl_anc.append("SSL_flag_qc1_physical")
+    if SSL_flag_qc2 is not None: ssl_anc.append("SSL_flag_qc2_log_iqr")
+    if SSL_flag_qc3 is not None: ssl_anc.append("SSL_flag_qc3_from_ssc_q")
+    ssl_var.ancillary_variables = " ".join(ssl_anc)
+
+    # --------------------------
+    # original Data.Quality text vars
+    # --------------------------
     q_quality_var = ds.createVariable('Q_quality', str, ('time',))
     q_quality_var.long_name = 'data quality label for discharge'
     q_quality_var.comment = 'Original Data.Quality from Flux.csv'
@@ -277,53 +380,33 @@ def create_netcdf_file(station_id, station_row, dates,
     ssc_quality_var.comment = 'Original Data.Quality from Water.csv'
     ssc_quality_var[:] = np.array(ssc_quality, dtype='object')
 
-    # 元数据
-    # ds.latitude = parse_float(station_row.get('Latitude', -9999.0))
-    # ds.longitude = parse_float(station_row.get('Longitude', -9999.0))
+    # --------------------------
+    # scalar metadata
+    # --------------------------
     ds.altitude = parse_float(station_row.get('Elevation', -9999.0))
     ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
 
     ds.Conventions = 'CF-1.8'
     ds.title = f'GFQA Daily Observed Sediment and Discharge Data for Station {station_id}'
     ds.comment = (
-        'Includes both automatic QC flags and original Data.Quality labels. '
-        'Flags: 0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data. '
-        'Data.Quality is a text label from the GEMS/Water CSV source.'
+        'Includes: (1) final QC flags and (2) step-level QC provenance flags, '
+        'plus original Data.Quality labels from source CSV.'
     )
     ds.history = f'Created on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by gfqa_to_netcdf_daily_dualqc.py'
     ds.close()
+
     print(f"✅ Created file: {filename}")
-    n = len(discharge)
-    skipped_log_iqr = (n < 5)
-    skipped_ssc_q = (n < 5)
-
-    def _repr(v, f):
-        v = np.asarray(v, dtype=float)
-        f = np.asarray(f, dtype=np.int8)
-        ok = np.isfinite(v) & (v > 0)
-        ok_good = ok & (f == 0)
-        if np.any(ok_good):
-            return float(np.nanmedian(v[ok_good])), 0
-        if np.any(ok):
-            return float(np.nanmedian(v[ok])), int(np.min(f[ok]))
-        return float("nan"), 9
-
-    qv, qf = _repr(discharge, q_flag)
-    sscv, sscf = _repr(ssc, ssc_flag)
-    sslv, sslf = _repr(ssl, ssl_flag)
-
     log_station_qc(
         station_id=station_id,
         station_name=str(station_row.get('Station Name', station_id)),
-        n_samples=n,
-        skipped_log_iqr=skipped_log_iqr,
-        skipped_ssc_q=skipped_ssc_q,
-        q_value=qv, q_flag=qf,
-        ssc_value=sscv, ssc_flag=sscf,
-        ssl_value=sslv, ssl_flag=sslf,
+        n_samples=len(discharge),
+        skipped_log_iqr=False,
+        skipped_ssc_q=False,
+        q_value=float(np.nanmedian(np.asarray(discharge, dtype=float))), q_flag=int(np.min(Q_flag)),
+        ssc_value=float(np.nanmedian(np.asarray(ssc, dtype=float))), ssc_flag=int(np.min(SSC_flag)),
+        ssl_value=float(np.nanmedian(np.asarray(ssl, dtype=float))), ssl_flag=int(np.min(SSL_flag)),
         created_path=filepath
     )
-
 
 
 # ==========================================================
@@ -332,6 +415,7 @@ def create_netcdf_file(station_id, station_row, dates,
 
 def process_all_stations(flux_df, water_df, station_df, output_dir):
     all_records = []
+    stations_info = []
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -364,59 +448,49 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
 
         merged['SSL'] = merged['Clean_Value_Q'] * merged['Clean_Value_SSC'] * 0.0864
         
-        #apply quality flags
-        merged['Q_flag'] = merged['Clean_Value_Q'].apply(
-            lambda x: apply_quality_flag(x, "Q")
+        # ==================================================
+        # ✅ 用 tool.py 的一键QC（含分步provenance flags）
+        # ==================================================
+        time_arr = pd.to_datetime(merged['Date']).values
+        Q_arr = merged['Clean_Value_Q'].to_numpy(dtype=float)
+        SSC_arr = merged['Clean_Value_SSC'].to_numpy(dtype=float)
+        SSL_arr = merged['SSL'].to_numpy(dtype=float)
+
+        qc = apply_hydro_qc_with_provenance(
+            time=time_arr,
+            Q=Q_arr,
+            SSC=SSC_arr,
+            SSL=SSL_arr,
+            Q_is_independent=True,
+            SSC_is_independent=True,
+            SSL_is_independent=False,          # SSL = Q*SSC 推导
+            ssl_is_derived_from_q_ssc=True,
+            qc2_k=1.5,
+            qc2_min_samples=5,
+            qc3_k=1.5,
+            qc3_min_samples=5,
         )
+        if qc is None:
+            print("  ⚠️ Skipped: QC produced no valid data")
+            continue
 
-        merged['SSC_flag'] = merged['Clean_Value_SSC'].apply(
-            lambda x: apply_quality_flag(x, "SSC")
-        )
+        # 写回 merged（用于导出/诊断图）
+        merged['Q_flag'] = qc['Q_flag']
+        merged['SSC_flag'] = qc['SSC_flag']
+        merged['SSL_flag'] = qc['SSL_flag']
 
-        merged['SSL_flag'] = merged['SSL'].apply(
-            lambda x: apply_quality_flag(x, "SSL")
-        )
+        merged['Q_flag_qc1_physical'] = qc.get('Q_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
+        merged['SSC_flag_qc1_physical'] = qc.get('SSC_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
+        merged['SSL_flag_qc1_physical'] = qc.get('SSL_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
 
-        # === SSC-Q check ===
-        lower, upper = compute_log_iqr_bounds(merged['SSL'].values)
+        merged['Q_flag_qc2_log_iqr'] = qc.get('Q_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
+        merged['SSC_flag_qc2_log_iqr'] = qc.get('SSC_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
+        merged['SSL_flag_qc2_log_iqr'] = qc.get('SSL_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
 
-        if lower is not None:
-            is_outlier = (
-                (merged['SSL'] < lower) |
-                (merged['SSL'] > upper)
-            ) & (merged['SSL_flag'] == 0)
+        merged['SSC_flag_qc3_ssc_q'] = qc.get('SSC_flag_qc3_ssc_q', np.full(len(merged), 8, dtype=np.int8))
+        merged['SSL_flag_qc3_from_ssc_q'] = qc.get('SSL_flag_qc3_from_ssc_q', np.full(len(merged), 8, dtype=np.int8))
 
-            merged.loc[is_outlier, 'SSL_flag'] = 2  # suspect
-
-        ssc_q_bounds = build_ssc_q_envelope(
-        Q_m3s=merged['Clean_Value_Q'].values,
-        SSC_mgL=merged['Clean_Value_SSC'].values,
-        k=1.5,
-        min_samples=5
-        )
-
-        for i, row in merged.iterrows():
-            is_bad, _ = check_ssc_q_consistency(
-                Q=row['Clean_Value_Q'],
-                SSC=row['Clean_Value_SSC'],
-                Q_flag=row['Q_flag'],
-                SSC_flag=row['SSC_flag'],
-                ssc_q_bounds=ssc_q_bounds
-            )
-            if is_bad and row['SSC_flag'] == 0:
-                merged.at[i, 'SSC_flag'] = np.int8(2)
-
-                merged.at[i, 'SSL_flag'] = propagate_ssc_q_inconsistency_to_ssl(
-                    inconsistent=True,
-                    Q=row['Clean_Value_Q'],
-                    SSC=row['Clean_Value_SSC'],
-                    SSL=merged.at[i, 'SSL'],
-                    Q_flag=row['Q_flag'],
-                    SSC_flag=merged.at[i, 'SSC_flag'],  
-                    SSL_flag=row['SSL_flag'],
-                    ssl_is_derived_from_q_ssc=True,  
-                )
-
+        ssc_q_bounds = qc.get("ssc_q_bounds", None)
             
         # --------------------------------------------------
         # SSC–Q diagnostic plot (station-level)
@@ -439,26 +513,78 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
                 out_png=str(out_png),
             )
 
+        # === 收集所有站点的合并数据 ===
+        export_df = merged.copy()
+        export_df['Station_ID'] = station_id     # 加入站点号
+        all_records.append(export_df)
+        # ==========================
+        # 站点QC统计（用于CSV汇总）
+        # ==========================
+        lat, lon = parse_lat_lon(station_row)
 
+        def _count_final(f):
+            f = np.asarray(f, dtype=np.int8)
+            return {
+                "good": int(np.sum(f == 0)),
+                "estimated": int(np.sum(f == 1)),
+                "suspect": int(np.sum(f == 2)),
+                "bad": int(np.sum(f == 3)),
+                "missing": int(np.sum(f == FILL_VALUE_INT)),  # 9
+            }
 
-            # === 收集所有站点的合并数据 ===
-            export_df = merged.copy()
-            export_df['Station_ID'] = station_id     # 加入站点号
-            all_records.append(export_df)
+        def _count_step(f, mapping):
+            f = np.asarray(f, dtype=np.int8)
+            return {k: int(np.sum(f == np.int8(v))) for k, v in mapping.items()}
+
+        station_info = {
+            "station_name": str(station_row.get("Station Name", station_id)),
+            "Source_ID": station_id,
+            "longitude": lon,
+            "latitude": lat,
+            "QC_n_days": int(len(merged)),
+        }
+
+        # final flags（你现在 merged 里已有 Q_flag/SSC_flag/SSL_flag）
+        c = _count_final(merged["Q_flag"].to_numpy());   station_info.update({f"Q_final_{k}": v for k, v in c.items()})
+        c = _count_final(merged["SSC_flag"].to_numpy()); station_info.update({f"SSC_final_{k}": v for k, v in c.items()})
+        c = _count_final(merged["SSL_flag"].to_numpy()); station_info.update({f"SSL_final_{k}": v for k, v in c.items()})
+
+        # 如果你已经把分步 flags 写回 merged（比如 Q_flag_qc1_physical 等），这里再统计：
+        qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+        qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+
+        if "Q_flag_qc1_physical" in merged.columns:
+            c = _count_step(merged["Q_flag_qc1_physical"].to_numpy(), qc1_map)
+            station_info.update({f"Q_qc1_{k}": v for k, v in c.items()})
+        if "Q_flag_qc2_log_iqr" in merged.columns:
+            c = _count_step(merged["Q_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+            station_info.update({f"Q_qc2_{k}": v for k, v in c.items()})
+
+        # SSC/SSL 分步同理（你有这些列就统计，没有就自动跳过）
+        if "SSC_flag_qc1_physical" in merged.columns:
+            c = _count_step(merged["SSC_flag_qc1_physical"].to_numpy(), qc1_map)
+            station_info.update({f"SSC_qc1_{k}": v for k, v in c.items()})
+        if "SSC_flag_qc2_log_iqr" in merged.columns:
+            c = _count_step(merged["SSC_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+            station_info.update({f"SSC_qc2_{k}": v for k, v in c.items()})
+        if "SSL_flag_qc1_physical" in merged.columns:
+            c = _count_step(merged["SSL_flag_qc1_physical"].to_numpy(), qc1_map)
+            station_info.update({f"SSL_qc1_{k}": v for k, v in c.items()})
+        if "SSL_flag_qc2_log_iqr" in merged.columns:
+            c = _count_step(merged["SSL_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+            station_info.update({f"SSL_qc2_{k}": v for k, v in c.items()})
+
+        stations_info.append(station_info)
 
         create_netcdf_file(
-            station_id, station_row,
-            pd.to_datetime(merged['Date']).dt.to_pydatetime(),
-            merged['Clean_Value_Q'].to_numpy(),
-            merged['Clean_Value_SSC'].to_numpy(),
-            merged['SSL'].to_numpy(),
-            merged['Q_flag'].to_numpy().astype(np.byte),
-            merged['SSC_flag'].to_numpy().astype(np.byte),
-            merged['SSL_flag'].to_numpy().astype(np.byte),
-            merged['Quality_Q'].fillna('unknown').to_numpy(),
-            merged['Quality_SSC'].fillna('unknown').to_numpy(),
-            output_dir
+            station_id=station_id,
+            station_row=station_row,
+            qc=qc,
+            q_quality=merged['Quality_Q'].fillna('unknown').to_numpy(),
+            ssc_quality=merged['Quality_SSC'].fillna('unknown').to_numpy(),
+            output_dir=output_dir,
         )
+
 
         # errors, warnings = check_nc_completeness(filepath, strict=False)
 
@@ -484,6 +610,18 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
         big_df.to_excel(out_path, index=False)
 
         print(f"\n📘 Saved merged Excel for all stations: {out_path}")
+    # === 输出两个CSV汇总 ===
+    if stations_info:
+        out_dir = Path(output_dir)
+        generate_csv_summary_tool(
+            stations_info,
+            str(out_dir / "GFQA_station_summary.csv")
+        )
+        generate_qc_results_csv_tool(
+            stations_info,
+            str(out_dir / "GFQA_station_qc_results.csv")
+        )
+
 
 
 

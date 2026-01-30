@@ -51,13 +51,16 @@ from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
     apply_quality_flag,
+    apply_quality_flag_array,                
     compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl,
-)
+    apply_hydro_qc_with_provenance,           
+    generate_csv_summary as generate_csv_summary_tool,          
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+) #add 4 functions from tool.py
 
 STATION_INFO = {
     "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430},
@@ -277,144 +280,98 @@ class HYBAMProcessor:
 
     def apply_qc_checks(self, data_dict):
         """
-        Apply QC using unified tool.py framework:
-        L0: physical validity
-        L1: log-IQR screening
-        L2: SSC–Q consistency
+        Apply QC via tool.apply_hydro_qc_with_provenance (QC1/QC2/QC3 + provenance flags)
+        and make sure all arrays are 1D and length-aligned.
+        new:change SSC/time/Q to iD arrays and aligned lengths
         """
 
-        time_sec = data_dict.get("time")
-        n = len(time_sec) if time_sec is not None else 0
+        # ---------- helper: force 1D ----------
+        def _as_1d(x):
+            if x is None:
+                return None
+            arr = np.asarray(x)
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
+            else:
+                arr = np.squeeze(arr)
+                if arr.ndim == 0:
+                    arr = arr.reshape(1)
+            return arr
 
-        Q = data_dict.get("discharge")
-        SSC = data_dict.get("ssc")
+        # ---------- helper: align to length n ----------
+        def _align_len(arr, n, fill=np.nan):
+            if arr is None:
+                return None
+            a = _as_1d(arr)
+            if a.size == n:
+                return a
+            if a.size > n:
+                return a[:n]
+            # pad
+            out = np.full(n, fill, dtype=float)
+            out[:a.size] = a.astype(float)
+            return out
 
-        # --------------------------------------------------
-        # L0: basic physical QC
-        # --------------------------------------------------
-        Q_flag = (
-            np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
-            if Q is not None else None
+        # ---- force 1D time ----
+        time_sec = _as_1d(data_dict.get("time"))
+        if time_sec is None or time_sec.size == 0:
+            return None
+
+        n = time_sec.size
+
+        Q = _align_len(data_dict.get("discharge"), n, fill=np.nan)
+        SSC = _align_len(data_dict.get("ssc"), n, fill=np.nan)
+
+        # ---- derive SSL (ton/day) if Q&SSC exist ----
+        # 注意：如果你最终 nc 里 SSL 的单位是 "ton day-1"，系数应是 0.0864
+        # (kg/s -> ton/day) = 86400/1000 = 86.4 ; 但 mg/L -> kg/m3 还有 1e-3，合起来就是 0.0864
+        SSL = np.full(n, np.nan, dtype=float)
+        if Q is not None and SSC is not None:
+            m = np.isfinite(Q) & np.isfinite(SSC)
+            SSL[m] = Q[m] * SSC[m] * 0.0864
+
+        qc = apply_hydro_qc_with_provenance(
+            time=time_sec,
+            Q=np.full(n, np.nan) if Q is None else Q,
+            SSC=np.full(n, np.nan) if SSC is None else SSC,
+            SSL=SSL,
+            Q_is_independent=True,
+            SSC_is_independent=True,
+            SSL_is_independent=False,
+            ssl_is_derived_from_q_ssc=True,
         )
 
-        SSC_flag = (
-            np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
-            if SSC is not None else None
-        )
+        if qc is None:
+            return None
 
-        data_dict["Q_flag"] = Q_flag
-        data_dict["SSC_flag"] = SSC_flag
+        # ---- write back (统一字段名) ----
+        data_dict["time"] = qc["time"]
+        data_dict["discharge"] = qc["Q"]
+        data_dict["ssc"] = qc["SSC"]
+        data_dict["SSL"] = qc["SSL"]
 
-        # --------------------------------------------------
-        # L1: log-IQR screening (independent variables)
-        # --------------------------------------------------
-        if Q is not None:
-            valid_Q = Q[(Q_flag == 0) & np.isfinite(Q) & (Q > 0)]
-            q_lo, q_hi = compute_log_iqr_bounds(valid_Q)
-            if q_lo is not None:
-                for i, v in enumerate(Q):
-                    if Q_flag[i] == 0 and (v < q_lo or v > q_hi):
-                        Q_flag[i] = 2  # suspect
+        # final flags
+        data_dict["Q_flag"] = qc["Q_flag"]
+        data_dict["SSC_flag"] = qc["SSC_flag"]
+        data_dict["SSL_flag"] = qc["SSL_flag"]
 
-        if SSC is not None:
-            valid_SSC = SSC[(SSC_flag == 0) & np.isfinite(SSC) & (SSC > 0)]
-            ssc_lo, ssc_hi = compute_log_iqr_bounds(valid_SSC)
-            if ssc_lo is not None:
-                for i, v in enumerate(SSC):
-                    if SSC_flag[i] == 0 and (v < ssc_lo or v > ssc_hi):
-                        SSC_flag[i] = 2  # suspect
+        # step/provenance flags（分步骤写入的关键）
+        data_dict["Q_flag_qc1_physical"] = qc["Q_flag_qc1_physical"]
+        data_dict["SSC_flag_qc1_physical"] = qc["SSC_flag_qc1_physical"]
+        data_dict["SSL_flag_qc1_physical"] = qc["SSL_flag_qc1_physical"]
 
-        # --------------------------------------------------
-        # L2: SSC–Q consistency (core hydrological QC)
-        # --------------------------------------------------
-        ssc_q_bounds = None
-        if Q is not None and SSC is not None:
-            ssc_q_bounds = build_ssc_q_envelope(Q, SSC)
+        data_dict["Q_flag_qc2_log_iqr"] = qc["Q_flag_qc2_log_iqr"]
+        data_dict["SSC_flag_qc2_log_iqr"] = qc["SSC_flag_qc2_log_iqr"]
+        data_dict["SSL_flag_qc2_log_iqr"] = qc["SSL_flag_qc2_log_iqr"]
 
-            if ssc_q_bounds is not None:
-                for i in range(n):
-                    inconsistent, resid = check_ssc_q_consistency(
-                        Q[i],
-                        SSC[i],
-                        Q_flag[i],
-                        SSC_flag[i],
-                        ssc_q_bounds
-                    )
-                    if inconsistent:
-                        SSC_flag[i] = 2  # suspect
+        data_dict["SSC_flag_qc3_ssc_q"] = qc["SSC_flag_qc3_ssc_q"]
+        data_dict["SSL_flag_qc3_from_ssc_q"] = qc["SSL_flag_qc3_from_ssc_q"]
 
-                        SSL_flag[i] = propagate_ssc_q_inconsistency_to_ssl(
-                            inconsistent=True,
-                            Q=Q[i],
-                            SSC=SSC[i],
-                            SSL=SSL[i],
-                            Q_flag=Q_flag[i],
-                            SSC_flag=SSC_flag[i],
-                            SSL_flag=SSL_flag[i],
-                            ssl_is_derived_from_q_ssc=True,
-                        )
+        # qc3 envelope for plotting (optional)
+        data_dict["ssc_q_bounds"] = qc.get("ssc_q_bounds", None)
 
-
-        # --------------------------------------------------
-        # Derived SSL
-        # --------------------------------------------------
-        if Q is not None and SSC is not None:
-            SSL = np.full(n, FILL_VALUE_FLOAT, dtype="f4")
-            SSL_flag = np.full(n, FILL_VALUE_INT, dtype="i1")
-
-            valid = (
-                (Q_flag <= 1)
-                & (SSC_flag <= 1)
-                & np.isfinite(Q)
-                & np.isfinite(SSC)
-                & (Q > 0)
-                & (SSC > 0)
-            )
-
-            SSL[valid] = Q[valid] * SSC[valid] * 86.4
-            SSL_flag[valid] = np.maximum(Q_flag[valid], SSC_flag[valid])
-
-            data_dict["SSL"] = SSL
-            data_dict["SSL_flag"] = SSL_flag
-
-        # --------------------------------------------------
-        # Diagnostic plot (station-level)
-        # --------------------------------------------------
-        if ssc_q_bounds is not None:
-            out_png = self.output_r_dir / f"diagnostic_plots/{data_dict['station_id']}_ssc_q_diagnostic.png"
-            # Ensure output directory exists for diagnostic plot
-            try:
-                out_png.parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-            plot_ssc_q_diagnostic(
-                time=np.array(
-                    [datetime.utcfromtimestamp(t) for t in time_sec]
-                ),
-                Q=Q,
-                SSC=SSC,
-                Q_flag=Q_flag,
-                SSC_flag=SSC_flag,
-                ssc_q_bounds=ssc_q_bounds,
-                station_id=data_dict["station_id"],
-                station_name=data_dict.get("station_name", ""),
-                out_png=str(out_png),
-            )
-            # ---- QC summary print (station-level) ----
-            n = len(Q)
-
-            def _count(flag, v):
-                return int(np.sum(flag == v)) if flag is not None else 0
-
-            print(
-                f"    QC summary | "
-                f"Q(good/suspect/bad)={_count(Q_flag,0)}/{_count(Q_flag,2)}/{_count(Q_flag,3)}, "
-                f"SSC(good/suspect/bad)={_count(SSC_flag,0)}/{_count(SSC_flag,2)}/{_count(SSC_flag,3)}, "
-                f"SSL(good/suspect/bad)={_count(SSL_flag,0)}/{_count(SSL_flag,2)}/{_count(SSL_flag,3)}"
-            )
-  
         return data_dict
+
 
     def get_reference_info(self):
         """Get reference information for HYBAM dataset."""
@@ -506,7 +463,7 @@ class HYBAMProcessor:
                 Q_var.long_name = 'river discharge'
                 Q_var.units = 'm3 s-1'
                 Q_var.coordinates = 'time lat lon'
-                Q_var.ancillary_variables = 'Q_flag'
+                Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
                 Q_var.comment = 'Source: Original data from ORE-HYBAM monitoring network.'
                 Q_var.missing_value = fill_value
                 Q_var[:] = data_dict['discharge']
@@ -520,6 +477,28 @@ class HYBAMProcessor:
                 Q_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                 Q_flag_var.missing_value = FILL_VALUE_INT
                 Q_flag_var[:] = data_dict['Q_flag']
+                def _add_step_flag(ds, name, values, *, flag_values, flag_meanings, long_name):
+                    v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
+                    v.long_name = long_name
+                    v.standard_name = 'status_flag'
+                    v.c = np.array(flag_values, dtype=np.int8)
+                    v.flag_meanings = flag_meanings
+                    v.missing_value = np.int8(FILL_VALUE_INT)
+                    v[:] = np.asarray(values, dtype=np.int8)
+                    return v
+
+                # ---- QC1 physical: 0 pass, 3 bad, 9 missing ----
+                _add_step_flag(ds,'Q_flag_qc1_physical', data_dict['Q_flag_qc1_physical'],
+                            flag_values=[0, 3, 9], 
+                            flag_meanings='pass bad missing',
+                            long_name='QC1 physical flag for river discharge')
+
+                # ---- QC2 log-IQR: 0 pass, 2 suspect, 8 not_checked, 9 missing ----
+                _add_step_flag(ds,'Q_flag_qc2_log_iqr', data_dict['Q_flag_qc2_log_iqr'],
+                            flag_values=[0, 2, 8, 9], 
+                            flag_meanings='pass suspect not_checked missing',
+                            long_name='QC2 log-IQR flag for river discharge')
+
 
             # Suspended Sediment Concentration (SSC)
             if data_dict['ssc'] is not None:
@@ -528,7 +507,7 @@ class HYBAMProcessor:
                 SSC_var.long_name = 'suspended sediment concentration'
                 SSC_var.units = 'mg L-1'
                 SSC_var.coordinates = 'time lat lon'
-                SSC_var.ancillary_variables = 'SSC_flag'
+                SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
                 SSC_var.comment = 'Source: Original data from ORE-HYBAM monitoring network.'
                 SSC_var.missing_value = fill_value
                 SSC_var[:] = data_dict['ssc']
@@ -542,6 +521,38 @@ class HYBAMProcessor:
                 SSC_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                 SSC_flag_var.missing_value = FILL_VALUE_INT
                 SSC_flag_var[:] = data_dict['SSC_flag']
+                # -------------------------------
+                # Step flags for SSC (QC1/QC2/QC3)
+                # -------------------------------
+
+                # QC1: physical (0 pass, 3 bad, 9 missing)
+                _add_step_flag(
+                    ds, "SSC_flag_qc1_physical", data_dict["SSC_flag_qc1_physical"],
+                    flag_values=[0, 3, 9],
+                    flag_meanings="pass bad missing",
+                    long_name="QC1 physical check flag for suspended sediment concentration"
+                )
+
+                # QC2: log-IQR (0 pass, 2 suspect, 8 not_checked, 9 missing)
+                _add_step_flag(
+                    ds, "SSC_flag_qc2_log_iqr", data_dict["SSC_flag_qc2_log_iqr"],
+                    flag_values=[0, 2, 8, 9],
+                    flag_meanings="pass suspect not_checked missing",
+                    long_name="QC2 log-IQR flag for suspended sediment concentration"
+                )
+
+                # QC3: SSC-Q consistency (0 pass, 2 suspect, 8 not_checked, 9 missing)
+                _add_step_flag(
+                    ds, "SSC_flag_qc3_ssc_q", data_dict["SSC_flag_qc3_ssc_q"],
+                    flag_values=[0, 2, 8, 9],
+                    flag_meanings="pass suspect not_checked missing",
+                    long_name="QC3 SSC–Q consistency flag for suspended sediment concentration"
+                )
+
+                SSC_var.ancillary_variables = (
+                    "SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q"
+                )
+
 
             # Suspended Sediment Load (SSL)
             if 'SSL' in data_dict:
@@ -550,7 +561,7 @@ class HYBAMProcessor:
                 SSL_var.long_name = 'suspended sediment load'
                 SSL_var.units = 'ton day-1'
                 SSL_var.coordinates = 'time lat lon'
-                SSL_var.ancillary_variables = 'SSL_flag'
+                SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
                 SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4'
                 SSL_var.missing_value = fill_value
                 SSL_var[:] = data_dict['SSL']
@@ -564,6 +575,38 @@ class HYBAMProcessor:
                 SSL_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                 SSL_flag_var.missing_value = FILL_VALUE_INT
                 SSL_flag_var[:] = data_dict['SSL_flag']
+                # -------------------------------
+                # Step flags for SSL (QC1/QC2/QC3)
+                # -------------------------------
+                # QC1: physical (0 pass, 3 bad, 9 missing)
+                _add_step_flag(
+                    ds, "SSL_flag_qc1_physical", data_dict["SSL_flag_qc1_physical"],
+                    flag_values=[0, 3, 9],
+                    flag_meanings="pass bad missing",
+                    long_name="QC1 physical check flag for suspended sediment load"
+                )
+
+                # QC2: log-IQR (0 pass, 2 suspect, 8 not_checked, 9 missing)
+                _add_step_flag(
+                    ds, "SSL_flag_qc2_log_iqr", data_dict["SSL_flag_qc2_log_iqr"],
+                    flag_values=[0, 2, 8, 9],
+                    flag_meanings="pass suspect not_checked missing",
+                    long_name="QC2 log-IQR flag for suspended sediment load"
+                )
+
+                # QC3: propagated-from-SSC-Q inconsistency
+                # 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+                _add_step_flag(
+                    ds, "SSL_flag_qc3_from_ssc_q", data_dict["SSL_flag_qc3_from_ssc_q"],
+                    flag_values=[0, 2, 8, 9],
+                    flag_meanings="not_propagated propagated not_checked missing",
+                    long_name="QC3 flag: SSL marked/propagated from SSC–Q inconsistency"
+                )
+
+                SSL_var.ancillary_variables = (
+                    "SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q"
+                )
+
 
             # =============
             # Global Attributes (CF-1.8 & ACDD-1.3)
@@ -683,6 +726,9 @@ class HYBAMProcessor:
         data['river_name'] = river_name
 
         data = self.apply_qc_checks(data)
+        if data is None or data.get("time") is None or len(data["time"]) == 0:
+            print("    ✗ No valid data after QC (all missing)")
+            return False
 
         # Get metadata from existing HYBAM file
         latitude = FILL_VALUE_FLOAT
@@ -707,22 +753,6 @@ class HYBAMProcessor:
 
         self.write_cf18_netcdf(station_id, station_name, river_name, latitude, longitude,
                               altitude, upstream_area, data, output_file)
-
-        # errors, warnings = check_nc_completeness(output_file, strict=True)
-
-        # if errors:
-        #     raise RuntimeError(
-        #         f"CF/ACDD completeness check failed for {output_file}:\n"
-        #         + "\n".join(errors)
-        #     )
-
-        # if warnings:
-        #     print(f"  ⚠ CF/ACDD warnings for {output_file.name}:")
-        #     for w in warnings:
-        #         print("    -", w)
-
-
-        # print(f"    ✓ Written: {output_file.name}")
 
         return {
             'station_id': station_id,
@@ -849,7 +879,67 @@ class HYBAMProcessor:
         # Generate CSV summary
         if successful_stations:
             csv_output = self.output_r_dir / 'HYBAM_station_summary.csv'
-            self.generate_csv_summary(successful_stations, csv_output)
+            generate_csv_summary_tool(successful_stations, csv_output)
+            # 2) 生成 QC 结果汇总 CSV
+            qc_rows = []
+            for s in successful_stations:
+                data = s.get("data", {})
+                row = {
+                    "station_name": s.get("station_name", ""),
+                    "Source_ID": s.get("station_id", ""),
+                    "river_name": s.get("river_name", ""),
+                    "longitude": s.get("longitude", ""),
+                    "latitude": s.get("latitude", ""),
+                    "QC_n_days": len(data.get("time", [])),
+                }
+
+                def _cnt(arr, v):
+                    a = np.asarray(arr) if arr is not None else np.asarray([])
+                    return int(np.sum(a == np.int8(v)))
+
+                # final counts
+                for var in ["Q", "SSC", "SSL"]:
+                    f = data.get(f"{var}_flag", None)
+                    row[f"{var}_final_good"] = _cnt(f, 0)
+                    row[f"{var}_final_estimated"] = _cnt(f, 1)
+                    row[f"{var}_final_suspect"] = _cnt(f, 2)
+                    row[f"{var}_final_bad"] = _cnt(f, 3)
+                    row[f"{var}_final_missing"] = _cnt(f, 9)
+
+                # step counts（按工具函数约定）
+                # qc1: 0 pass, 3 bad, 9 missing
+                for var in ["Q", "SSC", "SSL"]:
+                    f = data.get(f"{var}_flag_qc1_physical", None)
+                    row[f"{var}_qc1_pass"] = _cnt(f, 0)
+                    row[f"{var}_qc1_bad"] = _cnt(f, 3)
+                    row[f"{var}_qc1_missing"] = _cnt(f, 9)
+
+                # qc2: 0 pass, 2 suspect, 8 not_checked, 9 missing
+                for var in ["Q", "SSC", "SSL"]:
+                    f = data.get(f"{var}_flag_qc2_log_iqr", None)
+                    row[f"{var}_qc2_pass"] = _cnt(f, 0)
+                    row[f"{var}_qc2_suspect"] = _cnt(f, 2)
+                    row[f"{var}_qc2_not_checked"] = _cnt(f, 8)
+                    row[f"{var}_qc2_missing"] = _cnt(f, 9)
+
+                # qc3（SSC/SSL有）
+                f3 = data.get("SSC_flag_qc3_ssc_q", None)
+                row["SSC_qc3_pass"] = _cnt(f3, 0)
+                row["SSC_qc3_suspect"] = _cnt(f3, 2)
+                row["SSC_qc3_not_checked"] = _cnt(f3, 8)
+                row["SSC_qc3_missing"] = _cnt(f3, 9)
+
+                fssl3 = data.get("SSL_flag_qc3_from_ssc_q", None)
+                row["SSL_qc3_not_propagated"] = _cnt(fssl3, 0)
+                row["SSL_qc3_propagated"] = _cnt(fssl3, 2)
+                row["SSL_qc3_not_checked"] = _cnt(fssl3, 8)
+                row["SSL_qc3_missing"] = _cnt(fssl3, 9)
+
+                qc_rows.append(row)
+
+            qc_csv = self.output_r_dir / "HYBAM_qc_results.csv"
+            generate_qc_results_csv_tool(qc_rows, qc_csv)
+
 
         # Print summary
         print("\n" + "="*70)
