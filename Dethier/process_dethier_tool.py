@@ -37,6 +37,8 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
 )
 
 # =========================
@@ -208,9 +210,7 @@ def print_station_qc_summary(
     ssl_value, ssl_flag,
     created_nc_path
 ):
-    """
-    打印单站点 QC 结果（面向人类阅读）
-    """
+  
     print(f"\nProcessing: {station_name} ({station_id})")
     print(f"  Sample size = {n_samples}")
 
@@ -415,6 +415,37 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
     if qc is None:
         LOGGER.warning("No valid time remains after hydro QC for station %s, skip.", station_id)
         return None
+    # === align qc outputs back to df by time (robust) ===
+    qc_time_dt = pd.to_datetime(qc["time"], unit="D", origin="1970-01-01")
+    qc_time_dt = pd.DatetimeIndex(qc_time_dt)
+
+    # 先全表填 missing
+    df["Q_flag"]   = np.full(df.shape[0], FLAG_MISS, dtype=np.int8)
+    df["SSC_flag"] = np.full(df.shape[0], FLAG_MISS, dtype=np.int8)
+    df["SSL_flag"] = np.full(df.shape[0], FLAG_MISS, dtype=np.int8)
+
+    # ✅ final flags 回填（按时间对齐）
+    df.loc[qc_time_dt, "Q_flag"]   = qc["Q_flag"].astype(np.int8)
+    df.loc[qc_time_dt, "SSC_flag"] = qc["SSC_flag"].astype(np.int8)
+    df.loc[qc_time_dt, "SSL_flag"] = qc["SSL_flag"].astype(np.int8)
+
+    # ✅ step/provenance flags：先创建列(默认9)，再回填
+    step_cols = [
+        "Q_flag_qc1_physical",
+        "SSC_flag_qc1_physical",
+        "SSL_flag_qc1_physical",
+        "Q_flag_qc2_log_iqr",
+        "SSC_flag_qc2_log_iqr",
+        "SSL_flag_qc2_log_iqr",
+        "SSC_flag_qc3_ssc_q",
+        "SSL_flag_qc3_from_ssc_q",
+    ]
+    for c in step_cols:
+        df[c] = np.full(df.shape[0], FLAG_MISS, dtype=np.int8)
+
+    for c in step_cols:
+        if c in qc:
+            df.loc[qc_time_dt, c] = qc[c].astype(np.int8)
 
     df["Q_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
     df["SSC_flag"] = np.full(len(df), FLAG_MISS, dtype=np.int8)
@@ -461,10 +492,63 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     # ---- 构建最终 Dataset ----
     ds_out = xr.Dataset()
-
     ds_out = ds_out.assign_coords(time=("time", df_final.index))
     ds_out = ds_out.assign_coords(latitude=("latitude", [lat]))
     ds_out = ds_out.assign_coords(longitude=("longitude", [lon]))
+    # =========================
+    # Step / provenance flags
+    # =========================
+    def _add_step_flag(name, values, flag_values, flag_meanings, long_name):
+        ds_out[name] = ("time", np.asarray(values, dtype=np.int8))
+        ds_out[name].attrs.update({
+            "long_name": long_name,
+            "_FillValue": FILL_FLAG,
+            "flag_values": np.asarray(flag_values, dtype=np.int8),
+            "flag_meanings": flag_meanings,
+            "standard_name": "status_flag",
+        })
+
+    # QC1 physical: 0 pass, 3 bad, 9 missing
+    qc1_vals = [0, 3, 9]
+    qc1_mean = "pass bad missing"
+    # QC2 log-IQR: 0 pass, 2 suspect, 8 not_checked, 9 missing
+    qc2_vals = [0, 2, 8, 9]
+    qc2_mean = "pass suspect not_checked missing"
+    # QC3 SSC-Q: same as qc2
+    qc3_vals = [0, 2, 8, 9]
+    qc3_mean = "pass suspect not_checked missing"
+    # QC3 SSL propagation: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
+    ssl3_vals = [0, 2, 8, 9]
+    ssl3_mean = "not_propagated propagated not_checked missing"
+    # Q step flags
+    if "Q_flag_qc1_physical" in df_final.columns:
+        _add_step_flag("Q_flag_qc1_physical", df_final["Q_flag_qc1_physical"].values,
+                    qc1_vals, qc1_mean, "QC1 physical flag for river discharge")
+    if "Q_flag_qc2_log_iqr" in df_final.columns:
+        _add_step_flag("Q_flag_qc2_log_iqr", df_final["Q_flag_qc2_log_iqr"].values,
+                    qc2_vals, qc2_mean, "QC2 log-IQR flag for river discharge")
+
+    # SSC step flags
+    if "SSC_flag_qc1_physical" in df_final.columns:
+        _add_step_flag("SSC_flag_qc1_physical", df_final["SSC_flag_qc1_physical"].values,
+                    qc1_vals, qc1_mean, "QC1 physical flag for SSC")
+    if "SSC_flag_qc2_log_iqr" in df_final.columns:
+        _add_step_flag("SSC_flag_qc2_log_iqr", df_final["SSC_flag_qc2_log_iqr"].values,
+                    qc2_vals, qc2_mean, "QC2 log-IQR flag for SSC")
+    if "SSC_flag_qc3_ssc_q" in df_final.columns:
+        _add_step_flag("SSC_flag_qc3_ssc_q", df_final["SSC_flag_qc3_ssc_q"].values,
+                    qc3_vals, qc3_mean, "QC3 SSC-Q consistency flag for SSC")
+
+    # SSL step flags
+    if "SSL_flag_qc1_physical" in df_final.columns:
+        _add_step_flag("SSL_flag_qc1_physical", df_final["SSL_flag_qc1_physical"].values,
+                    qc1_vals, qc1_mean, "QC1 physical flag for SSL")
+    if "SSL_flag_qc2_log_iqr" in df_final.columns:
+        _add_step_flag("SSL_flag_qc2_log_iqr", df_final["SSL_flag_qc2_log_iqr"].values,
+                    qc2_vals, qc2_mean, "QC2 log-IQR flag for SSL")
+    if "SSL_flag_qc3_from_ssc_q" in df_final.columns:
+        _add_step_flag("SSL_flag_qc3_from_ssc_q", df_final["SSL_flag_qc3_from_ssc_q"].values,
+                    ssl3_vals, ssl3_mean, "QC3 SSL flag propagated from SSC-Q inconsistency")
 
     # Q / SSC / SSL
     for var_name, long_name, std_name, units, arr in [
@@ -545,7 +629,7 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
     })
 
 
-        # --------------------------------------------------
+    # --------------------------------------------------
     # Station-level SSC–Q diagnostic plot
     # --------------------------------------------------
     diag_dir = os.path.join(output_dir, "diagnostic")
@@ -618,6 +702,71 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
     summary.update(stats_ssc)
     summary.update(stats_ssl)
 
+    def _count(arr, mapping):
+        a = np.asarray(arr, dtype=np.int8)
+        return {k: int(np.sum(a == np.int8(v))) for k, v in mapping.items()}
+
+    # final flag counts
+    final_map = {
+        "good": 0, "estimated": 1, "suspect": 2, "bad": 3, "missing": 9
+    }
+
+    summary["QC_n_days"] = int(len(df_final))
+
+    cQ   = _count(df_final["Q_flag"].values, final_map)
+    cSSC = _count(df_final["SSC_flag"].values, final_map)
+    cSSL = _count(df_final["SSL_flag"].values, final_map)
+
+    summary.update({
+        "Q_final_good": cQ["good"], "Q_final_estimated": cQ["estimated"], "Q_final_suspect": cQ["suspect"],
+        "Q_final_bad": cQ["bad"], "Q_final_missing": cQ["missing"],
+
+        "SSC_final_good": cSSC["good"], "SSC_final_estimated": cSSC["estimated"], "SSC_final_suspect": cSSC["suspect"],
+        "SSC_final_bad": cSSC["bad"], "SSC_final_missing": cSSC["missing"],
+
+        "SSL_final_good": cSSL["good"], "SSL_final_estimated": cSSL["estimated"], "SSL_final_suspect": cSSL["suspect"],
+        "SSL_final_bad": cSSL["bad"], "SSL_final_missing": cSSL["missing"],
+    })
+
+    # QC1 physical
+    qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+    # QC2 / QC3
+    qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+    # SSL propagation
+    ssl3_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+    if "Q_flag_qc1_physical" in df_final:
+        c = _count(df_final["Q_flag_qc1_physical"].values, qc1_map)
+        summary.update({"Q_qc1_pass": c["pass"], "Q_qc1_bad": c["bad"], "Q_qc1_missing": c["missing"]})
+
+    if "SSC_flag_qc1_physical" in df_final:
+        c = _count(df_final["SSC_flag_qc1_physical"].values, qc1_map)
+        summary.update({"SSC_qc1_pass": c["pass"], "SSC_qc1_bad": c["bad"], "SSC_qc1_missing": c["missing"]})
+
+    if "SSL_flag_qc1_physical" in df_final:
+        c = _count(df_final["SSL_flag_qc1_physical"].values, qc1_map)
+        summary.update({"SSL_qc1_pass": c["pass"], "SSL_qc1_bad": c["bad"], "SSL_qc1_missing": c["missing"]})
+
+    if "Q_flag_qc2_log_iqr" in df_final:
+        c = _count(df_final["Q_flag_qc2_log_iqr"].values, qc2_map)
+        summary.update({"Q_qc2_pass": c["pass"], "Q_qc2_suspect": c["suspect"], "Q_qc2_not_checked": c["not_checked"], "Q_qc2_missing": c["missing"]})
+
+    if "SSC_flag_qc2_log_iqr" in df_final:
+        c = _count(df_final["SSC_flag_qc2_log_iqr"].values, qc2_map)
+        summary.update({"SSC_qc2_pass": c["pass"], "SSC_qc2_suspect": c["suspect"], "SSC_qc2_not_checked": c["not_checked"], "SSC_qc2_missing": c["missing"]})
+
+    if "SSL_flag_qc2_log_iqr" in df_final:
+        c = _count(df_final["SSL_flag_qc2_log_iqr"].values, qc2_map)
+        summary.update({"SSL_qc2_pass": c["pass"], "SSL_qc2_suspect": c["suspect"], "SSL_qc2_not_checked": c["not_checked"], "SSL_qc2_missing": c["missing"]})
+
+    if "SSC_flag_qc3_ssc_q" in df_final:
+        c = _count(df_final["SSC_flag_qc3_ssc_q"].values, qc2_map)
+        summary.update({"SSC_qc3_pass": c["pass"], "SSC_qc3_suspect": c["suspect"], "SSC_qc3_not_checked": c["not_checked"], "SSC_qc3_missing": c["missing"]})
+
+    if "SSL_flag_qc3_from_ssc_q" in df_final:
+        c = _count(df_final["SSL_flag_qc3_from_ssc_q"].values, ssl3_map)
+        summary.update({"SSL_qc3_not_propagated": c["not_propagated"], "SSL_qc3_propagated": c["propagated"], "SSL_qc3_not_checked": c["not_checked"], "SSL_qc3_missing": c["missing"]})
+
     return summary
 
 
@@ -661,14 +810,15 @@ def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv
 
     # 写 summary CSV
     if summaries:
-        df_summary = pd.DataFrame(summaries)
-        df_summary.to_csv(summary_csv_path, index=False)
+        generate_csv_summary_tool(summaries,summary_csv_path)
+        # 写 2) QC results CSV（同目录下另存一份）
+        qc_csv_path = os.path.join(output_dir, "Dethier_qc_results.csv")
+        generate_qc_results_csv_tool(summaries,qc_csv_path)
         LOGGER.info("Summary CSV saved to: %s", summary_csv_path)
     else:
         LOGGER.warning("No valid stations processed, summary CSV not created.")
 
     LOGGER.info("Processing finished. Success: %d, Skipped/Failed: %d", success, skipped)
-
 
 # =========================
 # main 入口
@@ -678,7 +828,7 @@ if __name__ == "__main__":
     PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 
     INPUT_NC_DIR = os.path.join(PROJECT_ROOT, "Source", "Dethier", "nc_convert")
-    OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "Output_r", "Dethier", "qc")
+    OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "Output_r", "monthly","Dethier", "qc")
     SUMMARY_CSV  = os.path.join(OUTPUT_DIR, "Dethier_station_summary.csv")
 
     process_dethier_data_from_nc(INPUT_NC_DIR, OUTPUT_DIR, SUMMARY_CSV)
