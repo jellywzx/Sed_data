@@ -38,6 +38,8 @@ from tool import (
     propagate_ssc_q_inconsistency_to_ssl,
     apply_quality_flag_array,        
     apply_hydro_qc_with_provenance, 
+    generate_station_summary_csv, 
+    generate_qc_results_csv,  
 )
 PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
 
@@ -170,12 +172,27 @@ def apply_station_level_qc(station_df):
         SSC_is_independent=False,
         ssl_is_derived_from_q_ssc=False,
     )
-
     if qc is None:
         return None
 
     # 4) 对齐长度
     station_df = station_df.loc[valid_time].copy()
+
+
+    # 额外保存 step flags 到 attrs，方便 main() 里统计 QC2/QC3
+    station_df.attrs["qc_steps"] = {
+        "Q_qc1":   qc["Q_flag_qc1_physical"].astype(np.int8),
+        "SSC_qc1": qc["SSC_flag_qc1_physical"].astype(np.int8),
+        "SSL_qc1": qc["SSL_flag_qc1_physical"].astype(np.int8),
+
+        "Q_qc2":   qc["Q_flag_qc2_log_iqr"].astype(np.int8),
+        "SSC_qc2": qc["SSC_flag_qc2_log_iqr"].astype(np.int8),
+        "SSL_qc2": qc["SSL_flag_qc2_log_iqr"].astype(np.int8),
+
+        "SSC_qc3": qc["SSC_flag_qc3_ssc_q"].astype(np.int8),
+        "SSL_qc3_prop": qc["SSL_flag_qc3_from_ssc_q"].astype(np.int8),
+    }
+
 
     # 5) 写回最终 flags（
     station_df["Q_flag"]   = qc["Q_flag"].astype("int8")
@@ -371,7 +388,8 @@ def generate_summary_csv(all_data, stations, output_dir):
 def main():
     """Main function to run the data processing workflow."""
     print("---"" Starting Chao Phraya River Data Processing ---")
-    
+    stations_info = []
+
     # Ensure output directory exists
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -487,12 +505,167 @@ def main():
                  continue
 
             create_netcdf_file(meta['station_id'], event, meta, station_data, OUTPUT_DIR)
+            
+            # -------------------------
+            # Build stations_info row for CSV summaries
+            # -------------------------
+            def _count_flags(arr, mapping):
+                arr = np.asarray(arr, dtype=np.int8)
+                return {k: int((arr == v).sum()) for k, v in mapping.items()}
+
+            # final flags
+            qf = station_data["Q_flag"].to_numpy(np.int8)
+            sf = station_data["SSC_flag"].to_numpy(np.int8)
+            lf = station_data["SSL_flag"].to_numpy(np.int8)
+
+            final_map = {
+                "good": 0, "estimated": 1, "suspect": 2, "bad": 3, "missing": 9
+            }
+            q_final = _count_flags(qf, final_map)
+            s_final = _count_flags(sf, final_map)
+            l_final = _count_flags(lf, final_map)
+
+            # step flags (qc1/qc2/qc3)
+            steps = station_data.attrs.get("qc_steps", {})
+            qc1_map = {"pass": 0, "bad": 3, "missing": 9}
+            qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+            qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
+            prop_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
+
+            Q_qc1 = _count_flags(steps.get("Q_qc1", np.array([], dtype=np.int8)), qc1_map)
+            S_qc1 = _count_flags(steps.get("SSC_qc1", np.array([], dtype=np.int8)), qc1_map)
+            L_qc1 = _count_flags(steps.get("SSL_qc1", np.array([], dtype=np.int8)), qc1_map)
+
+            Q_qc2 = _count_flags(steps.get("Q_qc2", np.array([], dtype=np.int8)), qc2_map)
+            S_qc2 = _count_flags(steps.get("SSC_qc2", np.array([], dtype=np.int8)), qc2_map)
+            L_qc2 = _count_flags(steps.get("SSL_qc2", np.array([], dtype=np.int8)), qc2_map)
+
+            S_qc3 = _count_flags(steps.get("SSC_qc3", np.array([], dtype=np.int8)), qc3_map)
+            L_qc3p = _count_flags(steps.get("SSL_qc3_prop", np.array([], dtype=np.int8)), prop_map)
+
+            # time span for summary
+            valid_any = station_data["Q"].notna() | station_data["SSC"].notna() | station_data["SSL"].notna()
+            if valid_any.any():
+                start_year = int(station_data.loc[valid_any, "year"].min())
+                end_year   = int(station_data.loc[valid_any, "year"].max())
+            else:
+                start_year, end_year = None, None
+
+            stations_info.append({
+                "station_name": meta["station_id"],
+                "Source_ID": meta["station_id"].replace(".", "_"),
+                "river_name": meta["river"],
+                "longitude": meta["lon"],
+                "latitude": meta["lat"],
+
+                # QC size
+                "QC_n_days": int(len(station_data)),
+
+                # final counts
+                "Q_final_good": q_final["good"],
+                "Q_final_estimated": q_final["estimated"],
+                "Q_final_suspect": q_final["suspect"],
+                "Q_final_bad": q_final["bad"],
+                "Q_final_missing": q_final["missing"],
+
+                "SSC_final_good": s_final["good"],
+                "SSC_final_estimated": s_final["estimated"],
+                "SSC_final_suspect": s_final["suspect"],
+                "SSC_final_bad": s_final["bad"],
+                "SSC_final_missing": s_final["missing"],
+
+                "SSL_final_good": l_final["good"],
+                "SSL_final_estimated": l_final["estimated"],
+                "SSL_final_suspect": l_final["suspect"],
+                "SSL_final_bad": l_final["bad"],
+                "SSL_final_missing": l_final["missing"],
+
+                # QC1
+                "Q_qc1_pass": Q_qc1.get("pass", 0),
+                "Q_qc1_bad": Q_qc1.get("bad", 0),
+                "Q_qc1_missing": Q_qc1.get("missing", 0),
+
+                "SSC_qc1_pass": S_qc1.get("pass", 0),
+                "SSC_qc1_bad": S_qc1.get("bad", 0),
+                "SSC_qc1_missing": S_qc1.get("missing", 0),
+
+                "SSL_qc1_pass": L_qc1.get("pass", 0),
+                "SSL_qc1_bad": L_qc1.get("bad", 0),
+                "SSL_qc1_missing": L_qc1.get("missing", 0),
+
+                # QC2
+                "Q_qc2_pass": Q_qc2.get("pass", 0),
+                "Q_qc2_suspect": Q_qc2.get("suspect", 0),
+                "Q_qc2_not_checked": Q_qc2.get("not_checked", 0),
+                "Q_qc2_missing": Q_qc2.get("missing", 0),
+
+                "SSC_qc2_pass": S_qc2.get("pass", 0),
+                "SSC_qc2_suspect": S_qc2.get("suspect", 0),
+                "SSC_qc2_not_checked": S_qc2.get("not_checked", 0),
+                "SSC_qc2_missing": S_qc2.get("missing", 0),
+
+                "SSL_qc2_pass": L_qc2.get("pass", 0),
+                "SSL_qc2_suspect": L_qc2.get("suspect", 0),
+                "SSL_qc2_not_checked": L_qc2.get("not_checked", 0),
+                "SSL_qc2_missing": L_qc2.get("missing", 0),
+
+                # QC3
+                "SSC_qc3_pass": S_qc3.get("pass", 0),
+                "SSC_qc3_suspect": S_qc3.get("suspect", 0),
+                "SSC_qc3_not_checked": S_qc3.get("not_checked", 0),
+                "SSC_qc3_missing": S_qc3.get("missing", 0),
+
+                "SSL_qc3_not_propagated": L_qc3p.get("not_propagated", 0),
+                "SSL_qc3_propagated": L_qc3p.get("propagated", 0),
+                "SSL_qc3_not_checked": L_qc3p.get("not_checked", 0),
+                "SSL_qc3_missing": L_qc3p.get("missing", 0),
+
+                # For generate_station_summary_csv (它需要这些键)
+                "source_id": meta["station_id"].replace(".", "_"),
+                "river_name": meta["river"],
+                "longitude": meta["lon"],
+                "latitude": meta["lat"],
+                "altitude": np.nan,
+                "upstream_area": np.nan,
+                "start_year": start_year,
+                "end_year": end_year,
+
+                # 这里用“代表性 flag”给 tool.py 的 station_summary（它是按单值 0/非0 写 100/0 的）
+                # 我们用“是否存在 good 数据”来定义
+                "Q_flag": np.int8(0) if q_final["good"] > 0 else np.int8(9),
+                "SSC_flag": np.int8(0) if s_final["good"] > 0 else np.int8(9),
+                "SSL_flag": np.int8(0) if l_final["good"] > 0 else np.int8(9),
+            })
+
+
         else:
             print(f"  Skipping {meta['station_id']}: No sediment data found.")
 
     # 6. Generate Summary CSV
     print("[6/6] Generating summary CSV...")
-    generate_summary_csv(df, stations, SUMMARY_DIR)
+    # generate_summary_csv(df, stations, SUMMARY_DIR)
+
+    # -------------------------
+    # Tool-based CSV outputs
+    # -------------------------
+    qc_csv = os.path.join(SUMMARY_DIR, f"{DATASET_NAME.replace(' ', '_')}_qc_results.csv")
+    generate_qc_results_csv(stations_info, qc_csv)
+
+    # 注意：tool.py 的 generate_station_summary_csv 目前写死了文件名
+    # 'ALi_De_Boer_station_summary.csv'，但我们仍按你的要求调用。
+    # 站点汇总（通用版）
+    generate_station_summary_csv(
+        stations_info,
+        SUMMARY_DIR,
+        raw_df=df,
+        stations=stations,
+        dataset_name=DATASET_NAME,
+        temporal_resolution="annually",
+        geographic_coverage="Chao Phraya Basin, Thailand",
+        reference_doi=SOURCE_LINK,
+        extra_columns=["QC_n_days", "n_warnings", "warnings"],
+        output_filename=f"{DATASET_NAME.replace(' ', '_')}_station_summary_combined.csv",
+    )
     
     print("---"" Processing Complete ---")
 

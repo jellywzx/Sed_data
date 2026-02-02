@@ -1345,65 +1345,385 @@ def generate_warning_summary_csv(stations_info, output_csv):
     df.to_csv(output_csv, index=False)
     print(f"✓ Warning summary CSV written: {output_csv} ({len(df)} stations)")
 
-def generate_station_summary_csv(station_data, output_dir):
-    """Generate a CSV summary file of station metadata and data completeness."""
+def generate_station_summary_csv(
+    stations_info,
+    output_dir,
+    *,
+    raw_df=None,
+    stations=None,
+    event_col="event",
+    year_col="year",
+    vars_cols=("Q", "SSC", "SSL"),
+    output_filename=None,
+    dataset_name=None,
+    data_type="In-situ station data",
+    temporal_resolution="daily",
+    geographic_coverage=None,
+    reference_doi=None,
+    extra_columns=None,
+    include_all_stations=True,
+    encoding="utf-8",
+):
+    """
+    Combined station summary CSV (Coverage + QC usability) - generic version.
+    This function REPLACES the old generate_station_summary_csv.
 
-    csv_file = os.path.join(output_dir, 'ALi_De_Boer_station_summary.csv')
+    What it outputs
+    ---------------
+    For each station, the CSV contains:
+    (A) Coverage/availability metrics (from raw_df, NaN-based):
+        - <var>_cov_start_date, <var>_cov_end_date, <var>_cov_percent_complete
+    (B) QC usability metrics (from stations_info, QC-based):
+        - <var>_percent_complete  (good fraction after QC; if final counts exist)
+        - <var>_final_* counts if present in stations_info
 
-    summary_data = []
-    for data in station_data:
-        # For climatology data, completeness is either 100% (good data) or 0% (not good)
-        Q_complete = 100.0 if data['Q_flag'] == 0 else 0.0
-        SSC_complete = 100.0 if data['SSC_flag'] == 0 else 0.0
-        SSL_complete = 100.0 if data['SSL_flag'] == 0 else 0.0
+    Parameters
+    ----------
+    stations_info : list[dict]
+        Per-station dicts (built in your process scripts). Can be empty if you
+        still want coverage-only output (when raw_df+stations provided).
+    output_dir : str
+        Output directory for CSV.
+    raw_df : pd.DataFrame or None
+        Raw per-record table (after cleaning/unit conversion), used to compute
+        coverage completeness like generate_summary_csv did.
+        Must include columns: event_col, year_col, and vars in vars_cols.
+    stations : dict or None
+        Station metadata mapping event_id -> {"station_id","lat","lon","river"}.
+        Same structure as parse_station_metadata() output in your process.py.
+    include_all_stations : bool
+        If True and raw_df+stations are provided, include stations even if they
+        are not present in stations_info (e.g., no sediment stations).
+    """
 
-        # Date formatting
-        Q_start = str(data['start_year']) if data['start_year'] else "N/A"
-        Q_end = str(data['end_year']) if data['end_year'] else "N/A"
+    import os
+    import pandas as pd
+    import numpy as np
 
-        # Temporal span
-        temporal_span = f"{Q_start}-{Q_end}" if Q_start != "N/A" and Q_end != "N/A" else "N/A"
+    os.makedirs(output_dir, exist_ok=True)
 
-        # Variables provided (based on data availability)
-        vars_provided = []
-        if Q_complete > 0:
-            vars_provided.append('Q')
-        if SSC_complete > 0:
-            vars_provided.append('SSC')
-        if SSL_complete > 0:
-            vars_provided.append('SSL')
-        vars_str = ', '.join(vars_provided) if vars_provided else "N/A"
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _get(d, keys, default=None):
+        for k in keys:
+            if k in d:
+                v = d.get(k)
+                if v is None:
+                    continue
+                if isinstance(v, str) and v.strip() == "":
+                    continue
+                return v
+        return default
 
-        summary_data.append({
-            'station_name': data['station_name'],
-            'Source_ID': data['source_id'],
-            'river_name': data['river_name'],
-            'longitude': f"{data['longitude']:.6f}" if not pd.isna(data['longitude']) else "N/A",
-            'latitude': f"{data['latitude']:.6f}" if not pd.isna(data['latitude']) else "N/A",
-            'altitude': f"{data['altitude']:.1f}" if not pd.isna(data['altitude']) else "N/A",
-            'upstream_area': f"{data['upstream_area']:.1f}" if not pd.isna(data['upstream_area']) else "N/A",
-            'Data Source Name': 'ALi_De_Boer Dataset',
-            'Type': 'In-situ',
-            'Temporal Resolution': 'climatology',
-            'Temporal Span': temporal_span,
-            'Variables Provided': vars_str,
-            'Geographic Coverage': 'Upper Indus River Basin, Northern Pakistan',
-            'Reference/DOI': 'https://doi.org/10.1016/j.jhydrol.2006.10.013',
-            'Q_start_date': Q_start,
-            'Q_end_date': Q_end,
-            'Q_percent_complete': f"{Q_complete:.1f}",
-            'SSC_start_date': Q_start,
-            'SSC_end_date': Q_end,
-            'SSC_percent_complete': f"{SSC_complete:.1f}",
-            'SSL_start_date': Q_start,
-            'SSL_end_date': Q_end,
-            'SSL_percent_complete': f"{SSL_complete:.1f}",
-        })
+    def _to_float(x):
+        try:
+            if x is None:
+                return np.nan
+            return float(x)
+        except Exception:
+            return np.nan
 
-    # Create DataFrame and save to CSV
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(csv_file, index=False, encoding='utf-8')
+    def _to_int(x):
+        try:
+            if x is None or (isinstance(x, str) and x.strip() == ""):
+                return None
+            return int(float(x))
+        except Exception:
+            return None
 
-    print(f"\nCreated station summary CSV: {csv_file}")
+    def _fmt_coord(x, nd=6):
+        v = _to_float(x)
+        if not np.isfinite(v):
+            return ""
+        return f"{v:.{nd}f}"
 
-    return csv_file
+    def _fmt_num(x, nd=1):
+        v = _to_float(x)
+        if not np.isfinite(v):
+            return ""
+        return f"{v:.{nd}f}"
+
+    def _calc_qc_good_percent(d, var_prefix):
+        """
+        QC percent complete = good / (good+estimated+suspect+bad+missing),
+        when final counts exist. Otherwise fallback:
+        - if <var>_percent_complete exists, use it
+        - else if <var>_flag exists: 0 -> 100, else -> 0
+        """
+        good = _to_int(_get(d, [f"{var_prefix}_final_good"]))
+        est  = _to_int(_get(d, [f"{var_prefix}_final_estimated"]))
+        sus  = _to_int(_get(d, [f"{var_prefix}_final_suspect"]))
+        bad  = _to_int(_get(d, [f"{var_prefix}_final_bad"]))
+        miss = _to_int(_get(d, [f"{var_prefix}_final_missing"]))
+
+        if good is not None and miss is not None:
+            total = sum([x for x in [good, est, sus, bad, miss] if x is not None])
+            if total > 0:
+                return 100.0 * good / total
+            return 0.0
+
+        direct = _get(d, [f"{var_prefix}_percent_complete", f"{var_prefix}_pct_complete"])
+        if direct is not None:
+            try:
+                return float(direct)
+            except Exception:
+                pass
+
+        flag = _get(d, [f"{var_prefix}_flag", f"{var_prefix.lower()}_flag"])
+        try:
+            return 100.0 if int(flag) == 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _infer_vars_provided(qp, sp, lp):
+        vars_ = []
+        if qp > 0:
+            vars_.append("Q")
+        if sp > 0:
+            vars_.append("SSC")
+        if lp > 0:
+            vars_.append("SSL")
+        return ", ".join(vars_) if vars_ else ""
+
+    # -------------------------
+    # 1) Build coverage table from raw_df + stations (like old generate_summary_csv)
+    # -------------------------
+    coverage_by_sourceid = {}
+    if raw_df is not None and stations is not None:
+        if not isinstance(raw_df, pd.DataFrame):
+            raise TypeError("raw_df must be a pandas DataFrame or None.")
+        for event_id, meta in stations.items():
+            sid = str(meta.get("station_id", "")).strip()
+            if sid == "":
+                continue
+            source_id = sid.replace(".", "_")
+
+            sub = raw_df[raw_df[event_col] == event_id]
+            if sub.empty:
+                continue
+
+            n_total = len(sub)
+
+            cov = {
+                "QC_n_days_raw": int(n_total),
+                "Temporal Span (raw)": "",
+            }
+
+            # overall span
+            try:
+                y_all = pd.to_numeric(sub[year_col], errors="coerce")
+                if np.isfinite(y_all).any():
+                    cov["Temporal Span (raw)"] = f"{int(np.nanmin(y_all))}-{int(np.nanmax(y_all))}"
+            except Exception:
+                pass
+
+            for v in vars_cols:
+                if v not in sub.columns:
+                    cov[f"{v}_cov_start_date"] = ""
+                    cov[f"{v}_cov_end_date"] = ""
+                    cov[f"{v}_cov_percent_complete"] = "0.0"
+                    continue
+
+                ser = sub[v]
+                valid = ser.dropna()
+                if valid.empty:
+                    cov[f"{v}_cov_start_date"] = ""
+                    cov[f"{v}_cov_end_date"] = ""
+                    cov[f"{v}_cov_percent_complete"] = "0.0"
+                else:
+                    idx = valid.index
+                    try:
+                        y = pd.to_numeric(sub.loc[idx, year_col], errors="coerce")
+                        cov[f"{v}_cov_start_date"] = int(np.nanmin(y)) if np.isfinite(y).any() else ""
+                        cov[f"{v}_cov_end_date"] = int(np.nanmax(y)) if np.isfinite(y).any() else ""
+                    except Exception:
+                        cov[f"{v}_cov_start_date"] = ""
+                        cov[f"{v}_cov_end_date"] = ""
+
+                    cov_pct = 100.0 * len(valid) / n_total if n_total > 0 else 0.0
+                    cov[f"{v}_cov_percent_complete"] = f"{cov_pct:.1f}"
+
+            # also store basic meta
+            cov.update({
+                "station_name": sid,
+                "Source_ID": source_id,
+                "river_name": meta.get("river", ""),
+                "longitude": meta.get("lon", np.nan),
+                "latitude": meta.get("lat", np.nan),
+            })
+
+            coverage_by_sourceid[source_id] = cov
+
+    # -------------------------
+    # 2) Build QC table from stations_info (like old station_summary_csv)
+    # -------------------------
+    qc_by_sourceid = {}
+    if stations_info:
+        for d in stations_info:
+            sid = _get(d, ["Source_ID", "source_id", "SourceID", "id"], "")
+            if sid == "":
+                # fallback: from station_name
+                name = _get(d, ["station_name", "station", "name"], "")
+                sid = str(name).replace(".", "_") if name else ""
+            if sid == "":
+                continue
+
+            qc_by_sourceid[sid] = d
+
+    # -------------------------
+    # 3) Merge keys: either from coverage-only, qc-only, or both
+    # -------------------------
+    all_source_ids = set()
+    all_source_ids.update(coverage_by_sourceid.keys())
+    all_source_ids.update(qc_by_sourceid.keys())
+
+    if not include_all_stations and stations_info:
+        # only output stations that appear in stations_info
+        all_source_ids = set(qc_by_sourceid.keys())
+
+    # If neither provided, nothing to do
+    if not all_source_ids:
+        print("  ⚠ generate_station_summary_csv: no stations to write.")
+        return ""
+
+    rows = []
+    for source_id in sorted(all_source_ids):
+        cov = coverage_by_sourceid.get(source_id, {})
+        qc  = qc_by_sourceid.get(source_id, {})
+
+        station_name = _get(qc, ["station_name", "station", "name"], _get(cov, ["station_name"], ""))
+        river_name   = _get(qc, ["river_name", "river"], _get(cov, ["river_name"], ""))
+
+        lon = _get(qc, ["longitude", "lon"], _get(cov, ["longitude"], np.nan))
+        lat = _get(qc, ["latitude", "lat"], _get(cov, ["latitude"], np.nan))
+        alt = _get(qc, ["altitude", "elevation", "alt"], np.nan)
+        area = _get(qc, ["upstream_area", "drainage_area", "area_km2"], np.nan)
+
+        # QC-based completeness (% good after QC)
+        q_qc_pct   = _calc_qc_good_percent(qc, "Q")
+        ssc_qc_pct = _calc_qc_good_percent(qc, "SSC")
+        ssl_qc_pct = _calc_qc_good_percent(qc, "SSL")
+
+        # Variables provided: prefer explicit -> else infer from QC pct (or coverage if QC missing)
+        vars_col = _get(qc, ["Variables Provided", "variables_provided"], "")
+        if not vars_col:
+            # if QC data absent, infer from coverage pct
+            q_cov_pct = float(_get(cov, ["Q_cov_percent_complete"], "0.0") or "0.0")
+            s_cov_pct = float(_get(cov, ["SSC_cov_percent_complete"], "0.0") or "0.0")
+            l_cov_pct = float(_get(cov, ["SSL_cov_percent_complete"], "0.0") or "0.0")
+            base_q = q_qc_pct if qc else q_cov_pct
+            base_s = ssc_qc_pct if qc else s_cov_pct
+            base_l = ssl_qc_pct if qc else l_cov_pct
+            vars_col = _infer_vars_provided(base_q, base_s, base_l)
+
+        # Temporal span: prefer raw coverage span -> else from qc start/end
+        temporal_span = _get(cov, ["Temporal Span (raw)"], "")
+        if not temporal_span:
+            start_year = _get(qc, ["start_year", "Q_start_date"], "")
+            end_year   = _get(qc, ["end_year", "Q_end_date"], "")
+            if str(start_year) != "" and str(end_year) != "":
+                temporal_span = f"{start_year}-{end_year}"
+            else:
+                temporal_span = _get(qc, ["Temporal Span", "temporal_span"], "")
+
+        geo_cov = geographic_coverage if geographic_coverage is not None else _get(
+            qc, ["Geographic Coverage", "geographic_coverage"], ""
+        )
+        ref = reference_doi if reference_doi is not None else _get(
+            qc, ["Reference/DOI", "reference", "doi", "source_data_link"], ""
+        )
+        ds_name = dataset_name if dataset_name is not None else _get(
+            qc, ["Data Source Name", "data_source_name"], ""
+        )
+
+        row = {
+            "station_name": station_name,
+            "Source_ID": source_id,
+            "river_name": river_name,
+            "longitude": _fmt_coord(lon),
+            "latitude": _fmt_coord(lat),
+            "altitude": _fmt_num(alt, nd=1),
+            "upstream_area": _fmt_num(area, nd=1),
+
+            "Data Source Name": ds_name,
+            "Type": data_type,
+            "Temporal Resolution": temporal_resolution,
+            "Temporal Span": temporal_span,
+            "Variables Provided": vars_col,
+            "Geographic Coverage": geo_cov,
+            "Reference/DOI": ref,
+
+            # --- QC usability (good %) ---
+            "Q_percent_complete": f"{q_qc_pct:.1f}",
+            "SSC_percent_complete": f"{ssc_qc_pct:.1f}",
+            "SSL_percent_complete": f"{ssl_qc_pct:.1f}",
+        }
+
+        # --- Coverage (raw non-NaN %) ---
+        for v in vars_cols:
+            row[f"{v}_cov_start_date"] = _get(cov, [f"{v}_cov_start_date"], "")
+            row[f"{v}_cov_end_date"] = _get(cov, [f"{v}_cov_end_date"], "")
+            row[f"{v}_cov_percent_complete"] = _get(cov, [f"{v}_cov_percent_complete"], "0.0")
+
+        # Optional: keep QC final counts if present (very useful)
+        for v in vars_cols:
+            for k in ("good", "estimated", "suspect", "bad", "missing"):
+                kk = f"{v}_final_{k}"
+                if kk in qc:
+                    row[kk] = qc.get(kk)
+
+        # Optional: include QC_n_days if present (from qc dict)
+        if "QC_n_days" in qc:
+            row["QC_n_days"] = qc.get("QC_n_days")
+        if "QC_n_days_raw" in cov:
+            row["Raw_n_records"] = cov.get("QC_n_days_raw")
+
+        # Extra columns passthrough
+        if extra_columns:
+            for c in extra_columns:
+                if c not in row:
+                    val = _get(qc, [c], None)
+                    if val is None:
+                        val = _get(cov, [c], None)
+                    if val is not None:
+                        row[c] = val
+
+        rows.append(row)
+
+    df_out = pd.DataFrame(rows)
+
+    # Column order: core -> QC -> coverage -> extras
+    base_cols = [
+        "station_name", "Source_ID", "river_name", "longitude", "latitude",
+        "altitude", "upstream_area",
+        "Data Source Name", "Type", "Temporal Resolution", "Temporal Span",
+        "Variables Provided", "Geographic Coverage", "Reference/DOI",
+        "Q_percent_complete", "SSC_percent_complete", "SSL_percent_complete",
+    ]
+    cov_cols = []
+    for v in vars_cols:
+        cov_cols += [f"{v}_cov_start_date", f"{v}_cov_end_date", f"{v}_cov_percent_complete"]
+    qc_count_cols = []
+    for v in vars_cols:
+        qc_count_cols += [f"{v}_final_good", f"{v}_final_estimated", f"{v}_final_suspect", f"{v}_final_bad", f"{v}_final_missing"]
+
+    front = [c for c in base_cols if c in df_out.columns]
+    mid = [c for c in qc_count_cols if c in df_out.columns] + [c for c in ("QC_n_days", "Raw_n_records") if c in df_out.columns]
+    back = [c for c in cov_cols if c in df_out.columns]
+    remaining = [c for c in df_out.columns if c not in (front + mid + back)]
+
+    df_out = df_out[front + mid + back + remaining]
+
+    # Output filename
+    if output_filename is None:
+        base = "station_summary_combined.csv"
+        if dataset_name and isinstance(dataset_name, str) and dataset_name.strip():
+            base = f"{dataset_name.replace(' ', '_')}_station_summary_combined.csv"
+        output_filename = base
+
+    out_csv = os.path.join(output_dir, output_filename)
+    df_out.to_csv(out_csv, index=False, encoding=encoding)
+
+    print(f"  ✓ Combined station summary CSV written: {out_csv} ({len(df_out)} stations)")
+    return out_csv
