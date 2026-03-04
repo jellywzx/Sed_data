@@ -37,6 +37,8 @@ from tool import (
     plot_ssc_q_diagnostic,
     convert_ssl_units_if_needed,
     propagate_ssc_q_inconsistency_to_ssl,
+    generate_station_summary_csv,   # ✅ add
+    generate_qc_results_csv,        # ✅ add
 )
 
 

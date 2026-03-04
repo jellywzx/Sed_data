@@ -651,8 +651,6 @@ def main():
     qc_csv = os.path.join(SUMMARY_DIR, f"{DATASET_NAME.replace(' ', '_')}_qc_results.csv")
     generate_qc_results_csv(stations_info, qc_csv)
 
-    # 注意：tool.py 的 generate_station_summary_csv 目前写死了文件名
-    # 'ALi_De_Boer_station_summary.csv'，但我们仍按你的要求调用。
     # 站点汇总（通用版）
     generate_station_summary_csv(
         stations_info,
