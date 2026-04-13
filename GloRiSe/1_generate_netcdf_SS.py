@@ -14,9 +14,18 @@ import os
 from pathlib import Path
 import bibtexparser
 import re
+import sys
+
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import ensure_directory, resolve_source_root
+from validation import require_existing_file
 
 # File paths
-BASE_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe')
+BASE_DIR = resolve_source_root(start=__file__) / 'GloRiSe'
 REF_FILE = BASE_DIR / 'SedimentDatabase_ref.xlsx'
 LOC_FILE = BASE_DIR / 'SedimentDatabase_Locations.xlsx'
 ID_FILE = BASE_DIR / 'SedimentDatabase_ID.xlsx'
@@ -24,8 +33,7 @@ ME_FILE = BASE_DIR / 'SedimentDatabase_ME_Nut.xlsx'
 BIB_FILE = BASE_DIR / 'References_RiSe.bib'
 
 # Output directory
-OUTPUT_DIR = BASE_DIR / 'netcdf_output_SS'
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR = ensure_directory(BASE_DIR / 'netcdf_output_SS')
 
 def clean_latex_text(text):
     """
@@ -325,6 +333,9 @@ def create_netcdf_for_station(location_id, station_data, location_info, citation
 def main():
     """Main processing function."""
     print("Loading data files...")
+
+    for path in (REF_FILE, LOC_FILE, ID_FILE, ME_FILE, BIB_FILE):
+        require_existing_file(path, description=f"GloRiSe source file {path.name}")
 
     # Load BibTeX references
     print("Loading BibTeX references...")

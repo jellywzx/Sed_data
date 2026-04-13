@@ -15,6 +15,15 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 import sys
+from pathlib import Path
+
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import ensure_directory, resolve_source_root
+from validation import require_existing_directory
 
 
 def create_output_directory(output_dir):
@@ -378,8 +387,12 @@ def main():
     print("="*70)
 
     # Set up paths
-    base_dir = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/evandethier_2022_global_sediment_flux_required_sediment_files"
-    output_dir = "/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/Milliman/netcdf_output"
+    source_root = resolve_source_root(start=__file__)
+    base_dir = require_existing_directory(
+        source_root / "Milliman" / "evandethier_2022_global_sediment_flux_required_sediment_files",
+        description="Milliman raw source directory",
+    )
+    output_dir = ensure_directory(source_root / "Milliman" / "netcdf_output")
 
     # Create output directory
     create_output_directory(output_dir)

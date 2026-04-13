@@ -27,6 +27,11 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
+CODE_DIR = os.path.join(PARENT_DIR, 'code')
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+from runtime import ensure_directory, resolve_output_root, resolve_source_root
+from validation import require_existing_directory
 from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
@@ -41,9 +46,10 @@ from tool import (
 )
 
 # Configuration
-INPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/GloRiSe/netcdf_output_SS/')
-OUTPUT_DIR = Path('/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/GloRiSe/SS/qc/')
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_DIR = resolve_source_root(start=__file__) / 'GloRiSe' / 'netcdf_output_SS'
+OUTPUT_DIR = ensure_directory(
+    resolve_output_root(start=__file__) / 'daily' / 'GloRiSe' / 'SS' / 'qc'
+)
 
 # Original data source information
 DATA_SOURCE = {
@@ -533,6 +539,7 @@ def main():
     print("="*80)
     print(f"\nInput directory:  {INPUT_DIR}")
     print(f"Output directory: {OUTPUT_DIR}")
+    require_existing_directory(INPUT_DIR, description="GloRiSe SS intermediate NetCDF directory")
 
     # Get all GloRiSe NetCDF files
     input_files = sorted(INPUT_DIR.glob('GloRiSe_*.nc'))

@@ -17,12 +17,21 @@ import numpy as np
 import netCDF4 as nc
 from datetime import datetime
 from pathlib import Path
+import sys
+
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import ensure_directory, resolve_output_root, resolve_source_root
+from validation import require_existing_file
 
 # =======================
 # User config
 # =======================
-INPUT_FILE = "/mnt/d/sediment_wzx_1111/Source/Yajiang/data_en.xlsx"
-OUTPUT_DIR = "/mnt/d/sediment_wzx_1111/Output_r/daily/Yajiang/nc"
+INPUT_FILE = resolve_source_root(start=__file__) / "Yajiang" / "data_en.xlsx"
+OUTPUT_DIR = resolve_output_root(start=__file__) / "daily" / "Yajiang" / "nc"
 
 # If False: only keep SSC + Discharge (recommended for your purpose)
 # If True : also save T/EC/TDS/pH/DO/NTU into nc
@@ -182,12 +191,9 @@ def create_one_nc(row, out_path: Path):
         ds.close()
 
 def main():
-    out_dir = Path(OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_directory(OUTPUT_DIR)
 
-    in_path = Path(INPUT_FILE)
-    if not in_path.exists():
-        raise FileNotFoundError(f"Input file not found: {in_path.resolve()}")
+    in_path = require_existing_file(INPUT_FILE, description="Yajiang source table")
 
     # Read table
     if in_path.suffix.lower() in [".xlsx", ".xls"]:

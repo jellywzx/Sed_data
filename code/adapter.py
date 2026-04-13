@@ -10,34 +10,32 @@ Responsibilities:
 This module MUST NOT implement any generic algorithms.
 """
 
-import pandas as pd
+import sys, os
 import numpy as np
+import pandas as pd
 
-# ---------- core imports (single source of truth) ----------
-from core.parsing import (
-    parse_dms_to_decimal,
-    parse_period,
-)
+sys.path.insert(0, os.path.dirname(__file__))   # 确保能找到 code/ 同级模块
 
-from core.calculation import (
-    calculate_discharge,
-    calculate_ssl_from_mt_yr,
-    calculate_ssc,
-)
+from geo import parse_dms_to_decimal
+from time_utils import parse_period, climatology_time
+from units import calculate_discharge, calculate_ssl_from_mt_yr, calculate_ssc
+from qc import compute_log_iqr_bounds, apply_ssl_log_iqr_flag
+from constants import FILL_VALUE_INT
+from validation import read_excel_validated
 
-from core.time import (
-    climatology_midpoint_days_since_1970,
-)
 
-from core.qc import (
-    compute_log_iqr_bounds,
-    flag_log_iqr_outlier,
-)
-
-from core.constants import (
-    FILL_FLOAT,
-    FILL_INT,
-)
+REQUIRED_COLUMNS = [
+    "Station",
+    "River",
+    "Latitude",
+    "Longitude",
+    "Period of record",
+    "Elevation (masl)",
+    "Drainage area (km2)",
+    "Runoff (mm)",
+    "Sediment（(Mt yr−1)）",
+    "Sediment（t km−2 yr−1）",
+]
 
 
 # ==========================================================
@@ -54,7 +52,12 @@ def load_and_process(source_file):
     # ------------------------------------------------------
     # 1. Read source file
     # ------------------------------------------------------
-    df = pd.read_excel(source_file, sheet_name="Sheet2")
+    df = read_excel_validated(
+        source_file,
+        sheet_name="Sheet2",
+        required_columns=REQUIRED_COLUMNS,
+        description="ALi_De_Boer source workbook",
+    )
 
     # ------------------------------------------------------
     # 2. Compute dataset-level SSL log-IQR bounds
@@ -77,9 +80,7 @@ def load_and_process(source_file):
 
         # ---------- temporal coverage ----------
         start_year, end_year = parse_period(row["Period of record"])
-        days_since_1970 = climatology_midpoint_days_since_1970(
-            start_year, end_year
-        )
+        days_since_1970 = climatology_time(start_year, end_year)
 
         # ---------- station properties ----------
         elevation = row["Elevation (masl)"]
@@ -96,17 +97,13 @@ def load_and_process(source_file):
         SSC = calculate_ssc(SSL, Q)
 
         # ---------- flags (default logic in core) ----------
-        Q_flag = 0 if np.isfinite(Q) else FILL_INT
-        SSC_flag = 0 if np.isfinite(SSC) else FILL_INT
-        SSL_flag = 0 if np.isfinite(SSL) else FILL_INT
+        Q_flag   = 0 if np.isfinite(Q)   else FILL_VALUE_INT
+        SSC_flag = 0 if np.isfinite(SSC) else FILL_VALUE_INT
+        SSL_flag = 0 if np.isfinite(SSL) else FILL_VALUE_INT
 
         # ---------- dataset-specific QC rule ----------
         # ONLY SSL participates in log-IQR screening
-        SSL_flag = flag_log_iqr_outlier(
-            value=sediment_mt_yr,
-            bounds=ssl_bounds,
-            default_flag=SSL_flag,
-        )
+        SSL_flag = apply_ssl_log_iqr_flag(sediment_mt_yr, ssl_bounds, SSL_flag)
 
         # ---------- assemble record ----------
         records.append(

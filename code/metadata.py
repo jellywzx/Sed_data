@@ -215,8 +215,8 @@ def build_metadata(
                 "ancillary_variables": "SSC_flag",
                 "comment": (
                     "Source: Calculated. Formula: SSC (mg/L) = SSL (ton/day) / "
-                    "(Q (m³/s) × 86.4), where 86.4 = 86400 s/day × "
-                    "1000 L/m³ × 10⁻⁶ ton/mg. "
+                    "(Q (m³/s) × 0.0864), where 0.0864 = 86400 s/day × "
+                    "1000 L/m³ ÷ 10⁹ mg/ton. "
                     "Represents mean annual value over the period of record."
                 ),
             },
@@ -376,4 +376,3 @@ def build_metadata(
         global_attrs["temporal_span"] = f"{start_year}-{end_year}"
 
     return dimensions, variables, global_attrs
-

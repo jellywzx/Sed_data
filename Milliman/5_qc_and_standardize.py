@@ -31,6 +31,11 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
+CODE_DIR = os.path.join(PARENT_DIR, 'code')
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+from runtime import ensure_directory, resolve_output_root, resolve_source_root
+from validation import require_existing_directory
 from tool import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
@@ -395,9 +400,13 @@ def main():
     print()
 
     # Paths
-    BASE_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..")) 
-    input_dir = os.path.join(BASE_DIR, "Source", "Milliman", "netcdf_output")
-    output_dir = os.path.join(BASE_DIR, "Output_r", "annually_climatology", "Milliman", "qc")
+    input_dir = require_existing_directory(
+        resolve_source_root(start=__file__) / "Milliman" / "netcdf_output",
+        description="Milliman intermediate NetCDF directory",
+    )
+    output_dir = ensure_directory(
+        resolve_output_root(start=__file__) / "annually_climatology" / "Milliman" / "qc"
+    )
  
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

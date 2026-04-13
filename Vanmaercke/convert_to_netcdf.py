@@ -11,10 +11,19 @@ from datetime import datetime, timedelta
 import os
 import re
 from pathlib import Path
+import sys
 
-# --- Absolute paths (WSL format) ---
-SOURCE_DIR = '/mnt/d/sediment_wzx_1111/Source/Vanmaercke'
-OUTPUT_DIR = '/mnt/d/sediment_wzx_1111/Output_r/annually_climatology/Vanmaercke/nc'
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import ensure_directory, resolve_output_root, resolve_source_root
+from validation import read_excel_validated, require_existing_file
+
+SOURCE_DIR = resolve_source_root(start=__file__) / 'Vanmaercke'
+OUTPUT_DIR = resolve_output_root(start=__file__) / 'annually_climatology' / 'Vanmaercke' / 'nc'
+REQUIRED_COLUMNS = ['ID', 'MP', 'Lat (°)', 'Lon (°)', 'A (km²)', 'SY\n(t/km²/y)']
 
 def parse_measurement_period(mp_str):
     """
@@ -235,13 +244,21 @@ def main():
     print("="*60)
 
     # Create output directory
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_directory(OUTPUT_DIR)
 
     # Read Excel file
-    source_file = Path(SOURCE_DIR) / 'sediment.xlsx'
+    source_file = require_existing_file(
+        Path(SOURCE_DIR) / 'sediment.xlsx',
+        description='Vanmaercke source workbook',
+    )
     print(f"\nReading {source_file}...")
-    df = pd.read_excel(source_file, sheet_name='Table 1', skiprows=17)
+    df = read_excel_validated(
+        source_file,
+        sheet_name='Table 1',
+        skiprows=17,
+        required_columns=REQUIRED_COLUMNS,
+        description='Vanmaercke source workbook',
+    )
 
     print(f"Total stations in dataset: {len(df)}")
 

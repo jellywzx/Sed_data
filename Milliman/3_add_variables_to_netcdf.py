@@ -17,6 +17,16 @@ import numpy as np
 import glob
 import os
 from datetime import datetime
+from pathlib import Path
+import sys
+
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import resolve_source_root
+from validation import require_existing_directory
 
 
 def add_variables_to_file(filepath):
@@ -144,7 +154,10 @@ def main():
     print("="*70)
 
     # 设置路径
-    netcdf_dir = "/Users/zhongwangwei/Downloads/7808492/netcdf_output"
+    netcdf_dir = require_existing_directory(
+        resolve_source_root(start=__file__) / "Milliman" / "netcdf_output",
+        description="Milliman intermediate NetCDF directory",
+    )
 
     # 查找所有 Milliman 文件
     milliman_files = glob.glob(os.path.join(netcdf_dir, "Milliman_*.nc"))

@@ -16,6 +16,15 @@ from datetime import datetime, timedelta
 import xlrd
 import os
 import sys
+from pathlib import Path
+
+CURRENT_DIR = Path(__file__).resolve().parent
+SCRIPT_ROOT = CURRENT_DIR.parent
+CODE_DIR = SCRIPT_ROOT / 'code'
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from runtime import ensure_directory, resolve_source_root
+from validation import require_existing_file
 
 def load_station_coordinates(coord_file):
     """Load station coordinates from the national hydrological stations file."""
@@ -337,9 +346,16 @@ def main():
     """Main conversion function."""
 
     # File paths
-    excel_file = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/黄河流域泥沙观测数据.xlsx'
-    coord_file = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/全国河流水文站坐标.xls'
-    output_dir = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/HuangHe/netcdf/'
+    source_dir = resolve_source_root(start=__file__) / 'HuangHe'
+    excel_file = require_existing_file(
+        source_dir / '黄河流域泥沙观测数据.xlsx',
+        description='Huanghe sediment workbook',
+    )
+    coord_file = require_existing_file(
+        source_dir / '全国河流水文站坐标.xls',
+        description='Huanghe station coordinate workbook',
+    )
+    output_dir = ensure_directory(source_dir / 'netcdf')
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
