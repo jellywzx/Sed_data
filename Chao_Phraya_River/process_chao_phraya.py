@@ -26,29 +26,28 @@ import sys
 import xarray as xr
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.output import generate_qc_results_csv, generate_station_summary_csv
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag_array,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,        
-    apply_hydro_qc_with_provenance, 
-    generate_station_summary_csv, 
-    generate_qc_results_csv,  
 )
-PROJECT_ROOT = os.path.abspath(os.path.join(PARENT_DIR, '..'))
+from code.runtime import resolve_output_root, resolve_source_root
 
-SOURCE_DATA_PATH = os.path.join(
-    PROJECT_ROOT, "Source", "Chao_Phraya_River", "Chao_Phraya_River.tab"
+SOURCE_DATA_PATH = os.fspath(
+    resolve_source_root(start=__file__) / "Chao_Phraya_River" / "Chao_Phraya_River.tab"
 )
 
-OUTPUT_DIR = os.path.join(
-    PROJECT_ROOT, "Output_r", "annually_climatology", "Chao_Phraya_River", "qc"
+OUTPUT_DIR = os.fspath(
+    resolve_output_root(start=__file__) / "annually_climatology" / "Chao_Phraya_River" / "qc"
 )
 
 SUMMARY_DIR = OUTPUT_DIR

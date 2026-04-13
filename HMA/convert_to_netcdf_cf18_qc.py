@@ -17,21 +17,20 @@ import os
 import re
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    calculate_discharge,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    # convert_ssl_units_if_needed,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
 )
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import calculate_discharge
 
 def parse_period(period_str):
     """
@@ -698,22 +697,10 @@ def generate_station_summary_csv(summaries, output_dir):
 
 # Main processing
 if __name__ == '__main__':
-    # Paths
-    # Paths (relative-style: derive from project root)
-    def _find_project_root(start_dir, marker="sediment_wzx_1111"):
-        d = os.path.abspath(start_dir)
-        while True:
-            if os.path.basename(d) == marker:
-                return d
-            parent = os.path.dirname(d)
-            if parent == d:
-                return None
-            d = parent
-
-    PROJECT_ROOT = _find_project_root(CURRENT_DIR) or os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-
-    source_csv = os.path.join(PROJECT_ROOT, "Source", "HMA", "HMA_catchments.csv")
-    output_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "HMA", "qc")
+    source_csv = os.fspath(resolve_source_root(start=__file__) / "HMA" / "HMA_catchments.csv")
+    output_dir = os.fspath(
+        resolve_output_root(start=__file__, create=True) / "annually_climatology" / "HMA" / "qc"
+    )
 
 
     # Create output directory

@@ -28,25 +28,21 @@ import os
 import glob
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-CODE_DIR = os.path.join(PARENT_DIR, 'code')
-if CODE_DIR not in sys.path:
-    sys.path.insert(0, CODE_DIR)
-from runtime import ensure_directory, resolve_output_root, resolve_source_root
-from validation import require_existing_directory
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
 )
+from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
+from code.validation import require_existing_directory
 
 
 

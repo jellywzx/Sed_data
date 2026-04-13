@@ -8,27 +8,27 @@ import os
 import sys
 import inspect
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    apply_quality_flag_array,
-    apply_hydro_qc_with_provenance,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
-    compute_log_iqr_bounds,
+)
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
-    # check_nc_completeness,
-    # add_global_attributes
 )
+from code.runtime import ensure_directory, resolve_output_root
+from code.units import convert_ssl_units_if_needed
+from code.validation import require_existing_directory
 
 
 def apply_tool_qc_yajiang(df, station_id, diagnostic_dir=None, station_name=None):
@@ -271,11 +271,12 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
 
     return row
 def process_yajiang():
-    PROJECT_ROOT = Path(CURRENT_DIR).resolve().parent.parent
-
-    input_dir = PROJECT_ROOT / "Output_r" / "daily" / "Yajiang" / "nc"
-    output_dir = PROJECT_ROOT / "Output_r" / "daily" / "Yajiang" / "qc"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = resolve_output_root(start=__file__, create=True)
+    input_dir = require_existing_directory(
+        output_root / "daily" / "Yajiang" / "nc",
+        description="Yajiang intermediate NetCDF directory",
+    )
+    output_dir = ensure_directory(output_root / "daily" / "Yajiang" / "qc")
 
     all_station_summary_data = []
     qc_rows = []

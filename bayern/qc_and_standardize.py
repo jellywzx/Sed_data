@@ -23,31 +23,31 @@ import os
 import sys
 # Add parent directory to PYTHONPATH
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
 from datetime import datetime
 import glob
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    calculate_ssc,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,        
-    apply_hydro_qc_with_provenance, 
-    # summarize_warning_types as summarize_warning_types_tool,
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
-    # generate_warning_summary_csv as generate_warning_summary_csv_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import calculate_ssc
 
 def fmt_float(x, nd=2):
     try:
@@ -695,10 +695,10 @@ def main():
     print()
 
     # Paths
-    project_root = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-
-    input_dir = os.path.join(project_root, "Source", "bayern", "done")
-    output_dir = os.path.join(project_root, "Output_r", "daily", "Bayern", "qc")
+    input_dir = os.fspath(resolve_source_root(start=__file__) / "bayern" / "done")
+    output_dir = os.fspath(
+        resolve_output_root(start=__file__) / "daily" / "Bayern" / "qc"
+    )
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

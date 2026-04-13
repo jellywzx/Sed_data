@@ -4,10 +4,11 @@ import matplotlib.pyplot as plt
 import os
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import compute_log_iqr_bounds
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.qc import compute_log_iqr_bounds
+from code.runtime import resolve_output_root
 
 def plot_iqr_distribution(nc_file, var='SSC', outdir='./figs'):
     ds = nc.Dataset(nc_file)
@@ -58,6 +59,5 @@ def plot_iqr_distribution(nc_file, var='SSC', outdir='./figs'):
     print(f'Saved: {outpng}')
 
 if __name__ == '__main__':
-    nc_file = '/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Output_r/daily/Bayern/qc/Bayern_10026293.nc'  # replace with your netCDF file
+    nc_file = resolve_output_root(start=__file__) / 'daily' / 'Bayern' / 'qc' / 'Bayern_10026293.nc'
     plot_iqr_distribution(nc_file, var='SSC', outdir='./figs')
-

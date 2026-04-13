@@ -9,26 +9,28 @@ import os
 import inspect
 from concurrent.futures import ProcessPoolExecutor
 import logging
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-REPO_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-from tool import (
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from code.constants import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,
-    apply_hydro_qc_with_provenance,
+)
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_quality_flag,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    apply_quality_flag_array,
+    apply_hydro_qc_with_provenance,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
 # --------------------------
 # Unit conversion constants
@@ -464,9 +466,11 @@ def process_usgs(num_workers=None):
     """
     # --------------------------
     # Paths
-    source_dir = Path(REPO_ROOT) / "Source" / "USGS" / "usgs_data_by_station"
-    output_dir = Path(REPO_ROOT) / "Output_r" / "daily" / "USGS" / "qc"
-    metadata_file = Path(REPO_ROOT) / "Source" / "USGS" / "common_sites_info.xlsx"
+    source_root = resolve_source_root(__file__)
+    output_root = resolve_output_root(__file__, create=True)
+    source_dir = source_root / "USGS" / "usgs_data_by_station"
+    output_dir = output_root / "daily" / "USGS" / "qc"
+    metadata_file = source_root / "USGS" / "common_sites_info.xlsx"
     log_file = output_dir / "processing_log.txt"
     output_dir.mkdir(parents=True, exist_ok=True)
 

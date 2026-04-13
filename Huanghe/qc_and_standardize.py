@@ -21,20 +21,21 @@ import os
 import glob
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
 )
+from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
+from code.validation import require_existing_directory
 
 def standardize_netcdf_file(input_file, output_dir):
     
@@ -420,16 +421,19 @@ def main():
     print()
 
     # Paths
-    script_dir = os.path.dirname(os.path.abspath(__file__)) 
-    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    input_dir = os.path.join(project_root, "Source", "HuangHe", "netcdf")
-    output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "Huanghe")
+    input_dir = require_existing_directory(
+        resolve_source_root(start=__file__) / "HuangHe" / "netcdf",
+        description="HuangHe intermediate NetCDF directory",
+    )
+    output_dir = ensure_directory(
+        resolve_output_root(start=__file__) / "annually_climatology" / "Huanghe"
+    )
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
     # Get all NetCDF files
-    input_files = sorted(glob.glob(os.path.join(input_dir, 'HuangHe_*.nc')))
+    input_files = sorted(glob.glob(str(input_dir / 'HuangHe_*.nc')))
 
     if len(input_files) == 0:
         print(f"ERROR: No NetCDF files found in {input_dir}")

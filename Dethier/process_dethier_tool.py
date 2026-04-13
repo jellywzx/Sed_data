@@ -22,24 +22,26 @@ import pandas as pd
 import xarray as xr
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,        
-    apply_hydro_qc_with_provenance, 
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
 # =========================
 # 全局 QC / FLAG 设置
@@ -825,10 +827,12 @@ def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv
 # =========================
 
 if __name__ == "__main__":
-    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+    input_nc_dir = resolve_source_root(start=__file__) / "Dethier" / "nc_convert"
+    output_dir = resolve_output_root(start=__file__, create=True) / "monthly" / "Dethier" / "qc"
+    summary_csv = output_dir / "Dethier_station_summary.csv"
 
-    INPUT_NC_DIR = os.path.join(PROJECT_ROOT, "Source", "Dethier", "nc_convert")
-    OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "Output_r", "monthly","Dethier", "qc")
-    SUMMARY_CSV  = os.path.join(OUTPUT_DIR, "Dethier_station_summary.csv")
-
-    process_dethier_data_from_nc(INPUT_NC_DIR, OUTPUT_DIR, SUMMARY_CSV)
+    process_dethier_data_from_nc(
+        os.fspath(input_nc_dir),
+        os.fspath(output_dir),
+        os.fspath(summary_csv),
+    )

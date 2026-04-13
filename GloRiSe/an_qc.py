@@ -18,15 +18,17 @@ from pathlib import Path
 from datetime import datetime
 
 CURRENT_DIR = Path(__file__).resolve().parent
-PARENT_DIR = CURRENT_DIR.parent
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-from tool import FILL_VALUE_FLOAT, FILL_VALUE_INT, apply_quality_flag, calculate_ssc
+SCRIPT_ROOT = CURRENT_DIR.parent
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.qc import apply_quality_flag
+from code.runtime import ensure_directory, resolve_output_root
+from code.units import calculate_ssc
 
 # 路径配置
-INPUT_DIR = Path('/media/zhwei/data02/weizx/sediment_wzx_1111/Output_r/annually_climatology/GloRiSe')
-OUTPUT_DIR = INPUT_DIR / 'qc'
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_DIR = resolve_output_root(start=__file__) / 'annually_climatology' / 'GloRiSe'
+OUTPUT_DIR = ensure_directory(INPUT_DIR / 'qc')
 
 # 与 2_qc 一致的数据源信息
 DATA_SOURCE = {

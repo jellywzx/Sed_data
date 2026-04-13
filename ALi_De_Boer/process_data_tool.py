@@ -21,29 +21,38 @@ from datetime import datetime
 import os
 import re
 import sys
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    parse_dms_to_decimal,
-    parse_period,
+from pathlib import Path
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from code.constants import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+)
+from code.geo import parse_dms_to_decimal
+from code.output import (
+    generate_csv_summary,
+    generate_qc_results_csv,
+    generate_station_summary_csv,
+    generate_warning_summary_csv,
+    summarize_warning_types,
+)
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    compute_log_iqr_bounds,
+    qc_flag_counts,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.time_utils import parse_period
+from code.units import (
     calculate_discharge,
     calculate_ssl_from_mt_yr,
     calculate_ssc,
-    compute_log_iqr_bounds,
-    generate_station_summary_csv,
-    build_ssc_q_envelope,
-    apply_quality_flag_array,        
-    apply_hydro_qc_with_provenance, 
-    qc_flag_counts,
-    generate_station_summary_csv,
-    generate_qc_results_csv,
 )
-
-
-FILL_VALUE_FLOAT = np.float32(-9999.0)
-FILL_VALUE_INT = np.int8(9)
 
 
 def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q_bounds):
@@ -573,15 +582,14 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
 def main():
     """Main conversion function."""
 
-    # 当前脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    source_dir = os.path.join(project_root, "Source", "ALi_De_Boer")
-    output_dir = os.path.join(project_root, "Output_r", "annually_climatology", "ALi_De_Boer", "qc")
+    source_root = resolve_source_root(__file__)
+    output_root = resolve_output_root(__file__, create=True)
+    source_dir = source_root / "ALi_De_Boer"
+    output_dir = output_root / "annually_climatology" / "ALi_De_Boer" / "qc"
 
-    input_file = os.path.join(source_dir, "ALi_De_Boer.xlsx")
+    input_file = source_dir / "ALi_De_Boer.xlsx"
 
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Input file:", input_file)
     print("Output directory:", output_dir)
@@ -594,7 +602,7 @@ def main():
     print()
 
     # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Read Excel file
     print("Reading Excel file...")
@@ -761,7 +769,7 @@ def main():
     stations_info = station_data  
 
     # 1) print warning types summary (returns whatever tool defines)
-    warning_summary = summarize_warning_types_tool(stations_info)
+    warning_summary = summarize_warning_types(stations_info)
     print("\n[WARN] summary by type:")
     print(warning_summary)
 
@@ -770,9 +778,9 @@ def main():
     qc_results_path = os.path.join(output_dir, "qc_results_tool.csv")
     warning_summary_path = os.path.join(output_dir, "warning_summary_tool.csv")
 
-    generate_csv_summary_tool(stations_info, csv_summary_path)
-    generate_qc_results_csv_tool(stations_info, qc_results_path)
-    generate_warning_summary_csv_tool(stations_info, warning_summary_path)
+    generate_csv_summary(stations_info, csv_summary_path)
+    generate_qc_results_csv(stations_info, qc_results_path)
+    generate_warning_summary_csv(stations_info, warning_summary_path)
 
     print("\n[CSV] Tool summaries written:")
     print("  -", csv_summary_path)

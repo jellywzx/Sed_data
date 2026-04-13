@@ -8,6 +8,7 @@ No numerical calculations or I/O operations should appear in this file.
 """
 
 import numpy as np
+from netCDF4 import Dataset
 
 FILL_FLOAT = -9999.0
 FILL_INT = 9
@@ -376,3 +377,183 @@ def build_metadata(
         global_attrs["temporal_span"] = f"{start_year}-{end_year}"
 
     return dimensions, variables, global_attrs
+
+
+def add_global_attributes(nc_obj, attrs=None, **kwargs):
+    """
+    Attach global attributes to a netCDF4 Dataset-like object.
+
+    Parameters
+    ----------
+    nc_obj : Dataset-like
+        Open netCDF dataset object.
+    attrs : dict or None
+        Attributes to set on the dataset.
+    **kwargs
+        Additional attributes merged with ``attrs``.
+    """
+    merged = {}
+    if attrs:
+        merged.update(attrs)
+    if kwargs:
+        merged.update(kwargs)
+
+    for key, value in merged.items():
+        setattr(nc_obj, key, value)
+    return nc_obj
+
+
+def check_variable_metadata_tiered(
+    nc_path,
+    *,
+    tier: str = "basic",
+    extra_requirements: dict | None = None,
+    treat_empty_as_missing: bool = True,
+    strict_empty: bool = False,
+):
+    """
+    Tiered variable metadata completeness checker.
+    """
+    tier = str(tier).lower().strip()
+    if tier not in {"basic", "recommended", "strict"}:
+        raise ValueError("tier must be one of: 'basic', 'recommended', 'strict'")
+
+    BASIC = {
+        "time": {"require": ["units", "calendar"], "warn": ["long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name"]},
+    }
+
+    RECOMMENDED = {
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units"], "warn": ["standard_name", "axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables"], "warn": ["standard_name", "coordinates", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "altitude": {"require": [], "warn": ["units", "positive", "long_name", "standard_name"]},
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    STRICT = {
+        "time": {"require": ["units", "calendar"], "warn": ["axis", "standard_name", "long_name"]},
+        "lat": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "lon": {"require": ["units", "standard_name"], "warn": ["axis", "valid_range", "long_name"]},
+        "Q": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "Q_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSC": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSC_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "SSL": {"require": ["units", "long_name", "ancillary_variables", "coordinates"], "warn": ["standard_name", "comment"]},
+        "SSL_flag": {"require": ["flag_values", "flag_meanings"], "warn": ["long_name", "standard_name", "_FillValue"]},
+        "altitude": {"require": [], "warn": []},
+        "upstream_area": {"require": [], "warn": ["units", "long_name"]},
+    }
+
+    rules = BASIC if tier == "basic" else RECOMMENDED if tier == "recommended" else STRICT
+
+    if extra_requirements:
+        for vname, spec in extra_requirements.items():
+            if vname not in rules:
+                rules[vname] = {"require": [], "warn": []}
+            for key in ("require", "warn"):
+                if key in spec and spec[key]:
+                    merged = list(
+                        dict.fromkeys(
+                            list(rules[vname].get(key, [])) + list(spec[key])
+                        )
+                    )
+                    rules[vname][key] = merged
+
+    errors = []
+    warnings = []
+
+    def _is_empty(val):
+        if val is None:
+            return True
+        if isinstance(val, str) and val.strip() == "":
+            return True
+        return False
+
+    with Dataset(str(nc_path), mode="r") as ds:
+        if tier == "strict" and "altitude" in ds.variables:
+            STRICT["altitude"] = {
+                "require": ["units", "long_name"],
+                "warn": ["positive", "standard_name", "comment"],
+            }
+
+        for vname in rules.keys():
+            var_is_required = len(rules[vname].get("require", [])) > 0
+            if vname not in ds.variables:
+                if var_is_required:
+                    errors.append("Missing required variable: {0}".format(vname))
+                continue
+
+        for vname, spec in rules.items():
+            if vname not in ds.variables:
+                continue
+
+            var = ds.variables[vname]
+            present_attrs = set(var.ncattrs())
+
+            for attr in spec.get("require", []):
+                if attr not in present_attrs:
+                    errors.append(
+                        "Variable '{0}' missing required attribute: {1}".format(
+                            vname, attr
+                        )
+                    )
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        msg = (
+                            "Variable '{0}' required attribute '{1}' is empty/None"
+                            .format(vname, attr)
+                        )
+                        if strict_empty:
+                            errors.append(msg)
+                        else:
+                            warnings.append(msg)
+
+            for attr in spec.get("warn", []):
+                if attr not in present_attrs:
+                    warnings.append(
+                        "Variable '{0}' missing recommended attribute: {1}".format(
+                            vname, attr
+                        )
+                    )
+                    continue
+
+                if treat_empty_as_missing:
+                    try:
+                        val = getattr(var, attr)
+                    except Exception:
+                        val = None
+                    if _is_empty(val):
+                        warnings.append(
+                            "Variable '{0}' recommended attribute '{1}' is empty/None"
+                            .format(vname, attr)
+                        )
+
+        for vname in ("Q", "SSC", "SSL", "lat", "lon", "time"):
+            if vname in ds.variables and "units" in ds.variables[vname].ncattrs():
+                units = str(getattr(ds.variables[vname], "units", "")).strip()
+                if units == "":
+                    warnings.append(
+                        "Variable '{0}' has empty 'units' attribute".format(vname)
+                    )
+
+    return errors, warnings

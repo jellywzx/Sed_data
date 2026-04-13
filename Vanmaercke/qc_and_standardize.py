@@ -27,22 +27,20 @@ import os
 import glob
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    # check_nc_completeness,
-    # add_global_attributes
+    compute_log_iqr_bounds,
 )
+from code.runtime import ensure_directory, resolve_output_root
+from code.units import convert_ssl_units_if_needed
+from code.validation import require_existing_directory
 
 def standardize_netcdf_file(input_file, output_dir):
     """
@@ -422,15 +420,20 @@ def main():
     print()
 
     # Paths
-    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
-    input_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "Vanmaercke", "nc")
-    output_dir = os.path.join(PROJECT_ROOT, "Output_r", "annually_climatology", "Vanmaercke", "qc")
+    output_root = resolve_output_root(start=__file__)
+    input_dir = require_existing_directory(
+        output_root / "annually_climatology" / "Vanmaercke" / "nc",
+        description="Vanmaercke intermediate NetCDF directory",
+    )
+    output_dir = ensure_directory(
+        output_root / "annually_climatology" / "Vanmaercke" / "qc"
+    )
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
     # Get all NetCDF files
-    input_files = sorted(glob.glob(os.path.join(input_dir, 'Vanmaercke_*.nc')))
+    input_files = sorted(glob.glob(str(input_dir / 'Vanmaercke_*.nc')))
 
     if len(input_files) == 0:
         print(f"ERROR: No NetCDF files found in {input_dir}")

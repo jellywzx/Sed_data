@@ -1,6 +1,22 @@
 import numpy as np
+import logging
+import xarray as xr
 
-from constants import DAYS_PER_JULIAN_YEAR, SSC_DISCHARGE_TO_SSL_FACTOR
+if __package__:
+    from .constants import (
+        DAYS_PER_JULIAN_YEAR,
+        SECONDS_PER_DAY,
+        SSC_DISCHARGE_TO_SSL_FACTOR,
+    )
+else:
+    from constants import (
+        DAYS_PER_JULIAN_YEAR,
+        SECONDS_PER_DAY,
+        SSC_DISCHARGE_TO_SSL_FACTOR,
+    )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _coerce_finite(value):
@@ -28,6 +44,29 @@ def calculate_ssl_from_mt_yr(sediment_mt_yr):
     if sediment is None:
         return np.nan
     return sediment * 1e6 / DAYS_PER_JULIAN_YEAR
+
+
+def convert_ssl_units_if_needed(ssl_da):
+    """
+    Normalize sediment flux units to ton day-1.
+
+    If the input unit is kg/s, convert values to ton/day. Otherwise preserve
+    the values and standardize ton-based units to ``ton day-1``.
+    """
+    units = str(getattr(ssl_da, "units", "")).lower()
+
+    if "kg/s" in units or "kg s-1" in units or "kg s^-1" in units:
+        LOGGER.info("Converting sediment_flux units from kg/s to ton/day")
+        data = ssl_da.values.astype(float)
+        converted = data * SECONDS_PER_DAY / 1000.0
+        da = ssl_da.copy(data=converted)
+        da.attrs["units"] = "ton day-1"
+        return da
+
+    da = ssl_da.copy()
+    if units == "" or "ton" in units:
+        da.attrs["units"] = "ton day-1"
+    return da
 
 
 def calculate_ssc(ssl_ton_day, discharge_m3s):

@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 def find_repo_root(start: Path, max_up: int = 6) -> Path:
     p = start.resolve()
     for _ in range(max_up):
@@ -17,25 +18,25 @@ def find_repo_root(start: Path, max_up: int = 6) -> Path:
         p = p.parent
     # 兜底：找不到就用“脚本所在目录的上两级”，你也可以按需要改
     return start.resolve().parents[2]
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,
-    apply_hydro_qc_with_provenance,
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
-
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
 def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
     """
@@ -245,9 +246,8 @@ def build_qc_results_summary_row(df_station, station_info, station_id, lon, lat,
 
 def process_shashi_jianli():
     # Define paths
-    repo_root = find_repo_root(Path(CURRENT_DIR))
-    source_dir = repo_root / "Source" / "Shashi_Jianli"
-    output_dir = repo_root / "Output_r" / "daily" / "Shashi_Jianli" / "qc"
+    source_dir = resolve_source_root(start=__file__) / "Shashi_Jianli"
+    output_dir = resolve_output_root(start=__file__, create=True) / "daily" / "Shashi_Jianli" / "qc"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

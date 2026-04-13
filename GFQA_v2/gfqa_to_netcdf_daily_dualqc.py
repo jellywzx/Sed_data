@@ -24,7 +24,7 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 def find_project_root(start_dir, max_up=6):
     p = Path(start_dir).resolve()
     for _ in range(max_up):
@@ -33,24 +33,27 @@ def find_project_root(start_dir, max_up=6):
         p = p.parent
     return Path(start_dir).resolve().parent
 
-PROJECT_ROOT = find_project_root(CURRENT_DIR)
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,
-    apply_hydro_qc_with_provenance,
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
+
+SOURCE_DIR = resolve_source_root(start=__file__) / "GFQA_v2" / "sed"
 
 
 # ==========================================================
@@ -111,7 +114,7 @@ def parse_float(value):
 def read_csv_files():
     """读取 CSV 文件"""
     print("Reading CSV files...")
-    base_dir = PROJECT_ROOT / "Source" / "GFQA_v2" / "sed"
+    base_dir = SOURCE_DIR
     flux_df = pd.read_csv(base_dir / "Flux.csv", delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
     water_df = pd.read_csv(base_dir / "Water.csv", delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
     station_df = pd.read_excel(base_dir / "GEMStat_station_metadata.xlsx")
@@ -632,11 +635,10 @@ def main():
 
     flux_df, water_df, station_df = read_csv_files()
     
-    output_dir = str(PROJECT_ROOT / "Output_r" / "daily" / "GFQA_v2" / "qc")
+    output_dir = str(resolve_output_root(start=__file__) / "daily" / "GFQA_v2" / "qc")
     process_all_stations(flux_df, water_df, station_df, output_dir=output_dir)
     print("\nConversion complete with Data.Quality and QC Flags!")
 
 
 if __name__ == '__main__':
     main()
-

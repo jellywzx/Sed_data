@@ -32,32 +32,33 @@ import warnings
 import json
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
     apply_quality_flag,
-    compute_log_iqr_bounds,
+    apply_quality_flag_array,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
-    apply_quality_flag_array,        
-    apply_hydro_qc_with_provenance, 
 )
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..', '..'))
 # Data paths
-SOURCE_DIR = os.path.join(PROJECT_ROOT, 'Source', 'EUSEDcollab')
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'Output_r', 'monthly', 'EUSEDcollab', 'qc')
-METADATA_FILE = os.path.join(SOURCE_DIR, 'ALL_METADATA.csv')
+SOURCE_DIR = os.fspath(resolve_source_root(start=__file__) / "EUSEDcollab")
+OUTPUT_DIR = os.fspath(
+    resolve_output_root(start=__file__) / "monthly" / "EUSEDcollab" / "qc"
+)
+METADATA_FILE = os.path.join(SOURCE_DIR, "ALL_METADATA.csv")
 
 FILL_VALUE = -9999.0
 # =============================================================================

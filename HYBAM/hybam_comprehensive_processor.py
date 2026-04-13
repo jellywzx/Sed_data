@@ -43,24 +43,31 @@ import json
 import warnings
 warnings.filterwarnings('ignore')
 import sys
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from code.constants import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
+)
+from code.output import (
+    generate_csv_summary as generate_csv_summary_tool,
+    generate_qc_results_csv as generate_qc_results_csv_tool,
+)
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    apply_quality_flag_array,                
-    compute_log_iqr_bounds,
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag_array,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
+    compute_log_iqr_bounds,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import (
     convert_ssl_units_if_needed,
-    apply_hydro_qc_with_provenance,           
-    generate_csv_summary as generate_csv_summary_tool,          
-    generate_qc_results_csv as generate_qc_results_csv_tool,
-) #add 4 functions from tool.py
+)
 
 STATION_INFO = {
     "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430},
@@ -957,11 +964,11 @@ class HYBAMProcessor:
 
 def main():
     """Main entry point."""
-    # Get base directory (project root) - go up two levels from Script/HYBAM/
-    base_dir = Path(__file__).parent.parent.parent
-    source_dir = base_dir / 'Source' / 'HYBAM' / 'source'
-    output_dir = base_dir / 'Output_r' / 'daily' / 'HYBAM' / 'Output'
-    output_r_dir = base_dir / 'Output_r' / 'daily' / 'HYBAM' / 'qc'
+    source_root = resolve_source_root(__file__)
+    output_root = resolve_output_root(__file__, create=True)
+    source_dir = source_root / 'HYBAM' / 'source'
+    output_dir = output_root / 'daily' / 'HYBAM' / 'Output'
+    output_r_dir = output_root / 'daily' / 'HYBAM' / 'qc'
 
     processor = HYBAMProcessor(source_dir, output_dir, output_r_dir)
     processor.run()

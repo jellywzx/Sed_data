@@ -24,29 +24,29 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) #得到当前脚本所在目录
-#设置相对路径第一步是利用dirname得到当前脚本所在目录，然后利用os.path.join()函数和获取其他目录的路径。
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..')) 
-if PARENT_DIR not in sys.path: #sys.path：这是一个列表，存储了 Python 查找模块 / 包的路径。
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    check_nc_completeness,
-    check_variable_metadata_tiered,
-    # add_global_attributes,
-    propagate_ssc_q_inconsistency_to_ssl,
-    apply_hydro_qc_with_provenance,
-    summarize_warning_types as summarize_warning_types_tool,
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path: #sys.path：这是一个列表，存储了 Python 查找模块 / 包的路径。
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.metadata import check_variable_metadata_tiered
+from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
     generate_warning_summary_csv as generate_warning_summary_csv_tool,
+    summarize_warning_types as summarize_warning_types_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+    propagate_ssc_q_inconsistency_to_ssl,
+)
+from code.runtime import resolve_output_root
+from code.units import convert_ssl_units_if_needed
+from code.validation import check_nc_completeness
 
 def apply_tool_qc(
     time,
@@ -702,13 +702,9 @@ class HYDATQualityControl:
 
 def main():
     """主函数"""
-    # 设置路径
-    BASE_DIR = Path(__file__).resolve().parent          # .../Script/Hydat 之类
-    PROJECT_DIR = BASE_DIR.parents[1]                      # 上一级（你之前的 PARENT_DIR 逻辑）
-
-    # 用相对路径替代绝对路径（按你的目录结构改这里）
-    input_dir = PROJECT_DIR / "Output_r" / "daily" / "HYDAT" / "sediment_update"
-    output_dir = PROJECT_DIR / "Output_r" / "daily" / "HYDAT" / "output_update"
+    output_root = resolve_output_root(start=__file__, create=True)
+    input_dir = output_root / "daily" / "HYDAT" / "sediment_update"
+    output_dir = output_root / "daily" / "HYDAT" / "output_update"
 
     csv_file = output_dir / 'HYDAT_station_summary.csv'
 

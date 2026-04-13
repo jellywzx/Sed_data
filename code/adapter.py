@@ -10,18 +10,23 @@ Responsibilities:
 This module MUST NOT implement any generic algorithms.
 """
 
-import sys, os
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(__file__))   # 确保能找到 code/ 同级模块
-
-from geo import parse_dms_to_decimal
-from time_utils import parse_period, climatology_time
-from units import calculate_discharge, calculate_ssl_from_mt_yr, calculate_ssc
-from qc import compute_log_iqr_bounds, apply_ssl_log_iqr_flag
-from constants import FILL_VALUE_INT
-from validation import read_excel_validated
+if __package__:
+    from .geo import parse_dms_to_decimal
+    from .time_utils import parse_period, climatology_time
+    from .units import calculate_discharge, calculate_ssl_from_mt_yr, calculate_ssc
+    from .qc import compute_log_iqr_bounds, apply_ssl_log_iqr_flag
+    from .constants import FILL_VALUE_INT
+    from .validation import read_excel_validated
+else:
+    from geo import parse_dms_to_decimal
+    from time_utils import parse_period, climatology_time
+    from units import calculate_discharge, calculate_ssl_from_mt_yr, calculate_ssc
+    from qc import compute_log_iqr_bounds, apply_ssl_log_iqr_flag
+    from constants import FILL_VALUE_INT
+    from validation import read_excel_validated
 
 
 REQUIRED_COLUMNS = [

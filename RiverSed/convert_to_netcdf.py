@@ -14,28 +14,33 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    apply_quality_flag,
-    apply_quality_flag_array,                
-    compute_log_iqr_bounds,
-    build_ssc_q_envelope,
-    check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
-    apply_hydro_qc_with_provenance,           
-    generate_csv_summary as generate_csv_summary_tool,          
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.output import (
+    generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
+    apply_hydro_qc_with_provenance,
+    apply_quality_flag,
+    apply_quality_flag_array,
+    build_ssc_q_envelope,
+    check_ssc_q_consistency,
+    compute_log_iqr_bounds,
+)
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
-PROJECT_ROOT = Path(CURRENT_DIR).parents[1]  
-SOURCE_DIR = str(PROJECT_ROOT / "Source" / "RiverSed")
-OUTPUT_NC_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "nc")
-OUTPUT_QC_DIR = str(PROJECT_ROOT / "Output_r" / "daily" / "RiverSed" / "qc")
+SOURCE_DIR = os.fspath(resolve_source_root(start=__file__) / "RiverSed")
+OUTPUT_NC_DIR = os.fspath(
+    resolve_output_root(start=__file__) / "daily" / "RiverSed" / "nc"
+)
+OUTPUT_QC_DIR = os.fspath(
+    resolve_output_root(start=__file__) / "daily" / "RiverSed" / "qc"
+)
 
 def load_aquasat_data(file_path):
     """Load Aquasat TSS data"""

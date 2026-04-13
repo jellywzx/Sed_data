@@ -22,21 +22,24 @@ import warnings
 warnings.filterwarnings('ignore')
 import sys
 import os
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
-from tool import (
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from code.constants import (
     FILL_VALUE_FLOAT,
     FILL_VALUE_INT,
+)
+from code.plot import plot_ssc_q_diagnostic
+from code.qc import (
     apply_quality_flag,
-    compute_log_iqr_bounds,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    plot_ssc_q_diagnostic,
-    convert_ssl_units_if_needed,
+    compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
 )
+from code.runtime import resolve_output_root, resolve_source_root
+from code.units import convert_ssl_units_if_needed
 
 # Quality flag definitions
 FLAG_GOOD = 0       # Good data
@@ -530,14 +533,12 @@ def create_summary_csv(stats_list, output_dir):
 
 def main():
     """Main processing function"""
-    # File paths
-    script_dir = Path(__file__).resolve().parent          # .../Script/GSED
-    project_root = script_dir.parents[1]                  # .../sediment_wzx_1111
-
-    source_dir = project_root / "Source" / "GSED" / "GSED"
+    source_root = resolve_source_root(__file__)
+    output_root = resolve_output_root(__file__, create=True)
+    source_dir = source_root / "GSED" / "GSED"
     csv_file = source_dir / "GSED_Reach_Monthly_SSC.csv"
     shapefile = source_dir / "GSED_Reach.shp"
-    output_dir = project_root / "Output_r" / "monthly" / "GSED" / "qc"
+    output_dir = output_root / "monthly" / "GSED" / "qc"
 
 
     # Create output directory

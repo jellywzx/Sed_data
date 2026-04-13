@@ -1,16 +1,28 @@
 import numpy as np
 import numpy.ma as ma
 
-from constants import (
-    FILL_VALUE_FLOAT,
-    FILL_VALUE_INT,
-    FLAG_BAD,
-    FLAG_ESTIMATED,
-    FLAG_GOOD,
-    FLAG_MISSING,
-    FLAG_NOT_CHECKED,
-    FLAG_SUSPECT,
-)
+if __package__:
+    from .constants import (
+        FILL_VALUE_FLOAT,
+        FILL_VALUE_INT,
+        FLAG_BAD,
+        FLAG_ESTIMATED,
+        FLAG_GOOD,
+        FLAG_MISSING,
+        FLAG_NOT_CHECKED,
+        FLAG_SUSPECT,
+    )
+else:
+    from constants import (
+        FILL_VALUE_FLOAT,
+        FILL_VALUE_INT,
+        FLAG_BAD,
+        FLAG_ESTIMATED,
+        FLAG_GOOD,
+        FLAG_MISSING,
+        FLAG_NOT_CHECKED,
+        FLAG_SUSPECT,
+    )
 
 
 def _as_float_array(values):
@@ -51,6 +63,31 @@ def apply_quality_flag_array(values, variable_name=""):
         [apply_quality_flag(value, variable_name=variable_name) for value in arr],
         dtype=np.int8,
     )
+
+
+def qc_flag_counts(flags):
+    counts = {
+        "pass": 0,
+        "estimated": 0,
+        "suspect": 0,
+        "bad": 0,
+        "not_checked": 0,
+        "missing": 0,
+    }
+    if flags is None:
+        return counts
+
+    arr = _as_float_array(np.atleast_1d(flags))
+    if arr.size == 0:
+        return counts
+
+    counts["pass"] = int(np.sum(arr == FLAG_GOOD))
+    counts["estimated"] = int(np.sum(arr == FLAG_ESTIMATED))
+    counts["suspect"] = int(np.sum(arr == FLAG_SUSPECT))
+    counts["bad"] = int(np.sum(arr == FLAG_BAD))
+    counts["not_checked"] = int(np.sum(arr == FLAG_NOT_CHECKED))
+    counts["missing"] = int(np.sum(arr == FLAG_MISSING))
+    return counts
 
 
 def compute_log_iqr_bounds(values, k=1.5):
