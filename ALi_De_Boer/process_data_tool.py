@@ -53,6 +53,7 @@ from code.units import (
     calculate_ssl_from_mt_yr,
     calculate_ssc,
 )
+from code.validation import read_excel_validated
 
 
 def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q_bounds):
@@ -606,7 +607,21 @@ def main():
 
     # Read Excel file
     print("Reading Excel file...")
-    df = pd.read_excel(input_file, sheet_name='Sheet2', header=0)
+
+    REQUIRED_COLUMNS = [
+        "Station", "River", "Latitude", "Longitude",
+        "Period of record", "Elevation (masl)",
+        "Drainage area (km2)", "Runoff (mm)",
+        "Sediment（(Mt yr−1)）", "Sediment（t km−2 yr−1）",
+    ]
+
+    df = read_excel_validated(
+        input_file,
+        sheet_name='Sheet2',
+        required_columns=REQUIRED_COLUMNS,
+        description="ALi_De_Boer source workbook",
+    )
+
     print(f"Found {len(df)} stations")
     print()
     # ==========================================================
