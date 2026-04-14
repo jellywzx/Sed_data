@@ -259,11 +259,13 @@ def create_netcdf_file(filepath, df, station_meta):
         ds.creator_institution = "Sun Yat-sen University, China"
         ds.history = f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using convert_to_netcdf.py. Data is not padded; only timestamps with measurements are included."
         ds.Type = "In-situ station data"
-        ds.Temporal_Resolution = "daily"
-        ds.Temporal_Span = f"{df['time'].min().strftime('%Y-%m-%d')} to {df['time'].max().strftime('%Y-%m-%d')}"
-        ds.Geographic_Coverage = "Irrawaddy and Salween Rivers, Myanmar"
+        ds.temporal_resolution = "daily"
+        ds.temporal_span = f"{df['time'].min().strftime('%Y-%m-%d')} to {df['time'].max().strftime('%Y-%m-%d')}"
+        ds.geographic_coverage = "Irrawaddy and Salween Rivers, Myanmar"
+        ds.time_coverage_start = df['time'].min().strftime('%Y-%m-%d')
+        ds.time_coverage_end = df['time'].max().strftime('%Y-%m-%d')
         ds.Variables_Provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
-        ds.Number_of_data = 1
+        ds.Number_of_data = str(len(df))
         
         # === DATA VARIABLES ===
         fill_value = -9999.0

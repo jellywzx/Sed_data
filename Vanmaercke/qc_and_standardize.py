@@ -276,9 +276,6 @@ def standardize_netcdf_file(input_file, output_dir):
 
         # Type and resolution
         ds.Type = "In-situ"
-        ds.Temporal_Resolution = "climatology"
-        ds.Temporal_Span = temporal_span
-        ds.Geographic_Coverage = f"Africa, {country}"
 
         # Variables provided
         vars_provided = "SSL"  # Only SSL available

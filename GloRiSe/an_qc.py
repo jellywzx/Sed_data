@@ -348,6 +348,12 @@ def process_one_file(input_path):
         ds_out.creator_email = DATA_SOURCE['creator_email']
         ds_out.creator_institution = DATA_SOURCE['creator_institution']
         ds_out.date_created = datetime.now().strftime('%Y-%m-%d')
+        # Add temporal coverage derived from actual time data
+        if time_dim_name == 'time' and len(time_vals) > 0:
+            _dates = nc4.num2date(time_vals, units=time_units, calendar=time_calendar)
+            _years = [d.year for d in _dates]
+            ds_out.time_coverage_start = f"{min(_years)}-01-01"
+            ds_out.time_coverage_end   = f"{max(_years)}-12-31"
         ds_out.date_modified = datetime.now().strftime('%Y-%m-%d')
         ds_out.processing_level = 'Variable unified and QC (apply_quality_flag, calculate_ssc)'
         history_entry = (

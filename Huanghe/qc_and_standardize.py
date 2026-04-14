@@ -74,7 +74,7 @@ def standardize_netcdf_file(input_file, output_dir):
         river_name = ds_in.river_name
         river_name_chinese = ds_in.river_name_chinese
         original_time_range = ds_in.original_time_range if hasattr(ds_in, 'original_time_range') else "2015-2019"
-        representative_year = ds_in.representative_year if hasattr(ds_in, 'representative_year') else "2017"
+        
 
         # Get time units for conversion
         time_units = ds_in.variables['time'].units
@@ -288,9 +288,8 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.Conventions = "CF-1.8, ACDD-1.3"
         ds.title = "Harmonized Global River Discharge and Sediment"
         ds.summary = f"Suspended sediment concentration data for {station_name} station on the {river_name} " \
-                     f"in the Yellow River Basin, China. This dataset contains climatological annual average " \
-                     f"value representing the 2015-2019 period. Data represents the middle year (2017) of " \
-                     f"the observation period."
+                    f"in the Yellow River Basin, China. This dataset contains annual average values " \
+                    f"for the {original_time_range} period."
 
         # Source and data information
         ds.source = "In-situ station data"
@@ -301,13 +300,10 @@ def standardize_netcdf_file(input_file, output_dir):
 
         # Type and resolution
         ds.Type = "In-situ"
-        ds.Temporal_Resolution = "climatology"
-        ds.Temporal_Span = f"{original_time_range}"
-        ds.Geographic_Coverage = "Yellow River Basin, China"
 
         # Variables provided
         ds.Variables_Provided = "SSC"
-        ds.Number_of_data = "1"
+        ds.Number_of_data = str(len(time_vals))
 
         # References and links
         ds.Reference = "Zhang Yaonan, Kang jianfang, Liu chun. (2021). Data on Sediment Observation in the " \
@@ -321,8 +317,8 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.creator_institution = "Sun Yat-sen University, China"
 
         # Temporal coverage
-        ds.time_coverage_start = f"{representative_year}-01-01"
-        ds.time_coverage_end = f"{representative_year}-12-31"
+        ds.time_coverage_start = f"{ssc_start_date}-01-01"
+        ds.time_coverage_end = f"{ssc_end_date}-12-31"
         ds.temporal_span = original_time_range
         ds.temporal_resolution = "climatology"
 
@@ -347,14 +343,11 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.processing_level = "Quality controlled and standardized"
 
         # Additional comments
-        ds.comment = f"Data represents climatological annual average sediment concentration from year {representative_year} " \
-                     f"(middle year of {original_time_range} dataset). Quality flags indicate data reliability: " \
-                     f"0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. " \
-                     f"Note: Discharge and sediment load data are NOT available in the original dataset."
+        ds.comment = f"Annual average SSC data for {original_time_range}. Quality flags indicate data reliability: " \
+                    f"0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. " \
+                    f"Note: Discharge and sediment load data are NOT available in the original dataset."
 
-        ds.data_limitations = "Only annual average SSC available; no discharge (Q) or sediment load (SSL) data in original dataset. " \
-                              "Climatological value represents single year (2017) from 2015-2019 period."
-
+        ds.data_limitations = "Only annual average SSC available; no discharge (Q) or sediment load (SSL) data in original dataset."
         # Store Chinese names as additional attributes
         ds.station_name_chinese = station_name_chinese
         ds.river_name_chinese = river_name_chinese

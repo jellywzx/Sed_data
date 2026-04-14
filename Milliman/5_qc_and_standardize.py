@@ -264,9 +264,6 @@ def standardize_netcdf_file(input_file, output_dir):
 
         # Type and resolution
         ds.Type = "In-situ"
-        ds.Temporal_Resolution = "climatology"
-        ds.Temporal_Span = "various (pre-2012)"
-        ds.Geographic_Coverage = f"{country}, {continent}"
 
         # Variables provided
         vars_provided = []
