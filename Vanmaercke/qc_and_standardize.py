@@ -22,6 +22,7 @@ Date: 2025-10-25
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
+from netCDF4 import num2date
 from datetime import datetime
 import os
 import glob
@@ -123,15 +124,60 @@ def standardize_netcdf_file(input_file, output_dir):
     q_percent = 100.0 if q_flag == 0 else 0.0
 
     import re
-    match = re.search(r'(\d{4})\s*[-–]\s*(\d{4})', str(period))
-    if match:
-        start_year = int(match.group(1))
-        end_year = int(match.group(2))
+
+    # --------------------------------------------------
+    # Derive temporal coverage
+    # Priority:
+    # 1) period metadata like "2007-2010" or "2007"
+    # 2) fallback to representative time variable only if needed
+    # --------------------------------------------------
+    time_coverage_start = ""
+    time_coverage_end = ""
+    temporal_span = ""
+    ssl_start_date = "N/A"
+    ssl_end_date = "N/A"
+
+    # First priority: use measurement period metadata
+    match_range = re.search(r'(\d{4})\s*[-–]\s*(\d{4})', str(period))
+    match_single = re.fullmatch(r'\s*(\d{4})\s*', str(period))
+
+    if match_range:
+        start_year = int(match_range.group(1))
+        end_year = int(match_range.group(2))
+        time_coverage_start = f"{start_year}-01-01"
+        time_coverage_end = f"{end_year}-12-31"
         temporal_span = f"{start_year}-{end_year}"
+        ssl_start_date = time_coverage_start
+        ssl_end_date = time_coverage_end
+
+    elif match_single:
+        year = int(match_single.group(1))
+        time_coverage_start = f"{year}-01-01"
+        time_coverage_end = f"{year}-12-31"
+        temporal_span = f"{year}"
+        ssl_start_date = time_coverage_start
+        ssl_end_date = time_coverage_end
+
     else:
-        start_year = 2000
-        end_year = 2000
-        temporal_span = period
+        # Only fallback to time variable when period metadata is missing/unusable
+        try:
+            time_obj = num2date(time_val, units=time_units, calendar=time_calendar)
+            time_str = f"{time_obj.year:04d}-{time_obj.month:02d}-{time_obj.day:02d}"
+
+            # This is only a representative time point, not true coverage
+            time_coverage_start = time_str
+            time_coverage_end = time_str
+            temporal_span = str(period) if period else time_str
+            ssl_start_date = time_str
+            ssl_end_date = time_str
+
+        except Exception:
+            time_coverage_start = ""
+            time_coverage_end = ""
+            temporal_span = str(period) if period else "unknown"
+            ssl_start_date = "N/A"
+            ssl_end_date = "N/A"
+    
 
     # Create output filename
     output_file = os.path.join(output_dir, os.path.basename(input_file))
@@ -294,8 +340,8 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.creator_institution = "Sun Yat-sen University, China"
 
         # Temporal coverage
-        ds.time_coverage_start = f"{start_year}-01-01"
-        ds.time_coverage_end = f"{end_year}-12-31"
+        ds.time_coverage_start = time_coverage_start
+        ds.time_coverage_end = time_coverage_end
         ds.temporal_span = temporal_span
         ds.temporal_resolution = "climatology"
 
@@ -400,8 +446,8 @@ def standardize_netcdf_file(input_file, output_dir):
         'SSC_start_date': 'N/A',
         'SSC_end_date': 'N/A',
         'SSC_percent_complete': 'N/A',
-        'SSL_start_date': start_year,
-        'SSL_end_date': end_year,
+        'SSL_start_date': ssl_start_date,
+        'SSL_end_date': ssl_end_date,
         'SSL_percent_complete': ssl_percent
     }
 
