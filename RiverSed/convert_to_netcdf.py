@@ -10,6 +10,7 @@ import numpy as np
 import netCDF4 as nc
 from datetime import datetime
 import os
+import struct
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import sys
@@ -41,6 +42,126 @@ OUTPUT_NC_DIR = os.fspath(
 OUTPUT_QC_DIR = os.fspath(
     resolve_output_root(start=__file__) / "daily" / "RiverSed" / "qc"
 )
+RIVERSED_METADATA_DBF = os.path.join(SOURCE_DIR, "nhdplusv2_modified_v1.0.dbf")
+RIVERSED_METADATA_FIELD_MAP = {
+    "ID": "ID",
+    "COMID": "comid",
+    "GNIS_NA": "river_name",
+    "REACHCO": "reach_code",
+    "VPUID": "vpu_id",
+    "RPUID": "rpu_id",
+    "TtDASKM": "upstream_area",
+}
+
+
+def _normalize_riversed_id(value):
+    """Normalize RiverSed reach IDs to stable string keys."""
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+    if text == "":
+        return ""
+
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except (TypeError, ValueError):
+        pass
+
+    return text
+
+
+def _clean_dbf_value(text):
+    """Convert DBF field text to a clean scalar value."""
+    value = text.strip()
+    if not value:
+        return None
+    if value.upper() == "NA":
+        return None
+    if set(value) == {"*"}:
+        return None
+    return value
+
+
+def load_riversed_station_metadata(dbf_path):
+    """Load RiverSed reach metadata from the modified NHDPlusV2 DBF."""
+    print(f"Loading RiverSed metadata from {dbf_path}...")
+
+    with open(dbf_path, "rb") as handle:
+        header = handle.read(32)
+        if len(header) < 32:
+            raise ValueError("Invalid DBF header in RiverSed metadata file.")
+
+        _, _, _, _, record_count, header_length, record_length = struct.unpack(
+            "<BBBBIHH20x", header
+        )
+
+        fields = []
+        field_count = (header_length - 33) // 32
+        for _ in range(field_count):
+            descriptor = handle.read(32)
+            name = descriptor[:11].split(b"\x00", 1)[0].decode("ascii", "ignore")
+            fields.append((name, descriptor[16]))
+
+        handle.read(1)  # field descriptor terminator
+
+        field_index = {name: idx for idx, (name, _) in enumerate(fields)}
+        missing_fields = sorted(
+            set(RIVERSED_METADATA_FIELD_MAP.keys()) - set(field_index.keys())
+        )
+        if missing_fields:
+            raise ValueError(
+                "RiverSed metadata DBF is missing fields: {0}".format(
+                    ", ".join(missing_fields)
+                )
+            )
+
+        rows = []
+        for _ in range(record_count):
+            record = handle.read(record_length)
+            if not record:
+                break
+            if record[0:1] == b"*":
+                continue
+
+            pos = 1
+            values = {}
+            for name, length in fields:
+                raw = record[pos:pos + length]
+                pos += length
+                if name not in RIVERSED_METADATA_FIELD_MAP:
+                    continue
+                clean_value = _clean_dbf_value(raw.decode("latin1", "ignore"))
+                values[RIVERSED_METADATA_FIELD_MAP[name]] = clean_value
+
+            rows.append(values)
+
+    metadata_df = pd.DataFrame(rows)
+    if metadata_df.empty:
+        raise ValueError("No RiverSed metadata records were loaded from DBF.")
+
+    metadata_df["ID"] = metadata_df["ID"].map(_normalize_riversed_id)
+    metadata_df = metadata_df[metadata_df["ID"] != ""].copy()
+
+    duplicated_ids = metadata_df["ID"].duplicated()
+    if duplicated_ids.any():
+        dup_sample = metadata_df.loc[duplicated_ids, "ID"].head(10).tolist()
+        raise ValueError(
+            "RiverSed metadata DBF contains duplicate IDs: {0}".format(dup_sample)
+        )
+
+    metadata_df["upstream_area"] = pd.to_numeric(
+        metadata_df["upstream_area"], errors="coerce"
+    )
+
+    print(
+        "  Loaded {0} metadata rows covering {1} RiverSed IDs".format(
+            len(metadata_df), metadata_df["ID"].nunique()
+        )
+    )
+    return metadata_df
 
 def load_aquasat_data(file_path):
     """Load Aquasat TSS data"""
@@ -63,19 +184,46 @@ def load_aquasat_data(file_path):
     print(f"  Loaded {len(df)} records from {df['station_id'].nunique()} stations")
     return df
 
-def load_riversed_data(file_path):
+def load_riversed_data(file_path, metadata_dbf_path=RIVERSED_METADATA_DBF):
     """Load RiverSed USA data"""
     print(f"Loading RiverSed data from {file_path}...")
     df = pd.read_csv(file_path, low_memory=False)
+    metadata_df = load_riversed_station_metadata(metadata_dbf_path)
+
+    df["ID"] = df["ID"].map(_normalize_riversed_id)
+
+    source_ids = set(df["ID"].dropna()) - {""}
+    metadata_ids = set(metadata_df["ID"].dropna()) - {""}
+    missing_ids = sorted(source_ids - metadata_ids)
+    if missing_ids:
+        raise ValueError(
+            "RiverSed metadata missing for {0} IDs. Sample: {1}".format(
+                len(missing_ids), missing_ids[:10]
+            )
+        )
 
     # Combine date and time
     df['date'] = pd.to_datetime(df['date'] + ' ' + df['time'], errors='coerce')
+
+    df = df.merge(metadata_df, on="ID", how="left", validate="m:1")
 
     # Use ID as station_id
     df['station_id'] = 'RiverSed_' + df['ID'].astype(str)
 
     # Select relevant columns
-    cols = ['station_id', 'date', 'tss', 'elevation']
+    cols = [
+        'ID',
+        'station_id',
+        'date',
+        'tss',
+        'elevation',
+        'river_name',
+        'comid',
+        'reach_code',
+        'vpu_id',
+        'rpu_id',
+        'upstream_area',
+    ]
     df = df[[c for c in cols if c in df.columns]].dropna(subset=['tss'])
 
     print(f"  Loaded {len(df)} records from {df['station_id'].nunique()} stations")
@@ -246,6 +394,39 @@ def create_netcdf_file(station_id, tss_df, output_dir):
     latitude = tss_df['lat'].dropna().iloc[0] if 'lat' in tss_df.columns and not tss_df['lat'].dropna().empty else np.nan
     longitude = tss_df['long'].dropna().iloc[0] if 'long' in tss_df.columns and not tss_df['long'].dropna().empty else np.nan
     altitude = tss_df['elevation'].dropna().iloc[0] if 'elevation' in tss_df.columns and not tss_df['elevation'].dropna().empty else np.nan
+    upstream_area = (
+        pd.to_numeric(tss_df['upstream_area'], errors='coerce').dropna().iloc[0]
+        if 'upstream_area' in tss_df.columns
+        and not pd.to_numeric(tss_df['upstream_area'], errors='coerce').dropna().empty
+        else np.nan
+    )
+
+    def _first_nonempty_text(df, column_name):
+        if column_name not in df.columns:
+            return ""
+        values = df[column_name].dropna()
+        for value in values:
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    river_name = _first_nonempty_text(tss_df, "river_name")
+    comid = _first_nonempty_text(tss_df, "comid")
+    reach_code = _first_nonempty_text(tss_df, "reach_code")
+    vpu_id = _first_nonempty_text(tss_df, "vpu_id")
+    rpu_id = _first_nonempty_text(tss_df, "rpu_id")
+    has_riversed_metadata = any(
+        column in tss_df.columns
+        for column in ["river_name", "comid", "reach_code", "vpu_id", "rpu_id", "upstream_area"]
+    )
+
+    geographic_coverage_parts = []
+    if vpu_id:
+        geographic_coverage_parts.append(f"VPUID={vpu_id}")
+    if rpu_id:
+        geographic_coverage_parts.append(f"RPUID={rpu_id}")
+    geographic_coverage = "; ".join(geographic_coverage_parts)
 
     # Sanitize station_id for filename (replace invalid characters)
     safe_station_id = str(station_id).replace('/', '_').replace('\\', '_').replace(':', '_')
@@ -293,8 +474,12 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         area_var = ds.createVariable('upstream_area', 'f4')
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
-        area_var.comment = 'Not available for satellite-derived data'
-        area_var[:] = -9999.0
+        if np.isfinite(upstream_area):
+            area_var.comment = 'Upstream drainage area from modified NHDPlusV2 metadata joined by RiverSed reach ID'
+            area_var[:] = upstream_area
+        else:
+            area_var.comment = 'Not available for satellite-derived data'
+            area_var[:] = -9999.0
 
         # Create data variables
         Q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
@@ -396,6 +581,12 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         ds.station_id = str(station_id)
         ds.data_period_start = start_date.strftime('%Y-%m-%d')
         ds.data_period_end = end_date.strftime('%Y-%m-%d')
+        if has_riversed_metadata:
+            ds.river_name = river_name
+            ds.comid = comid
+            ds.reach_code = reach_code
+            ds.vpu_id = vpu_id
+            ds.rpu_id = rpu_id
 
     # --- build station_info for CSV outputs ---
     n = len(daily_df)
@@ -411,17 +602,21 @@ def create_netcdf_file(station_id, tss_df, output_dir):
         # metadata summary fields
         "station_name": str(station_id).replace("_", " "),
         "Source_ID": str(station_id),
-        "river_name": "",
+        "river_name": river_name,
+        "comid": comid,
+        "reach_code": reach_code,
+        "vpu_id": vpu_id,
+        "rpu_id": rpu_id,
         "longitude": float(longitude) if not np.isnan(longitude) else np.nan,
         "latitude": float(latitude) if not np.isnan(latitude) else np.nan,
         "altitude": float(altitude) if not np.isnan(altitude) else np.nan,
-        "upstream_area": np.nan,
+        "upstream_area": float(upstream_area) if np.isfinite(upstream_area) else np.nan,
         "Data Source Name": "RiverSed / Aquasat (satellite-derived TSS)",
         "Type": "Satellite",
         "Temporal Resolution": "daily",
         "Temporal Span": f"{daily_df['date'].min().strftime('%Y-%m-%d')} to {daily_df['date'].max().strftime('%Y-%m-%d')}",
         "Variables Provided": "SSC",
-        "Geographic Coverage": "",
+        "Geographic Coverage": geographic_coverage,
         "Reference/DOI": "Gardner et al. (2021) doi:10.1029/2020GL088946",
 
         # QC summary fields (QC results CSV会自动挑存在的列)
@@ -469,6 +664,7 @@ def main():
     # Configuration with WSL absolute paths
     aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
     riversed_file = os.path.join(SOURCE_DIR, 'RiverSed_USA_V1.1.txt')
+    riversed_metadata_dbf = RIVERSED_METADATA_DBF
     output_nc_dir = OUTPUT_NC_DIR
     output_qc_dir = OUTPUT_QC_DIR
 
@@ -483,7 +679,7 @@ def main():
     print("="*80)
 
     aquasat_df = load_aquasat_data(aquasat_file)
-    riversed_df = load_riversed_data(riversed_file)
+    riversed_df = load_riversed_data(riversed_file, metadata_dbf_path=riversed_metadata_dbf)
 
     # Process each dataset separately
     print("\n" + "="*80)
@@ -560,9 +756,9 @@ def main():
                 result = future.result()
                 if isinstance(result, dict):
                     stations_info.append(result)
-                    aquasat_success += 1
+                    riversed_success += 1
                 else:
-                    aquasat_failed += 1
+                    riversed_failed += 1
             except Exception as e:
                 print(f"  Station {station_id} failed with error: {e}")
                 riversed_failed += 1
@@ -592,7 +788,7 @@ def main():
     print(f"  Successfully created: {riversed_success}")
     print(f"  Failed (all NaN or no data): {riversed_failed}")
     print(f"\nTotal netCDF files created: {aquasat_success + riversed_success}")
-    print(f"Output directory: {output_dir}/")
+    print(f"Output directory: {output_nc_dir}/")
     print("="*80)
 
 if __name__ == '__main__':
