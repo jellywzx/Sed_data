@@ -16,11 +16,13 @@ import numpy as np
 import pandas as pd
 import netCDF4 as nc
 from datetime import datetime
-import subprocess
 from pathlib import Path
+import struct
 import warnings
 warnings.filterwarnings('ignore')
 import sys
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
@@ -48,61 +50,392 @@ FLAG_SUSPECT = 2    # Suspect data (e.g., extreme values)
 FLAG_BAD = 3        # Bad data (e.g., negative values)
 FLAG_MISSING = 9    # Missing in source
 
+GSED_AREA_LOOKUP_FILENAMES = (
+    'GSED_Reach_upstream_area.csv',
+    'GSED_Reach_upstream_area.tsv',
+    'GSED_Reach_upstream_area.txt',
+    'GSED_Reach_upstream_area.xlsx',
+    'GSED_Reach_upstream_area.xls',
+)
+GSED_AREA_ID_COLUMNS = (
+    'R_ID',
+    'r_id',
+    'RID',
+    'reach_id',
+    'reach_code',
+    'station_id',
+    'Source_ID',
+)
+GSED_AREA_VALUE_COLUMNS = (
+    'upstream_area_km2',
+    'upstream_area',
+    'drainage_area_km2',
+    'drainage_area',
+    'basin_area',
+    'catchment_area',
+    'uparea_km2',
+    'uparea',
+)
+GSED_AREA_ACCEPT_COLUMNS = (
+    'merit_lookup_accept',
+    'lookup_accept',
+    'accept',
+)
 
-def get_geometry_info(shapefile_path, r_id):
+def process_one_reach(task):
+    idx, total, r_id, ssc_data, r_id_str, reach_meta, time_array, output_dir = task
+
+    try:
+        if (idx + 1) % 100 == 0:
+            print(f"\nProcessing reach {r_id} ({idx+1}/{total})...")
+
+        reach_meta = dict(reach_meta) if reach_meta is not None else {}
+        reach_meta.setdefault('r_level', None)
+        reach_meta.setdefault('reach_length_m', None)
+        reach_meta.setdefault('latitude', None)
+        reach_meta.setdefault('longitude', None)
+
+        if pd.isna(reach_meta.get('latitude')) or pd.isna(reach_meta.get('longitude')):
+            print(f"  Warning: Could not extract coordinates for R_ID {r_id}")
+
+        stats = create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir)
+        if stats is not None:
+            return ("success", stats)
+        return ("skip", None)
+
+    except Exception as e:
+        return ("error", f"R_ID {r_id}: {e}")
+
+def _normalize_gsed_rid(value):
     """
-    Extract centroid coordinates from shapefile for given R_ID using ogrinfo
+    Normalize GSED reach IDs to a stable string representation.
 
     Args:
-        shapefile_path: Path to shapefile
-        r_id: Reach ID
+        value: Raw R_ID value from CSV/DBF
 
     Returns:
-        tuple: (latitude, longitude, reach_length)
+        str: Reach ID without scientific notation
     """
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
     try:
-        cmd = f'ogrinfo -al {shapefile_path} -where "R_ID={r_id}"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return str(int(float(text)))
+    except (TypeError, ValueError):
+        return text
 
-        if result.returncode != 0:
-            return None, None, None
 
-        lines = result.stdout.split('\n')
-        for i, line in enumerate(lines):
-            if 'LINESTRING' in line:
-                # Extract coordinates from LINESTRING
-                coords_str = line.split('LINESTRING')[1].strip()
-                coords_str = coords_str.replace('(', '').replace(')', '')
-                coords = coords_str.split(',')
+def _derive_basin_info_from_rid(r_id):
+    """
+    Recover hierarchical basin prefixes from the public GSED R_ID code.
 
-                # Calculate centroid from all points
-                lons = []
-                lats = []
-                for coord in coords:
-                    parts = coord.strip().split()
-                    if len(parts) >= 2:
-                        lons.append(float(parts[0]))
-                        lats.append(float(parts[1]))
+    The public GSED release only exposes R_ID/R_level in the shapefile.
+    The original intermediary catchment fields were removed before export,
+    so we preserve the recoverable basin hierarchy through R_ID prefixes.
+    """
+    r_id_str = _normalize_gsed_rid(r_id)
+    if r_id_str is None:
+        return {
+            'r_id_str': None,
+            'basin_code_l1': None,
+            'basin_code_l2': None,
+            'basin_code_l3': None,
+            'basin_code_l4': None,
+        }
 
-                if lons and lats:
-                    lon = np.mean(lons)
-                    lat = np.mean(lats)
-                    length = None
+    return {
+        'r_id_str': r_id_str,
+        'basin_code_l1': r_id_str[:2] if len(r_id_str) >= 2 else r_id_str,
+        'basin_code_l2': r_id_str[:5] if len(r_id_str) >= 5 else r_id_str,
+        'basin_code_l3': r_id_str[:8] if len(r_id_str) >= 8 else r_id_str,
+        'basin_code_l4': r_id_str,
+    }
 
-                    # Try to get Length attribute
-                    for line in lines:
-                        if 'Length (Real)' in line:
-                            try:
-                                length = float(line.split('=')[1].strip())
-                            except:
-                                pass
 
-                    return lat, lon, length
+def _read_gsed_dbf_records(dbf_path):
+    """
+    Read the minimal attribute table needed from GSED_Reach.dbf.
 
-        return None, None, None
+    Returns records in shapefile order so they can be paired with .shp
+    geometries without any external GIS dependency.
+    """
+    records = []
+    with open(dbf_path, 'rb') as handle:
+        header = handle.read(32)
+        if len(header) < 32:
+            raise ValueError(f"Invalid DBF header: {dbf_path}")
+
+        record_count = struct.unpack('<I', header[4:8])[0]
+        record_length = struct.unpack('<H', header[10:12])[0]
+
+        fields = []
+        while True:
+            first = handle.read(1)
+            if not first:
+                break
+            if first == b'\r':
+                break
+            descriptor = first + handle.read(31)
+            name = descriptor[:11].split(b'\x00', 1)[0].decode('ascii', 'ignore')
+            fields.append((name, descriptor[11:12].decode('ascii', 'ignore'), descriptor[16], descriptor[17]))
+
+        for _ in range(record_count):
+            record = handle.read(record_length)
+            if not record:
+                break
+
+            deleted = record[:1] == b'*'
+            row = {'_deleted': deleted}
+            offset = 1
+
+            for name, field_type, length, decimals in fields:
+                raw = record[offset:offset + length]
+                offset += length
+                text = raw.decode('latin1', 'ignore').strip()
+
+                if name not in {'R_ID', 'R_level', 'Length'}:
+                    continue
+
+                if not text:
+                    row[name] = None
+                    continue
+
+                if field_type in {'N', 'F'}:
+                    try:
+                        value = float(text)
+                        if decimals == 0:
+                            value = int(value)
+                        row[name] = value
+                    except ValueError:
+                        row[name] = text
+                else:
+                    row[name] = text
+
+            records.append(row)
+
+    return records
+
+
+def _extract_polyline_centroid(record_content):
+    """
+    Extract a simple centroid from a polyline shapefile record.
+
+    This mirrors the previous implementation, which used the mean of
+    all vertices returned by ogrinfo.
+    """
+    if len(record_content) < 44:
+        return None, None
+
+    shape_type = struct.unpack('<i', record_content[:4])[0]
+    if shape_type == 0:
+        return None, None
+
+    if shape_type != 3:
+        raise ValueError(f"Unsupported shapefile geometry type: {shape_type}")
+
+    num_points = struct.unpack('<i', record_content[40:44])[0]
+    points_offset = 44 + 4 * struct.unpack('<i', record_content[36:40])[0]
+    points_end = points_offset + num_points * 16
+
+    if points_end > len(record_content):
+        raise ValueError("Corrupted polyline record in shapefile.")
+
+    if num_points == 0:
+        return None, None
+
+    lons = []
+    lats = []
+    for i in range(num_points):
+        x, y = struct.unpack('<2d', record_content[points_offset + i * 16: points_offset + (i + 1) * 16])
+        lons.append(x)
+        lats.append(y)
+
+    return float(np.mean(lats)), float(np.mean(lons))
+
+
+def load_gsed_reach_metadata(shapefile_path, target_rids=None):
+    """
+    Load GSED reach geometry and basin metadata once.
+
+    Args:
+        shapefile_path: Path to GSED_Reach.shp
+        target_rids: Optional set of reach IDs to keep
+
+    Returns:
+        dict: {R_ID string: metadata dict}
+    """
+    shapefile_path = Path(shapefile_path)
+    dbf_records = _read_gsed_dbf_records(shapefile_path.with_suffix('.dbf'))
+    target_rids = {_normalize_gsed_rid(r_id) for r_id in target_rids} if target_rids else None
+    metadata = {}
+
+    try:
+        with open(shapefile_path, 'rb') as handle:
+            handle.read(100)  # shapefile header
+
+            for record_index, dbf_row in enumerate(dbf_records):
+                record_header = handle.read(8)
+                if not record_header:
+                    break
+
+                content_length_words = struct.unpack('>i', record_header[4:8])[0]
+                content = handle.read(content_length_words * 2)
+
+                if dbf_row.get('_deleted'):
+                    continue
+
+                r_id_str = _normalize_gsed_rid(dbf_row.get('R_ID'))
+                if r_id_str is None:
+                    continue
+
+                if target_rids and r_id_str not in target_rids:
+                    continue
+
+                lat, lon = _extract_polyline_centroid(content)
+                basin_info = _derive_basin_info_from_rid(r_id_str)
+                metadata[r_id_str] = {
+                    'r_id_str': r_id_str,
+                    'r_level': int(dbf_row['R_level']) if dbf_row.get('R_level') is not None else None,
+                    'reach_length_m': float(dbf_row['Length']) if dbf_row.get('Length') is not None else None,
+                    'latitude': lat,
+                    'longitude': lon,
+                    **basin_info,
+                }
+
+        return metadata
     except Exception as e:
-        print(f"Error getting geometry for R_ID {r_id}: {e}")
-        return None, None, None
+        print(f"Error loading GSED reach metadata from {shapefile_path}: {e}")
+        return metadata
+
+
+def find_gsed_area_lookup_file(source_dir):
+    """
+    Locate an optional external lookup table that maps R_ID to upstream area.
+
+    Search order:
+    1. Environment variable GSED_UPSTREAM_AREA_FILE
+    2. Standard filenames in the nested GSED source folder
+    3. Standard filenames in the parent GSED source folder
+    """
+    env_path = os.environ.get('GSED_UPSTREAM_AREA_FILE')
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.exists():
+            return candidate
+        print(f"Warning: GSED_UPSTREAM_AREA_FILE not found: {candidate}")
+
+    search_roots = [Path(source_dir), Path(source_dir).parent]
+    for root in search_roots:
+        for filename in GSED_AREA_LOOKUP_FILENAMES:
+            candidate = root / filename
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
+def _read_gsed_area_table(file_path):
+    """Read a CSV/TSV/TXT/Excel lookup table with pandas."""
+    file_path = Path(file_path)
+    suffix = file_path.suffix.lower()
+
+    if suffix == '.csv':
+        return pd.read_csv(file_path)
+    if suffix == '.tsv':
+        return pd.read_csv(file_path, sep='\t')
+    if suffix == '.txt':
+        return pd.read_csv(file_path, sep=None, engine='python')
+    if suffix in {'.xlsx', '.xls'}:
+        return pd.read_excel(file_path)
+
+    raise ValueError(f"Unsupported lookup table format: {file_path}")
+
+
+def load_gsed_area_lookup(file_path, target_rids=None):
+    """
+    Load an external R_ID -> upstream_area_km2 table.
+
+    The table is expected to provide at least one ID column and one area
+    column. Area values are interpreted as km2 because downstream basin
+    scripts expect reported_area in square kilometres.
+    """
+    df = _read_gsed_area_table(file_path)
+    if df.empty:
+        raise ValueError(f"Area lookup table is empty: {file_path}")
+
+    id_col = next((col for col in GSED_AREA_ID_COLUMNS if col in df.columns), None)
+    if id_col is None:
+        raise ValueError(
+            f"Area lookup table {file_path} is missing an R_ID column. "
+            f"Supported names: {', '.join(GSED_AREA_ID_COLUMNS)}"
+        )
+
+    area_col = next((col for col in GSED_AREA_VALUE_COLUMNS if col in df.columns), None)
+    if area_col is None:
+        raise ValueError(
+            f"Area lookup table {file_path} is missing an upstream area column. "
+            f"Supported names: {', '.join(GSED_AREA_VALUE_COLUMNS)}"
+        )
+
+    area_df = df[[id_col, area_col]].copy()
+    accept_col = next((col for col in GSED_AREA_ACCEPT_COLUMNS if col in df.columns), None)
+    if accept_col is not None:
+        accept_mask = (
+            df[accept_col]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({'1', 'true', 'yes', 'y', 't'})
+        )
+        area_df = area_df.loc[accept_mask].copy()
+    area_df['r_id_str'] = area_df[id_col].map(_normalize_gsed_rid)
+    area_df['upstream_area_km2'] = pd.to_numeric(area_df[area_col], errors='coerce')
+    area_df = area_df.dropna(subset=['r_id_str', 'upstream_area_km2'])
+
+    if target_rids is not None:
+        area_df = area_df[area_df['r_id_str'].isin(target_rids)]
+
+    duplicate_count = int(area_df['r_id_str'].duplicated(keep='first').sum())
+    if duplicate_count:
+        print(
+            f"Warning: {duplicate_count} duplicate R_ID rows found in "
+            f"{file_path.name}; keeping the first non-missing value."
+        )
+        area_df = area_df.drop_duplicates(subset=['r_id_str'], keep='first')
+
+    return {
+        row['r_id_str']: {
+            'upstream_area_km2': float(row['upstream_area_km2']),
+            'upstream_area_source': str(Path(file_path).name),
+        }
+        for _, row in area_df.iterrows()
+    }
+
+
+def merge_gsed_area_lookup(reach_metadata, area_lookup, target_rids=None):
+    """
+    Merge an external upstream-area lookup into the reach metadata mapping.
+    """
+    target_rids = set(target_rids) if target_rids is not None else None
+    attached_count = 0
+
+    for r_id_str, area_meta in area_lookup.items():
+        if target_rids is not None and r_id_str not in target_rids:
+            continue
+
+        reach_meta = reach_metadata.setdefault(r_id_str, _derive_basin_info_from_rid(r_id_str))
+        reach_meta.setdefault('r_level', None)
+        reach_meta.setdefault('reach_length_m', None)
+        reach_meta.setdefault('latitude', None)
+        reach_meta.setdefault('longitude', None)
+        reach_meta.update(area_meta)
+        attached_count += 1
+
+    return attached_count
 
 def create_time_array(start_year=1985, start_month=1, n_months=432):
     """
@@ -239,7 +572,7 @@ def find_data_period(ssc_data, flags):
 
     return start_idx, end_idx
 
-def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
+def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
     """
     Create CF-1.8 compliant netCDF file for a single station
 
@@ -247,14 +580,23 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
         r_id: Reach ID
         ssc_data: Array of SSC values
         time_array: Array of time values
-        lat: Station latitude
-        lon: Station longitude
-        length: Reach length (meters)
+        reach_meta: Reach metadata dictionary
         output_dir: Output directory path
 
     Returns:
         dict: Statistics for the station (for CSV summary)
     """
+    lat = reach_meta.get('latitude')
+    lon = reach_meta.get('longitude')
+    length = reach_meta.get('reach_length_m')
+    reach_level = reach_meta.get('r_level')
+    basin_code_l1 = reach_meta.get('basin_code_l1')
+    basin_code_l2 = reach_meta.get('basin_code_l2')
+    basin_code_l3 = reach_meta.get('basin_code_l3')
+    basin_code_l4 = reach_meta.get('basin_code_l4')
+    upstream_area_km2 = reach_meta.get('upstream_area_km2')
+    upstream_area_source = reach_meta.get('upstream_area_source')
+
     # Apply QC and get flags
     ssc_qc, flags, qc_stats = apply_gsed_qc_with_tool(ssc_data)
 
@@ -270,16 +612,16 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
     # Find data period
     start_idx, end_idx = find_data_period(ssc_qc, flags)
 
+    if start_idx is None:
+        print(f"Reach {r_id}: No valid SSC data, skipping...")
+        return None
+
     trimmed = qc_stats['n_total'] - (end_idx - start_idx)
 
     print(
         f"  trimmed (no data at edges): {trimmed}\n"
         f"  retained for output       : {end_idx - start_idx}"
     )
-
-    if start_idx is None:
-        print(f"Reach {r_id}: No valid SSC data, skipping...")
-        return None
 
     # Subset data to valid period
     ssc_subset = ssc_qc[start_idx:end_idx]
@@ -331,6 +673,15 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
         lon_var.units = 'degrees_east'
         lon_var.valid_range = np.array([-180.0, 180.0], dtype='f4')
         lon_var[:] = lon if lon is not None else np.nan
+
+        # Optional drainage area metadata. scripts_basin_test reads this field
+        # as reported_area when it exists.
+        if upstream_area_km2 is not None and pd.notna(upstream_area_km2):
+            area_var = ds.createVariable('upstream_area', 'f4')
+            area_var.long_name = 'upstream drainage area'
+            area_var.units = 'km2'
+            area_var.comment = 'Upstream drainage area used as reported_area by scripts_basin_test.'
+            area_var[:] = float(upstream_area_km2)
 
         # ===== Data Variables =====
         # Q (Discharge) - Not available in GSED
@@ -405,9 +756,37 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
         # Data Source Information
         ds.data_source_name = 'GSED Dataset'
         ds.Source_ID = str(int(r_id))
+        ds.station_id = str(int(r_id))
+        ds.station_name = str(int(r_id))
         ds.reach_id = str(int(r_id))
         ds.source = 'Satellite station'
         ds.Type = 'Satellite'
+        if pd.notna(reach_level):
+            ds.reach_level = int(reach_level)
+        if basin_code_l1:
+            ds.basin_code_l1 = basin_code_l1
+        if basin_code_l2:
+            ds.basin_code_l2 = basin_code_l2
+        if basin_code_l3:
+            ds.basin_code_l3 = basin_code_l3
+        if basin_code_l4:
+            ds.basin_code_l4 = basin_code_l4
+            ds.reach_code = basin_code_l4
+        if basin_code_l1:
+            ds.vpu_id = basin_code_l1
+        if basin_code_l3:
+            ds.rpu_id = basin_code_l3
+        ds.basin_info_note = (
+            'Public GSED source data exposes basin hierarchy through R_ID and '
+            'R_level. Explicit basin-name/catchment-name fields are not included '
+            'in the released shapefile.'
+        )
+        ds.source_reach_hierarchy_note = (
+            'reach_code uses the original public GSED R_ID; vpu_id and rpu_id '
+            'store coarse and intermediate basin prefixes derived from that R_ID '
+            'so downstream basin scripts can retain GSED basin hierarchy without '
+            'custom code changes.'
+        )
 
         # Temporal Information
         ds.temporal_resolution = 'monthly'
@@ -425,6 +804,10 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
 
         if length is not None:
             ds.reach_length_m = float(length)
+        if upstream_area_km2 is not None and pd.notna(upstream_area_km2):
+            ds.upstream_area = float(upstream_area_km2)
+            if upstream_area_source:
+                ds.upstream_area_source = upstream_area_source
 
         # Variables
         ds.variables_provided = 'Q, SSC, SSL'
@@ -471,9 +854,16 @@ def create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir):
     stats = {
         'Source_ID': int(r_id),
         'reach_id': int(r_id),
+        'reach_level': reach_level if reach_level is not None else np.nan,
+        'basin_code_l1': basin_code_l1 if basin_code_l1 is not None else '',
+        'basin_code_l2': basin_code_l2 if basin_code_l2 is not None else '',
+        'basin_code_l3': basin_code_l3 if basin_code_l3 is not None else '',
+        'basin_code_l4': basin_code_l4 if basin_code_l4 is not None else '',
         'longitude': lon if lon is not None else np.nan,
         'latitude': lat if lat is not None else np.nan,
         'reach_length_m': length if length is not None else np.nan,
+        'upstream_area_km2': upstream_area_km2 if upstream_area_km2 is not None else np.nan,
+        'upstream_area_source': upstream_area_source if upstream_area_source is not None else '',
         'SSC_start_date': f'{start_year}-{start_month:02d}',
         'SSC_end_date': f'{end_year}-{end_month:02d}',
         'SSC_percent_complete': percent_complete,
@@ -515,7 +905,10 @@ def create_summary_csv(stats_list, output_dir):
 
     # Reorder columns
     columns = [
-        'Source_ID', 'reach_id', 'longitude', 'latitude', 'reach_length_m',
+        'Source_ID', 'reach_id', 'reach_level',
+        'basin_code_l1', 'basin_code_l2', 'basin_code_l3', 'basin_code_l4',
+        'longitude', 'latitude', 'reach_length_m', 'upstream_area_km2',
+        'upstream_area_source',
         'Data Source Name', 'Type', 'Temporal Resolution', 'temporal_span',
         'Variables Provided', 'Geographic Coverage', 'Reference/DOI',
         'Q_start_date', 'Q_end_date', 'Q_percent_complete',
@@ -553,6 +946,26 @@ def main():
     df = pd.read_csv(csv_file)
     print(f"Found {len(df)} reaches in CSV file")
 
+    target_rids = {_normalize_gsed_rid(r_id) for r_id in df['R_ID'].tolist()}
+    print(f"Loading reach metadata from shapefile: {shapefile}")
+    reach_metadata = load_gsed_reach_metadata(shapefile, target_rids=target_rids)
+    print(f"Loaded metadata for {len(reach_metadata)} reaches used by GSED")
+
+    area_lookup_file = find_gsed_area_lookup_file(source_dir)
+    if area_lookup_file is not None:
+        print(f"Loading external upstream area lookup: {area_lookup_file}")
+        area_lookup = load_gsed_area_lookup(area_lookup_file, target_rids=target_rids)
+        attached_count = merge_gsed_area_lookup(reach_metadata, area_lookup, target_rids=target_rids)
+        print(
+            f"Attached upstream area metadata to {attached_count} reaches from "
+            f"{area_lookup_file.name}"
+        )
+    else:
+        print(
+            "No external upstream-area lookup found. Continuing without "
+            "reported drainage area for GSED."
+        )
+
     # Create time array for all months (1985-01 to 2020-12)
     time_array = create_time_array(1985, 1, 432)
 
@@ -561,36 +974,47 @@ def main():
     success_count = 0
     skip_count = 0
     error_count = 0
+    tasks = []
+    total = len(df)
 
     for idx, row in df.iterrows():
         r_id = row['R_ID']
-
-        # Extract SSC data (all columns except first one which is R_ID)
+        r_id_str = _normalize_gsed_rid(r_id)
         ssc_data = row.iloc[1:].values.astype(float)
 
-        try:
-            # Get geometry info from shapefile
-            if (idx + 1) % 100 == 0:
-                print(f"\nProcessing reach {r_id} ({idx+1}/{len(df)})...")
+        reach_meta = reach_metadata.get(r_id_str, _derive_basin_info_from_rid(r_id_str))
 
-            lat, lon, length = get_geometry_info(str(shapefile), r_id)
+        tasks.append((
+            idx,
+            total,
+            r_id,
+            ssc_data,
+            r_id_str,
+            reach_meta,
+            time_array,
+            output_dir,
+        ))
 
-            if lat is None or lon is None:
-                print(f"  Warning: Could not extract coordinates for R_ID {r_id}")
+    stats_list = []
+    success_count = 0
+    skip_count = 0
+    error_count = 0
 
-            # Create netCDF file
-            stats = create_netcdf(r_id, ssc_data, time_array, lat, lon, length, output_dir)
+    max_workers = max(1, min(os.cpu_count() or 1, 16))
 
-            if stats is not None:
-                stats_list.append(stats)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_one_reach, task) for task in tasks]
+
+        for future in as_completed(futures):
+            status, payload = future.result()
+            if status == "success":
+                stats_list.append(payload)
                 success_count += 1
-            else:
+            elif status == "skip":
                 skip_count += 1
-
-        except Exception as e:
-            print(f"Error processing reach {r_id}: {e}")
-            error_count += 1
-            continue
+            else:
+                print(f"Error processing reach: {payload}")
+                error_count += 1
 
     # Create summary CSV
     if stats_list:
