@@ -34,6 +34,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+_HELPER_DIR = Path(__file__).resolve().parents[2] / "Output_r" / "scripts_basin_test"
+if str(_HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(_HELPER_DIR))
+
+from gsed_reach_hint import load_gsed_reach_metadata as _shared_load_gsed_reach_metadata
+from gsed_reach_hint import normalize_gsed_rid as _shared_normalize_gsed_rid
+from gsed_reach_hint import resolve_gsed_anchor as _shared_resolve_gsed_anchor
+
 
 _WORKER_TRACER = None
 _WORKER_CLASSIFY_BASIN_RESULT = None
@@ -43,17 +51,7 @@ _WORKER_CLEAR_CACHE_EVERY = None
 
 def _normalize_gsed_rid(value):
     """Normalize a raw GSED reach id to a stable integer-like string."""
-    if pd.isna(value):
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    try:
-        return str(int(float(text)))
-    except (TypeError, ValueError):
-        return text
+    return _shared_normalize_gsed_rid(value)
 
 
 def _derive_basin_info_from_rid(r_id):
@@ -266,109 +264,15 @@ def _extract_polyline_centroid(record_content):
 
 def load_gsed_reach_metadata(shapefile_path, target_rids=None):
     """Load GSED reach geometry anchors and basic metadata from the shapefile."""
-    shapefile_path = Path(shapefile_path)
-    dbf_records = _read_gsed_dbf_records(shapefile_path.with_suffix(".dbf"))
-    target_rids = {_normalize_gsed_rid(r_id) for r_id in target_rids} if target_rids else None
-    metadata = {}
-
-    with open(shapefile_path, "rb") as handle:
-        handle.read(100)  # ESRI shapefile fixed-length file header.
-
-        for dbf_row in dbf_records:
-            # In the ESRI shapefile format, the .dbf attribute table and the .shp
-            # geometry records are aligned by record order. The loop below keeps
-            # them in lockstep so we can recover coordinates without geopandas.
-            record_header = handle.read(8)
-            if not record_header:
-                break
-
-            content_length_words = struct.unpack(">i", record_header[4:8])[0]
-            content = handle.read(content_length_words * 2)
-
-            if dbf_row.get("_deleted"):
-                continue
-
-            r_id_str = _normalize_gsed_rid(dbf_row.get("R_ID"))
-            if r_id_str is None:
-                continue
-            if target_rids and r_id_str not in target_rids:
-                continue
-
-            # The public release does not carry an explicit outlet point, so we
-            # reconstruct both:
-            #   - a centroid-like fallback point; and
-            #   - all unique part endpoints, which are later tested against
-            #     MERIT to infer the downstream anchor.
-            centroid_lat, centroid_lon, endpoint_candidates = _extract_polyline_representatives(content)
-            metadata[r_id_str] = {
-                "r_id_str": r_id_str,
-                "r_level": int(dbf_row["R_level"]) if dbf_row.get("R_level") is not None else None,
-                "reach_length_m": float(dbf_row["Length"]) if dbf_row.get("Length") is not None else None,
-                "latitude": centroid_lat,
-                "longitude": centroid_lon,
-                "centroid_latitude": centroid_lat,
-                "centroid_longitude": centroid_lon,
-                "endpoint_candidates": endpoint_candidates,
-                **_derive_basin_info_from_rid(r_id_str),
-            }
-
+    metadata = _shared_load_gsed_reach_metadata(shapefile_path, target_rids=target_rids)
+    for r_id_str, meta in metadata.items():
+        meta.update(_derive_basin_info_from_rid(r_id_str))
     return metadata
 
 
 def _resolve_gsed_anchor(tracer, meta):
     """Choose the final GSED anchor and matched MERIT reach for one reach."""
-    endpoint_matches = []
-    endpoint_candidates = meta.get("endpoint_candidates") or []
-
-    for candidate_index, endpoint in enumerate(endpoint_candidates):
-        lat = endpoint.get("latitude")
-        lon = endpoint.get("longitude")
-        if not _has_valid_coordinate_pair(lat, lon):
-            continue
-
-        reach_info = tracer.find_best_reach(float(lon), float(lat), reported_area=None)
-        if not _is_valid_reach_info(reach_info):
-            continue
-
-        endpoint_matches.append(
-            {
-                "candidate_index": candidate_index,
-                "latitude": float(lat),
-                "longitude": float(lon),
-                "reach_info": reach_info,
-            }
-        )
-
-    if endpoint_matches:
-        endpoint_matches.sort(
-            key=lambda item: (
-                -_safe_float(item["reach_info"].get("uparea"), default=-np.inf),
-                _safe_float(item["reach_info"].get("distance"), default=np.inf),
-                item["candidate_index"],
-            )
-        )
-        best_endpoint = endpoint_matches[0]
-        return {
-            "anchor_source": "downstream_endpoint",
-            "endpoint_match_count": len(endpoint_matches),
-            "latitude": best_endpoint["latitude"],
-            "longitude": best_endpoint["longitude"],
-            "reach_info": best_endpoint["reach_info"],
-        }
-
-    centroid_lat = meta.get("centroid_latitude", meta.get("latitude"))
-    centroid_lon = meta.get("centroid_longitude", meta.get("longitude"))
-    reach_info = _empty_reach_info()
-    if _has_valid_coordinate_pair(centroid_lat, centroid_lon):
-        reach_info = tracer.find_best_reach(float(centroid_lon), float(centroid_lat), reported_area=None)
-
-    return {
-        "anchor_source": "centroid_fallback",
-        "endpoint_match_count": 0,
-        "latitude": centroid_lat,
-        "longitude": centroid_lon,
-        "reach_info": reach_info,
-    }
+    return _shared_resolve_gsed_anchor(tracer, meta, allow_centroid_fallback=True)
 
 
 def _point_is_covered_by_geometries(geometries, point):

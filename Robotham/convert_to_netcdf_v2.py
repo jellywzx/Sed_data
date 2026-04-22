@@ -51,7 +51,7 @@ DEFAULT_SOURCE_DIR = os.fspath(
     resolve_source_root(start=__file__) / "Robotham" / "data"
 )
 DEFAULT_OUTPUT_DIR = os.fspath(
-    resolve_output_root(start=__file__) / "daily" / "Robotham"
+    resolve_output_root(start=__file__) / "daily" / "Robotham"/"qc"
 )
 
 # Station metadata
