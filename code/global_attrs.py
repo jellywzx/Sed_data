@@ -64,7 +64,7 @@ ATTR_PRIORITY_MAP = {
     "date_created": ["date_created"],
     "date_modified": ["date_modified"],
     "featureType": ["featureType"],
-    "station_id": ["station_id", "Source_ID", "source_id", "location_id"],
+    "station_id": ["station_id", "Source_ID", "Station_ID", "source_id", "stationID", "ID", "location_id"],
     "station_name": ["station_name"],
     "river_name": ["river_name"],
     "station_location": ["station_location"],
