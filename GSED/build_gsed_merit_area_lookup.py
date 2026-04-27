@@ -8,13 +8,13 @@ without changing scripts_basin_test.
 Matching workflow, end to end
 -----------------------------
 1. Read the public GSED reach ids (R_ID) from the monthly CSV.
-2. Reconstruct both centroid and endpoint candidates from GSED_Reach.shp.
+2. Reconstruct both midpoint and endpoint candidates from GSED_Reach.shp.
 3. Match each endpoint candidate to nearby MERIT reaches and select the
    downstream endpoint proxy by preferring the candidate whose matched MERIT
    reach has the largest uparea.
 4. Reuse that already matched MERIT reach directly when tracing the upstream
    basin, instead of asking the tracer to run a second find_best_reach() pass.
-5. If all endpoint matches fail, fall back to one centroid-based reach match.
+5. If all endpoint matches fail, fall back to one midpoint-based reach match.
 6. Run the shared basin release policy from basin_policy.py so that this lookup
    follows the exact same accept/reject semantics as the downstream basin
    workflow.
@@ -27,7 +27,6 @@ points; MERIT still supplies COMID-level upstream area and basin polygons.
 import argparse
 import multiprocessing as mp
 import os
-import struct
 import sys
 from pathlib import Path
 
@@ -73,65 +72,6 @@ def _derive_basin_info_from_rid(r_id):
     }
 
 
-def _read_gsed_dbf_records(dbf_path):
-    """Read the minimal GSED DBF attributes without requiring GIS libraries."""
-    records = []
-    with open(dbf_path, "rb") as handle:
-        header = handle.read(32)
-        if len(header) < 32:
-            raise ValueError(f"Invalid DBF header: {dbf_path}")
-
-        record_count = struct.unpack("<I", header[4:8])[0]
-        record_length = struct.unpack("<H", header[10:12])[0]
-
-        fields = []
-        while True:
-            # DBF field descriptors end with 0x0D. Each descriptor is 32 bytes.
-            first = handle.read(1)
-            if not first or first == b"\r":
-                break
-            descriptor = first + handle.read(31)
-            name = descriptor[:11].split(b"\x00", 1)[0].decode("ascii", "ignore")
-            fields.append((name, descriptor[11:12].decode("ascii", "ignore"), descriptor[16], descriptor[17]))
-
-        for _ in range(record_count):
-            record = handle.read(record_length)
-            if not record:
-                break
-
-            deleted = record[:1] == b"*"
-            row = {"_deleted": deleted}
-            offset = 1
-
-            for name, field_type, length, decimals in fields:
-                raw = record[offset:offset + length]
-                offset += length
-                text = raw.decode("latin1", "ignore").strip()
-
-                # The lookup only needs the reach id, hierarchy level, and length.
-                if name not in {"R_ID", "R_level", "Length"}:
-                    continue
-
-                if not text:
-                    row[name] = None
-                    continue
-
-                if field_type in {"N", "F"}:
-                    try:
-                        value = float(text)
-                        if decimals == 0:
-                            value = int(value)
-                        row[name] = value
-                    except ValueError:
-                        row[name] = text
-                else:
-                    row[name] = text
-
-            records.append(row)
-
-    return records
-
-
 def _empty_reach_info():
     """Return the failed-match structure used by basin_tracer.find_best_reach."""
     return {
@@ -145,7 +85,7 @@ def _empty_reach_info():
 
 
 def _build_missing_coords_row(r_id_str):
-    """Return the fixed CSV row used when a GSED reach has no usable anchor."""
+    """Return the fixed CSV row used when a GSED reach has no usable midpoint."""
     return {
         "R_ID": r_id_str,
         "upstream_area_km2": np.nan,
@@ -164,6 +104,8 @@ def _build_missing_coords_row(r_id_str):
         "gsed_endpoint_match_count": 0,
         "gsed_lat": np.nan,
         "gsed_lon": np.nan,
+        "gsed_anchor_lat": np.nan,
+        "gsed_anchor_lon": np.nan,
         **_derive_basin_info_from_rid(r_id_str),
     }
 
@@ -190,80 +132,8 @@ def _is_valid_reach_info(reach_info):
     return comid is not None and not pd.isna(comid)
 
 
-def _extract_polyline_representatives(record_content):
-    """Extract centroid and unique part endpoints from a polyline record."""
-    if len(record_content) < 44:
-        return None, None, []
-
-    shape_type = struct.unpack("<i", record_content[:4])[0]
-    if shape_type == 0:
-        return None, None, []
-    if shape_type != 3:
-        raise ValueError(f"Unsupported shapefile geometry type: {shape_type}")
-
-    # PolyLine record layout: bbox + numParts + numPoints + parts[] + points[].
-    num_parts = struct.unpack("<i", record_content[36:40])[0]
-    num_points = struct.unpack("<i", record_content[40:44])[0]
-    parts_offset = 44
-    points_offset = parts_offset + 4 * num_parts
-    points_end = points_offset + num_points * 16
-
-    if points_end > len(record_content):
-        raise ValueError("Corrupted polyline record in shapefile.")
-    if num_points == 0:
-        return None, None, []
-
-    part_starts = [
-        struct.unpack(
-            "<i",
-            record_content[parts_offset + i * 4: parts_offset + (i + 1) * 4],
-        )[0]
-        for i in range(num_parts)
-    ]
-    if not part_starts:
-        part_starts = [0]
-    part_starts.append(num_points)
-
-    lons = []
-    lats = []
-    for i in range(num_points):
-        x, y = struct.unpack(
-            "<2d",
-            record_content[points_offset + i * 16: points_offset + (i + 1) * 16],
-        )
-        lons.append(x)
-        lats.append(y)
-
-    endpoint_candidates = []
-    seen = set()
-    for part_start, part_end in zip(part_starts[:-1], part_starts[1:]):
-        if part_end <= part_start:
-            continue
-        for point_idx in (part_start, part_end - 1):
-            lat = float(lats[point_idx])
-            lon = float(lons[point_idx])
-            key = (round(lat, 12), round(lon, 12))
-            if key in seen:
-                continue
-            seen.add(key)
-            endpoint_candidates.append(
-                {
-                    "latitude": lat,
-                    "longitude": lon,
-                }
-            )
-
-    return float(np.mean(lats)), float(np.mean(lons)), endpoint_candidates
-
-
-def _extract_polyline_centroid(record_content):
-    """Approximate a reach centroid by averaging all polyline vertices."""
-    centroid_lat, centroid_lon, _ = _extract_polyline_representatives(record_content)
-    return centroid_lat, centroid_lon
-
-
 def load_gsed_reach_metadata(shapefile_path, target_rids=None):
-    """Load GSED reach geometry anchors and basic metadata from the shapefile."""
+    """Load GSED reach midpoint metadata and anchor candidates."""
     metadata = _shared_load_gsed_reach_metadata(shapefile_path, target_rids=target_rids)
     for r_id_str, meta in metadata.items():
         meta.update(_derive_basin_info_from_rid(r_id_str))
@@ -272,7 +142,7 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
 
 def _resolve_gsed_anchor(tracer, meta):
     """Choose the final GSED anchor and matched MERIT reach for one reach."""
-    return _shared_resolve_gsed_anchor(tracer, meta, allow_centroid_fallback=True)
+    return _shared_resolve_gsed_anchor(tracer, meta, allow_midpoint_fallback=True)
 
 
 def _point_is_covered_by_geometries(geometries, point):
@@ -439,20 +309,20 @@ def _load_basin_tracer(basin_tracer_dir):
 def _build_lookup_row(r_id_str, meta, tracer, classify_basin_result):
     """Build one output row for a single GSED reach id."""
     meta = meta or _derive_basin_info_from_rid(r_id_str)
-    centroid_lat = meta.get("centroid_latitude", meta.get("latitude"))
-    centroid_lon = meta.get("centroid_longitude", meta.get("longitude"))
+    midpoint_lat = meta.get("midpoint_latitude", meta.get("latitude"))
+    midpoint_lon = meta.get("midpoint_longitude", meta.get("longitude"))
     endpoint_candidates = meta.get("endpoint_candidates") or []
     has_valid_endpoint = any(
         _has_valid_coordinate_pair(candidate.get("latitude"), candidate.get("longitude"))
         for candidate in endpoint_candidates
     )
-    has_valid_centroid = _has_valid_coordinate_pair(centroid_lat, centroid_lon)
+    has_valid_midpoint = _has_valid_coordinate_pair(midpoint_lat, midpoint_lon)
 
-    if not has_valid_endpoint and not has_valid_centroid:
+    if not has_valid_endpoint and not has_valid_midpoint:
         return _build_missing_coords_row(r_id_str)
 
     # Stage 1: resolve the final GSED anchor. Endpoints are tested first;
-    # if none yields a MERIT reach match, we fall back to the centroid.
+    # if none yields a MERIT reach match, we fall back to the reach midpoint.
     anchor_result = _resolve_gsed_anchor(tracer, meta)
     anchor_lat = anchor_result.get("latitude")
     anchor_lon = anchor_result.get("longitude")
@@ -510,8 +380,10 @@ def _build_lookup_row(r_id_str, meta, tracer, classify_basin_result):
         "merit_lookup_accept": merit_accept,
         "gsed_anchor_source": anchor_result.get("anchor_source", ""),
         "gsed_endpoint_match_count": int(anchor_result.get("endpoint_match_count", 0)),
-        "gsed_lat": _safe_float(anchor_lat),
-        "gsed_lon": _safe_float(anchor_lon),
+        "gsed_lat": _safe_float(midpoint_lat),
+        "gsed_lon": _safe_float(midpoint_lon),
+        "gsed_anchor_lat": _safe_float(anchor_lat),
+        "gsed_anchor_lon": _safe_float(anchor_lon),
         **_derive_basin_info_from_rid(r_id_str),
     }
 

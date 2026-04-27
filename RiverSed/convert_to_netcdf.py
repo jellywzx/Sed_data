@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Convert Aquasat and RiverSed CSV data to netCDF format
 Following HYBAM example structure
@@ -7,7 +6,8 @@ Discharge is set to NaN (no in-situ discharge available)
 Workflow overview
 -----------------
 1. Read Aquasat source rows and standardize them to a common station/date/tss schema.
-2. Read RiverSed source rows and load the modified NHDPlus DBF lookup table.
+2. Read RiverSed source rows, load the modified NHDPlus DBF lookup table,
+   and derive representative reach coordinates from the matching flowlines.
 3. Normalize RiverSed IDs in both tables, then attach reach/basin metadata by ID.
 4. Build per-station row indices so each station can be processed independently.
 5. In parallel, convert each station's raw observations into daily SSC time series.
@@ -17,10 +17,12 @@ Workflow overview
 Important RiverSed note
 -----------------------
 The RiverSed "matching" step in this script is a table join on ID, not a new
-runtime GIS spatial join. The modified DBF is assumed to already encode the
-reach/basin assignment prepared upstream.
+runtime GIS spatial nearest-neighbor operation. The modified DBF is assumed to
+already encode the reach/basin assignment prepared upstream, and the matched
+flowline geometry is only used to derive a representative reach coordinate.
 """
 
+import re
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
@@ -36,6 +38,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, SCRIPT_ROOT)
+import geopandas as gpd
 from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
@@ -58,6 +61,7 @@ OUTPUT_NC_DIR = OUTPUT_QC_DIR
 # The DBF acts as the RiverSed reach/basin lookup table. It maps RiverSed IDs
 # to NHDPlus-derived metadata such as COMID, reach code, VPU/RPU, and area.
 RIVERSED_METADATA_DBF = os.path.join(SOURCE_DIR, "nhdplusv2_modified_v1.0.dbf")
+RIVERSED_METADATA_FLOWLINE = os.path.join(SOURCE_DIR, "nhdplusv2_modified_v1.0.shp")
 RIVERSED_METADATA_FIELD_MAP = {
     "ID": "ID",
     "COMID": "comid",
@@ -67,15 +71,36 @@ RIVERSED_METADATA_FIELD_MAP = {
     "RPUID": "rpu_id",
     "TtDASKM": "upstream_area",
 }
+RIVERSED_FLOWLINE_FIELD_MAP = {
+    "ID": "ID",
+    "COMID": "comid",
+    "GNIS_NA": "river_name",
+    "REACHCO": "reach_code",
+    "VPUID": "vpu_id",
+    "RPUID": "rpu_id",
+}
+RIVERSED_FLOWLINE_GEOGRAPHIC_CRS = "EPSG:4269"
+RIVERSED_REPRESENTATIVE_POINT_CRS = "EPSG:5070"
+CONUS_LONGITUDE_RANGE = (-125.0, -66.0)
+CONUS_LATITUDE_RANGE = (24.0, 50.0)
 
 # On fork-based systems the worker processes reuse these in-memory tables
 # instead of receiving a full station DataFrame through IPC for every task.
 _WORKER_DATASETS = {}
 _WORKER_GROUP_INDICES = {}
-MAX_WORKERS = 16
+MAX_WORKERS = 24
 VERBOSE_STATION_LOGS = False
 PROGRESS_BAR_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.25
+DEFAULT_COUNTRY = "United States"
+DEFAULT_CONTINENT_REGION = "North America"
+DEFAULT_TEMPORAL_RESOLUTION = "daily"
+SCALAR_COORD_FILL_VALUE = -9999.0
+DATA_LIMITATIONS_TEXT = (
+    "Satellite-derived TSS/SSC from Landsat imagery; discharge (Q) and sediment "
+    "load (SSL) are not available. The exported series is sparse daily data "
+    "containing only observation days and is not gap-filled."
+)
 
 
 def _resolve_num_workers(max_workers=MAX_WORKERS):
@@ -153,6 +178,75 @@ def _first_nonempty_text(df, column_name):
         if text:
             return text
     return ""
+
+
+def _normalize_optional_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _normalize_reach_code(value):
+    text = _normalize_optional_text(value)
+    if not text:
+        return ""
+
+    if re.fullmatch(r"[0-9]+(?:\.0+)?", text):
+        return str(int(float(text))).zfill(14)
+
+    return text
+
+
+def _coordinates_within_conus(latitude, longitude):
+    if not np.isfinite(latitude) or not np.isfinite(longitude):
+        return False
+    return (
+        CONUS_LATITUDE_RANGE[0] <= latitude <= CONUS_LATITUDE_RANGE[1]
+        and CONUS_LONGITUDE_RANGE[0] <= longitude <= CONUS_LONGITUDE_RANGE[1]
+    )
+
+
+def _format_coordinate_pair(latitude, longitude):
+    if not np.isfinite(latitude) or not np.isfinite(longitude):
+        return ""
+    return f"{latitude:.4f},{longitude:.4f}"
+
+
+def _build_station_location(station_id, river_name, comid, reach_code, latitude, longitude, *, is_riversed_reach):
+    coord_text = _format_coordinate_pair(latitude, longitude)
+
+    if is_riversed_reach:
+        details = []
+        if comid:
+            details.append(f"COMID {comid}")
+        if reach_code:
+            details.append(f"reach {reach_code}")
+        if river_name:
+            if details:
+                return f"{river_name} ({', '.join(details)})"
+            return river_name
+        if details:
+            return ", ".join(details)
+        return f"RiverSed reach {station_id}"
+
+    if river_name and coord_text:
+        return f"{river_name} ({coord_text})"
+    if river_name:
+        return river_name
+    if coord_text:
+        return f"Site {station_id} ({coord_text})"
+    return f"Site {station_id}"
+
+
+def _build_geographic_coverage(station_location, vpu_id="", rpu_id=""):
+    parts = [DEFAULT_COUNTRY]
+    if station_location:
+        parts.append(station_location)
+    if vpu_id:
+        parts.append(f"VPUID={vpu_id}")
+    if rpu_id:
+        parts.append(f"RPUID={rpu_id}")
+    return "; ".join(parts)
 
 
 def _run_station_task(station_id, station_df, output_dir, verbose):
@@ -290,7 +384,117 @@ def _clean_dbf_value(text):
     return value
 
 
-def load_riversed_station_metadata(dbf_path):
+def _derive_representative_point(geometry):
+    if geometry is None or geometry.is_empty:
+        return None
+
+    try:
+        return geometry.interpolate(0.5, normalized=True)
+    except Exception:
+        return None
+
+
+def load_riversed_flowline_reference(shp_path):
+    """Load RiverSed flowlines and compute representative reach coordinates."""
+    print(f"Loading RiverSed flowline geometry from {shp_path}...")
+
+    flowline_gdf = gpd.read_file(shp_path)
+    required_fields = sorted(set(RIVERSED_FLOWLINE_FIELD_MAP.keys()) - set(flowline_gdf.columns))
+    if required_fields:
+        raise ValueError(
+            "RiverSed flowline shapefile is missing fields: {0}".format(
+                ", ".join(required_fields)
+            )
+        )
+
+    flowline_gdf = flowline_gdf[
+        [column for column in RIVERSED_FLOWLINE_FIELD_MAP.keys() if column in flowline_gdf.columns]
+        + ["geometry"]
+    ].copy()
+
+    renamed_columns = {
+        source_name: target_name
+        for source_name, target_name in RIVERSED_FLOWLINE_FIELD_MAP.items()
+        if source_name in flowline_gdf.columns
+    }
+    flowline_gdf = flowline_gdf.rename(columns=renamed_columns)
+
+    flowline_gdf["ID"] = flowline_gdf["ID"].map(_normalize_riversed_id)
+    flowline_gdf["comid"] = flowline_gdf["comid"].map(_normalize_riversed_id)
+    flowline_gdf["reach_code"] = flowline_gdf["reach_code"].map(_normalize_reach_code)
+    for column_name in ("river_name", "vpu_id", "rpu_id"):
+        flowline_gdf[column_name] = flowline_gdf[column_name].map(_normalize_optional_text)
+
+    flowline_gdf = flowline_gdf[flowline_gdf["ID"] != ""].copy()
+
+    duplicated_ids = flowline_gdf["ID"].duplicated()
+    if duplicated_ids.any():
+        dup_sample = flowline_gdf.loc[duplicated_ids, "ID"].head(10).tolist()
+        raise ValueError(
+            "RiverSed flowline shapefile contains duplicate IDs: {0}".format(
+                dup_sample
+            )
+        )
+
+    # The RiverSed flowline subset behaves like NAD83 geographic coordinates in
+    # the current PROJ environment even though the shapefile advertises WGS84.
+    # Override explicitly before projecting to the CONUS Albers work CRS so the
+    # representative midpoint calculation stays stable across environments.
+    flowline_gdf = flowline_gdf.set_crs(
+        RIVERSED_FLOWLINE_GEOGRAPHIC_CRS,
+        allow_override=True,
+    )
+
+    projected_flowlines = flowline_gdf.to_crs(RIVERSED_REPRESENTATIVE_POINT_CRS)
+    representative_points = projected_flowlines.geometry.apply(_derive_representative_point)
+    representative_points = gpd.GeoSeries(
+        representative_points,
+        index=projected_flowlines.index,
+        crs=projected_flowlines.crs,
+    ).to_crs(RIVERSED_FLOWLINE_GEOGRAPHIC_CRS)
+
+    flowline_gdf["long"] = representative_points.x.astype(float)
+    flowline_gdf["lat"] = representative_points.y.astype(float)
+
+    invalid_coordinate_mask = ~flowline_gdf.apply(
+        lambda row: _coordinates_within_conus(row["lat"], row["long"]),
+        axis=1,
+    )
+    if invalid_coordinate_mask.any():
+        invalid_count = int(invalid_coordinate_mask.sum())
+        invalid_sample = (
+            flowline_gdf.loc[invalid_coordinate_mask, "ID"].head(10).tolist()
+        )
+        print(
+            "  Warning: {0} flowlines produced out-of-range coordinates and will "
+            "remain unfilled. Sample IDs: {1}".format(invalid_count, invalid_sample)
+        )
+        flowline_gdf.loc[invalid_coordinate_mask, ["lat", "long"]] = np.nan
+
+    valid_coordinate_count = int(flowline_gdf["lat"].notna().sum())
+    if valid_coordinate_count == 0:
+        raise ValueError(
+            "RiverSed flowline representative coordinate generation failed for "
+            "all IDs. Check the flowline CRS override and PROJ installation."
+        )
+
+    flowline_gdf["coordinate_source"] = os.path.basename(shp_path)
+    flowline_gdf["coordinate_method"] = "flowline_midpoint_by_id"
+    flowline_gdf["coordinate_confidence"] = "high"
+
+    print(
+        "  Loaded {0} flowlines with representative coordinates for {1} IDs".format(
+            len(flowline_gdf),
+            valid_coordinate_count,
+        )
+    )
+    return pd.DataFrame(flowline_gdf.drop(columns=["geometry"]))
+
+
+def load_riversed_station_metadata(
+    dbf_path,
+    flowline_path=RIVERSED_METADATA_FLOWLINE,
+):
     """Load RiverSed reach metadata from the modified NHDPlusV2 DBF."""
     print(f"Loading RiverSed metadata from {dbf_path}...")
 
@@ -365,6 +569,35 @@ def load_riversed_station_metadata(dbf_path):
         metadata_df["upstream_area"], errors="coerce"
     )
 
+    flowline_df = load_riversed_flowline_reference(flowline_path)
+    coordinate_columns = [
+        "ID",
+        "lat",
+        "long",
+        "coordinate_source",
+        "coordinate_method",
+        "coordinate_confidence",
+    ]
+    metadata_df = metadata_df.merge(
+        flowline_df[coordinate_columns],
+        on="ID",
+        how="left",
+        validate="1:1",
+    )
+
+    missing_coordinate_ids = metadata_df.loc[
+        metadata_df["lat"].isna() | metadata_df["long"].isna(),
+        "ID",
+    ]
+    if not missing_coordinate_ids.empty:
+        print(
+            "  Warning: representative coordinates missing for {0} RiverSed IDs. "
+            "Sample: {1}".format(
+                len(missing_coordinate_ids),
+                missing_coordinate_ids.head(10).tolist(),
+            )
+        )
+
     print(
         "  Loaded {0} metadata rows covering {1} RiverSed IDs".format(
             len(metadata_df), metadata_df["ID"].nunique()
@@ -377,7 +610,19 @@ def load_aquasat_data(file_path):
     print(f"Loading Aquasat data from {file_path}...")
     # Only read the columns used later. This reduces startup time and memory
     # footprint for a very large source file.
-    required_columns = {"SiteID", "date", "value", "lat", "long", "elevation"}
+    required_columns = {
+        "SiteID",
+        "date",
+        "value",
+        "lat",
+        "long",
+        "elevation",
+        "GNIS_NAME",
+        "COMID",
+        "REACHCODE",
+        "RPUID",
+        "VPUID",
+    }
     df = pd.read_csv(
         file_path,
         low_memory=False,
@@ -392,17 +637,38 @@ def load_aquasat_data(file_path):
     # Rename columns
     df = df.rename(columns={
         'value': 'tss',
-        'SiteID': 'station_id'
+        'SiteID': 'station_id',
+        'GNIS_NAME': 'river_name',
+        'COMID': 'comid',
+        'REACHCODE': 'reach_code',
+        'RPUID': 'rpu_id',
+        'VPUID': 'vpu_id',
     })
 
     # Select relevant columns
-    cols = ['station_id', 'date', 'tss', 'lat', 'long', 'elevation']
+    cols = [
+        'station_id',
+        'date',
+        'tss',
+        'lat',
+        'long',
+        'elevation',
+        'river_name',
+        'comid',
+        'reach_code',
+        'rpu_id',
+        'vpu_id',
+    ]
     df = df[[c for c in cols if c in df.columns]].dropna(subset=['station_id', 'tss'])
 
     print(f"  Loaded {len(df)} records from {df['station_id'].nunique()} stations")
     return df
 
-def load_riversed_data(file_path, metadata_dbf_path=RIVERSED_METADATA_DBF):
+def load_riversed_data(
+    file_path,
+    metadata_dbf_path=RIVERSED_METADATA_DBF,
+    metadata_flowline_path=RIVERSED_METADATA_FLOWLINE,
+):
     """Load RiverSed USA data"""
     print(f"Loading RiverSed data from {file_path}...")
     # RiverSed rows themselves only contain the measurement-side information.
@@ -413,7 +679,10 @@ def load_riversed_data(file_path, metadata_dbf_path=RIVERSED_METADATA_DBF):
         low_memory=False,
         usecols=lambda column_name: column_name in required_columns,
     )
-    metadata_df = load_riversed_station_metadata(metadata_dbf_path)
+    metadata_df = load_riversed_station_metadata(
+        metadata_dbf_path,
+        flowline_path=metadata_flowline_path,
+    )
 
     df["ID"] = df["ID"].map(_normalize_riversed_id)
 
@@ -457,6 +726,11 @@ def load_riversed_data(file_path, metadata_dbf_path=RIVERSED_METADATA_DBF):
         'vpu_id',
         'rpu_id',
         'upstream_area',
+        'lat',
+        'long',
+        'coordinate_source',
+        'coordinate_method',
+        'coordinate_confidence',
     ]
     df = df[[c for c in cols if c in df.columns]].dropna(subset=['tss'])
 
@@ -670,17 +944,23 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
     reach_code = _first_nonempty_text(tss_df, "reach_code")
     vpu_id = _first_nonempty_text(tss_df, "vpu_id")
     rpu_id = _first_nonempty_text(tss_df, "rpu_id")
-    has_riversed_metadata = any(
-        column in tss_df.columns
-        for column in ["river_name", "comid", "reach_code", "vpu_id", "rpu_id", "upstream_area"]
+    coordinate_source = _first_nonempty_text(tss_df, "coordinate_source")
+    coordinate_method = _first_nonempty_text(tss_df, "coordinate_method")
+    coordinate_confidence = _first_nonempty_text(tss_df, "coordinate_confidence")
+    is_riversed_reach = str(station_id).startswith("RiverSed_")
+    station_location = _build_station_location(
+        station_id,
+        river_name,
+        comid,
+        reach_code,
+        latitude,
+        longitude,
+        is_riversed_reach=is_riversed_reach,
     )
-
-    geographic_coverage_parts = []
-    if vpu_id:
-        geographic_coverage_parts.append(f"VPUID={vpu_id}")
-    if rpu_id:
-        geographic_coverage_parts.append(f"RPUID={rpu_id}")
-    geographic_coverage = "; ".join(geographic_coverage_parts)
+    geographic_coverage = _build_geographic_coverage(station_location, vpu_id=vpu_id, rpu_id=rpu_id)
+    has_station_metadata = any(
+        value for value in [river_name, comid, reach_code, vpu_id, rpu_id]
+    )
 
     # Sanitize station_id for filename (replace invalid characters)
     safe_station_id = str(station_id).replace('/', '_').replace('\\', '_').replace(':', '_')
@@ -711,19 +991,21 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         time_var[:] = (daily_df['date'] - reference_date).dt.total_seconds() / 86400.0
 
         # Create coordinate variables
-        lat_var = ds.createVariable('latitude', 'f4')
+        lat_var = ds.createVariable('latitude', 'f4', fill_value=SCALAR_COORD_FILL_VALUE)
         lat_var.standard_name = 'latitude'
         lat_var.long_name = 'station latitude'
         lat_var.units = 'degrees_north'
         lat_var.valid_range = [-90.0, 90.0]
-        lat_var[:] = latitude if not np.isnan(latitude) else -9999.0
+        lat_var.missing_value = np.float32(SCALAR_COORD_FILL_VALUE)
+        lat_var[:] = latitude if np.isfinite(latitude) else SCALAR_COORD_FILL_VALUE
 
-        lon_var = ds.createVariable('longitude', 'f4')
+        lon_var = ds.createVariable('longitude', 'f4', fill_value=SCALAR_COORD_FILL_VALUE)
         lon_var.standard_name = 'longitude'
         lon_var.long_name = 'station longitude'
         lon_var.units = 'degrees_east'
         lon_var.valid_range = [-180.0, 180.0]
-        lon_var[:] = longitude if not np.isnan(longitude) else -9999.0
+        lon_var.missing_value = np.float32(SCALAR_COORD_FILL_VALUE)
+        lon_var[:] = longitude if np.isfinite(longitude) else SCALAR_COORD_FILL_VALUE
 
         alt_var = ds.createVariable('altitude', 'f4')
         alt_var.standard_name = 'altitude'
@@ -833,22 +1115,42 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
             )
 
         # Global attributes
+        export_now = datetime.now()
+        export_date = export_now.strftime('%Y-%m-%d')
         ds.Conventions = 'CF-1.8'
         ds.title = f'RiverSed Satellite-derived TSS Data for Station {station_id}'
         ds.institution = 'University of North Carolina at Chapel Hill'
         ds.source = 'Satellite-derived TSS from Aquasat/RiverSed database'
-        ds.history = f'Created on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by convert_to_netcdf.py'
+        ds.history = f'Created on {export_now.strftime("%Y-%m-%d %H:%M:%S")} by convert_to_netcdf.py'
         ds.references = 'Gardner et al. (2021), The color of rivers, Geophysical Research Letters, doi:10.1029/2020GL088946'
         ds.comment = 'TSS values derived from Landsat satellite imagery. Discharge and sediment load are not available and set to missing values.'
         ds.station_id = str(station_id)
         ds.data_period_start = actual_start.strftime('%Y-%m-%d')
         ds.data_period_end = actual_end.strftime('%Y-%m-%d')
-        if has_riversed_metadata:
-            ds.river_name = river_name
-            ds.comid = comid
-            ds.reach_code = reach_code
-            ds.vpu_id = vpu_id
-            ds.rpu_id = rpu_id
+        ds.date_created = export_date
+        ds.date_modified = export_date
+        ds.country = DEFAULT_COUNTRY
+        ds.continent_region = DEFAULT_CONTINENT_REGION
+        ds.temporal_resolution = DEFAULT_TEMPORAL_RESOLUTION
+        ds.data_limitations = DATA_LIMITATIONS_TEXT
+        ds.station_location = station_location
+        ds.geographic_coverage = geographic_coverage
+        if has_station_metadata:
+            if river_name:
+                ds.river_name = river_name
+            if comid:
+                ds.comid = comid
+            if reach_code:
+                ds.reach_code = reach_code
+            if vpu_id:
+                ds.vpu_id = vpu_id
+            if rpu_id:
+                ds.rpu_id = rpu_id
+        if coordinate_source and np.isfinite(latitude) and np.isfinite(longitude):
+            ds.coordinate_source = coordinate_source
+            ds.coordinate_method = coordinate_method or "flowline_midpoint_by_id"
+            ds.coordinate_confidence = coordinate_confidence or "high"
+            ds.coordinate_fill_date = export_date
 
     # Build a compact station-level summary row from the same in-memory data
     # used for the netCDF. This avoids re-reading the source data later.
@@ -861,6 +1163,8 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
 
     # final flags
     ssc_f = daily_df["SSC_flag"].values.astype(np.int8)
+
+    has_valid_coordinates = np.isfinite(latitude) and np.isfinite(longitude)
 
     station_info = {
         # metadata summary fields
@@ -881,6 +1185,12 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         "Temporal Span": temporal_span,
         "Variables Provided": "SSC",
         "Geographic Coverage": geographic_coverage,
+        "Station Location": station_location,
+        "Country": DEFAULT_COUNTRY,
+        "Continent Region": DEFAULT_CONTINENT_REGION,
+        "Coordinate Source": coordinate_source if has_valid_coordinates else "",
+        "Coordinate Method": coordinate_method if has_valid_coordinates else "",
+        "Coordinate Confidence": coordinate_confidence if has_valid_coordinates else "",
         "Reference/DOI": "Gardner et al. (2021) doi:10.1029/2020GL088946",
 
         # QC summary fields (QC results CSV会自动挑存在的列)
@@ -941,6 +1251,7 @@ def main():
     aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
     riversed_file = os.path.join(SOURCE_DIR, 'RiverSed_USA_V1.1.txt')
     riversed_metadata_dbf = RIVERSED_METADATA_DBF
+    riversed_metadata_flowline = RIVERSED_METADATA_FLOWLINE
     output_nc_dir = OUTPUT_NC_DIR
     output_qc_dir = OUTPUT_QC_DIR
 
@@ -961,7 +1272,11 @@ def main():
     # Stage 1: load the two source tables and attach RiverSed metadata.
     load_started_at = time.perf_counter()
     aquasat_df = load_aquasat_data(aquasat_file)
-    riversed_df = load_riversed_data(riversed_file, metadata_dbf_path=riversed_metadata_dbf)
+    riversed_df = load_riversed_data(
+        riversed_file,
+        metadata_dbf_path=riversed_metadata_dbf,
+        metadata_flowline_path=riversed_metadata_flowline,
+    )
     timing_stats["load_data"] = time.perf_counter() - load_started_at
 
     # Stage 2: precompute station membership once. These indices are the bridge

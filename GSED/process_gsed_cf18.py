@@ -220,41 +220,98 @@ def _read_gsed_dbf_records(dbf_path):
     return records
 
 
-def _extract_polyline_centroid(record_content):
-    """
-    Extract a simple centroid from a polyline shapefile record.
-
-    This mirrors the previous implementation, which used the mean of
-    all vertices returned by ogrinfo.
-    """
+def _extract_polyline_parts(record_content):
+    """Parse a PolyLine shapefile record into ordered point parts."""
     if len(record_content) < 44:
-        return None, None
+        return []
 
     shape_type = struct.unpack('<i', record_content[:4])[0]
     if shape_type == 0:
-        return None, None
+        return []
 
     if shape_type != 3:
         raise ValueError(f"Unsupported shapefile geometry type: {shape_type}")
 
+    num_parts = struct.unpack('<i', record_content[36:40])[0]
     num_points = struct.unpack('<i', record_content[40:44])[0]
-    points_offset = 44 + 4 * struct.unpack('<i', record_content[36:40])[0]
+    points_offset = 44 + 4 * num_parts
     points_end = points_offset + num_points * 16
 
     if points_end > len(record_content):
         raise ValueError("Corrupted polyline record in shapefile.")
 
     if num_points == 0:
-        return None, None
+        return []
 
-    lons = []
-    lats = []
+    part_starts_offset = 44
+    part_starts = [
+        struct.unpack('<i', record_content[part_starts_offset + i * 4: part_starts_offset + (i + 1) * 4])[0]
+        for i in range(num_parts)
+    ]
+    if not part_starts:
+        part_starts = [0]
+    part_starts.append(num_points)
+
+    points = []
     for i in range(num_points):
         x, y = struct.unpack('<2d', record_content[points_offset + i * 16: points_offset + (i + 1) * 16])
-        lons.append(x)
-        lats.append(y)
+        points.append((float(x), float(y)))
 
-    return float(np.mean(lats)), float(np.mean(lons))
+    parts = []
+    for part_start, part_end in zip(part_starts[:-1], part_starts[1:]):
+        if part_end <= part_start:
+            continue
+        parts.append(points[part_start:part_end])
+
+    return parts
+
+
+def _extract_polyline_midpoint(record_content):
+    """Extract the 50%-along-line midpoint from a polyline shapefile record."""
+    parts = _extract_polyline_parts(record_content)
+    if not parts:
+        return None, None
+
+    fallback_point = None
+    total_length = 0.0
+    for part_points in parts:
+        if not part_points:
+            continue
+        if fallback_point is None:
+            fallback_point = part_points[0]
+        for (lon0, lat0), (lon1, lat1) in zip(part_points[:-1], part_points[1:]):
+            total_length += float(np.hypot(lon1 - lon0, lat1 - lat0))
+
+    if fallback_point is None:
+        return None, None
+
+    if total_length <= 0.0:
+        fallback_lon, fallback_lat = fallback_point
+        return float(fallback_lat), float(fallback_lon)
+
+    midpoint_distance = total_length / 2.0
+    traversed = 0.0
+    last_point = fallback_point
+
+    for part_points in parts:
+        if not part_points:
+            continue
+        last_point = part_points[-1]
+        for (lon0, lat0), (lon1, lat1) in zip(part_points[:-1], part_points[1:]):
+            segment_length = float(np.hypot(lon1 - lon0, lat1 - lat0))
+            if segment_length <= 0.0:
+                continue
+
+            next_traversed = traversed + segment_length
+            if next_traversed >= midpoint_distance:
+                ratio = (midpoint_distance - traversed) / segment_length
+                midpoint_lon = lon0 + ratio * (lon1 - lon0)
+                midpoint_lat = lat0 + ratio * (lat1 - lat0)
+                return float(midpoint_lat), float(midpoint_lon)
+            traversed = next_traversed
+
+    last_lon, last_lat = last_point
+    return float(last_lat), float(last_lon)
 
 
 def load_gsed_reach_metadata(shapefile_path, target_rids=None):
@@ -295,7 +352,7 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
                 if target_rids and r_id_str not in target_rids:
                     continue
 
-                lat, lon = _extract_polyline_centroid(content)
+                lat, lon = _extract_polyline_midpoint(content)
                 basin_info = _derive_basin_info_from_rid(r_id_str)
                 metadata[r_id_str] = {
                     'r_id_str': r_id_str,
@@ -303,6 +360,8 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
                     'reach_length_m': float(dbf_row['Length']) if dbf_row.get('Length') is not None else None,
                     'latitude': lat,
                     'longitude': lon,
+                    'midpoint_latitude': lat,
+                    'midpoint_longitude': lon,
                     **basin_info,
                 }
 
@@ -800,7 +859,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
             ds.geospatial_lat_max = float(lat)
             ds.geospatial_lon_min = float(lon)
             ds.geospatial_lon_max = float(lon)
-            ds.geographic_coverage = f'River reach centroid at ({lat:.4f}°N, {lon:.4f}°E)'
+            ds.geographic_coverage = f'River reach midpoint at ({lat:.4f}°N, {lon:.4f}°E)'
 
         if length is not None:
             ds.reach_length_m = float(length)
