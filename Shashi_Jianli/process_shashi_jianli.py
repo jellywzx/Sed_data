@@ -109,7 +109,7 @@ def apply_tool_qc_shashi(df, station_id, diagnostic_dir=None):
 
     return out
 
-def _count_flags(flag_arr, fill_value=-127):
+def _count_flags(flag_arr, fill_value=FILL_VALUE_INT):
     """Return counts for (good, estimated, suspect, bad, missing) using 0/1/2/3/fill_value."""
     a = np.asarray(flag_arr)
     return {
@@ -120,7 +120,7 @@ def _count_flags(flag_arr, fill_value=-127):
         "missing": int(np.sum(a == fill_value)),
     }
 
-def _count_step(step_arr, fill_value=-127):
+def _count_step(step_arr, fill_value=FILL_VALUE_INT):
     """
     Generic step flag counts (pass/bad/missing) or (pass/suspect/not_checked/missing)
     We'll count by values: 0=pass, 1=not_checked, 2=suspect, 3=bad, fill=missing.
@@ -139,7 +139,7 @@ def _pick_step_col(df_station, prefix):
     cols = [c for c in df_station.columns if str(c).startswith(prefix)]
     return cols[0] if len(cols) > 0 else None
 
-def build_qc_results_summary_row(df_station, station_info, station_id, lon, lat, fill_value=-127):
+def build_qc_results_summary_row(df_station, station_info, station_id, lon, lat, fill_value=FILL_VALUE_INT):
     """
     Build ONE row for qc_results_summary.csv with the columns you specified.
     Assumptions:
@@ -393,17 +393,17 @@ def process_shashi_jianli():
             ds[f'{var}_flag'] = ('time', df_station[f'{var}_flag'].values.astype(np.byte))
             ds[f'{var}_flag'].attrs = {
                 'long_name': f'Quality flag for {attrs["long_name"]}',
-                '_FillValue': -127,
-                'flag_values': np.array([0, 1, 2, 3], dtype=np.byte),
-                'flag_meanings': 'good_data suspect_data bad_data missing_data',
-                'comment': "Flag definitions: 0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data"
+                '_FillValue': FILL_VALUE_INT,
+                'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.byte),
+                'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
+                'comment': "Flag definitions: 0=good_data, 1=estimated_data, 2=suspect_data, 3=bad_data, 9=missing_data"
             }
 
         # Add coordinate variables
         ds['lat'] = ((), coords[station_id]['lat'], {'long_name': 'station latitude', 'standard_name': 'latitude', 'units': 'degrees_north'})
         ds['lon'] = ((), coords[station_id]['lon'], {'long_name': 'station longitude', 'standard_name': 'longitude', 'units': 'degrees_east'})
-        ds['altitude'] = ((), np.nan, {'long_name': 'station altitude', 'standard_name': 'altitude', 'units': 'm', 'comment': 'Not available in source data'})
-        ds['upstream_area'] = ((), np.nan, {'long_name': 'upstream drainage area', 'units': 'km2', 'comment': 'Not available in source data'})
+        ds['altitude'] = ((), FILL_VALUE_FLOAT, {'long_name': 'station altitude', 'standard_name': 'altitude', 'units': 'm', '_FillValue': FILL_VALUE_FLOAT, 'comment': 'Not available in source data'})
+        ds['upstream_area'] = ((), FILL_VALUE_FLOAT, {'long_name': 'upstream drainage area', 'units': 'km2', '_FillValue': FILL_VALUE_FLOAT, 'comment': 'Not available in source data'})
 
         # Global attributes
         ds.attrs = {

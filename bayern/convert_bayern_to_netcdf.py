@@ -17,6 +17,14 @@ import netCDF4 as nc
 from datetime import datetime
 import warnings
 from pyproj import Transformer
+import sys
+from pathlib import Path
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]   # .../Script
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../sediment_wzx_1111
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_FLOAT
 
 warnings.filterwarnings('ignore')
 
@@ -339,19 +347,19 @@ def create_netcdf(filename, data, metadata, lat, lon):
     lon_var.valid_range = np.array([-180.0, 180.0], dtype='f4')
     lon_var[:] = lon
 
-    alt_var = dataset.createVariable('altitude', 'f4')
+    alt_var = dataset.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
     alt_var.standard_name = 'altitude'
     alt_var.long_name = 'station altitude above sea level'
     alt_var.units = 'm'
-    alt_var[:] = metadata.get('altitude', np.nan)
+    altitude = metadata.get('altitude', FILL_VALUE_FLOAT)
+    alt_var[:] = altitude if pd.notna(altitude) and np.isfinite(float(altitude)) else FILL_VALUE_FLOAT
 
     # Note: upstream_area not available in Bayern data
-    # Creating variable but setting to NaN
-    area_var = dataset.createVariable('upstream_area', 'f4')
+    area_var = dataset.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
     area_var.long_name = 'upstream drainage area'
     area_var.units = 'km2'
     area_var.comment = 'Not available in source data'
-    area_var[:] = np.nan
+    area_var[:] = FILL_VALUE_FLOAT
 
     # Create data variables
     discharge_var = dataset.createVariable('discharge', 'f4', ('time',),
@@ -404,10 +412,10 @@ def main():
     """
 
     # Directories
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    discharge_dir = os.path.join(base_dir, 'discharge')
-    sediment_dir = os.path.join(base_dir, 'ssp')
-    output_dir = os.path.join(base_dir, 'done')
+    input_dir = PROJECT_ROOT / "Source" / "bayern"
+    discharge_dir = input_dir / "discharge"
+    sediment_dir = input_dir / "ssp"
+    output_dir = PROJECT_ROOT / "Source" / "bayern" / "done"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)

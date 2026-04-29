@@ -23,6 +23,7 @@ SCRIPT_ROOT = CURRENT_DIR.parent
 CODE_DIR = SCRIPT_ROOT / 'code'
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
+from constants import FILL_VALUE_FLOAT
 from runtime import ensure_directory, resolve_source_root
 from validation import require_existing_file
 
@@ -294,19 +295,19 @@ def create_netcdf_file(station_name, station_data, station_coords, output_dir):
         lat_var.valid_range = np.array([-90.0, 90.0], dtype='f4')
         lat_var[:] = lat
 
-        # Altitude (not available, set to NaN)
-        alt_var = ds.createVariable('altitude', 'f4')
+        # Altitude (not available)
+        alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.standard_name = 'altitude'
         alt_var.long_name = 'station altitude above sea level'
         alt_var.units = 'm'
-        alt_var[:] = np.nan
+        alt_var[:] = FILL_VALUE_FLOAT
 
         # Upstream drainage area
-        area_var = ds.createVariable('upstream_area', 'f4')
+        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
         area_var.comment = 'Drainage area from Yellow River Basin data'
-        area_var[:] = basin_area
+        area_var[:] = basin_area if np.isfinite(basin_area) else FILL_VALUE_FLOAT
 
         # Create data variables
         # SSC - convert from kg/m³ to mg/L (1 kg/m³ = 1000 mg/L)

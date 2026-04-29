@@ -10,6 +10,12 @@ import netCDF4 as nc
 from datetime import datetime, timedelta
 import os
 from pathlib import Path
+import sys
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_FLOAT
 
 def parse_land2sea_data(filepath):
     """
@@ -156,25 +162,25 @@ def create_netcdf_file(station, output_dir, reference1, reference2=None, row_idx
     lon_var[:] = np.nan  # Placeholder
 
     # Altitude
-    alt_var = ds.createVariable('altitude', 'f4')
+    alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
     alt_var.standard_name = 'altitude'
     alt_var.long_name = 'station altitude above sea level'
     alt_var.units = 'm'
-    alt_var[:] = np.nan  # Not available in Land2Sea
+    alt_var[:] = FILL_VALUE_FLOAT  # Not available in Land2Sea
 
     # Upstream area
-    area_var = ds.createVariable('upstream_area', 'f4')
+    area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
     area_var.long_name = 'upstream drainage area'
     area_var.units = 'km2'
     area_var.comment = 'Best estimate of drainage basin area from Land2Sea database'
     if station['area'] is not None:
         try:
             area_val = float(str(station['area']).replace('"', '').replace(',', ''))
-            area_var[:] = area_val
+            area_var[:] = area_val if np.isfinite(area_val) else FILL_VALUE_FLOAT
         except:
-            area_var[:] = np.nan
+            area_var[:] = FILL_VALUE_FLOAT
     else:
-        area_var[:] = np.nan
+        area_var[:] = FILL_VALUE_FLOAT
 
     # Time variable
     # Use a reference time and represent as days since epoch

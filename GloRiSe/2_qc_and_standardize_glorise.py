@@ -341,19 +341,19 @@ def standardize_station_file(input_file):
         lon_var.valid_range = np.array([-180.0, 180.0], dtype=np.float32)
         lon_var[:] = lon
 
-        alt_var = ds_out.createVariable('altitude', 'f4')
+        alt_var = ds_out.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.standard_name = 'altitude'
         alt_var.long_name = 'station elevation above sea level'
         alt_var.units = 'm'
         alt_var.positive = 'up'
         alt_var.comment = 'Source: Original data provided by GloRiSe database.'
-        alt_var[:] = alt
+        alt_var[:] = alt if np.isfinite(alt) else FILL_VALUE_FLOAT
 
-        area_var = ds_out.createVariable('upstream_area', 'f4')
+        area_var = ds_out.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
         area_var.comment = 'Source: Original data provided by GloRiSe database. May not be available for all stations.'
-        area_var[:] = upstream_area
+        area_var[:] = upstream_area if np.isfinite(upstream_area) else FILL_VALUE_FLOAT
 
         # Create data variables
         q_var = ds_out.createVariable('Q', 'f4', ('time',), fill_value=-9999.0, zlib=True, complevel=4)
@@ -383,7 +383,7 @@ def standardize_station_file(input_file):
         ssl_var[:] = ssl
 
         # Create quality flag variables
-        q_flag_var = ds_out.createVariable('Q_flag', 'i1', ('time',), fill_value=9, zlib=True, complevel=4)
+        q_flag_var = ds_out.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         q_flag_var.long_name = 'quality flag for river discharge'
         q_flag_var.standard_name = 'status_flag'
         q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -391,7 +391,7 @@ def standardize_station_file(input_file):
         q_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         q_flag_var[:] = q_flag
 
-        ssc_flag_var = ds_out.createVariable('SSC_flag', 'i1', ('time',), fill_value=9, zlib=True, complevel=4)
+        ssc_flag_var = ds_out.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
         ssc_flag_var.standard_name = 'status_flag'
         ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -399,7 +399,7 @@ def standardize_station_file(input_file):
         ssc_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         ssc_flag_var[:] = ssc_flag
 
-        ssl_flag_var = ds_out.createVariable('SSL_flag', 'i1', ('time',), fill_value=9, zlib=True, complevel=4)
+        ssl_flag_var = ds_out.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssl_flag_var.long_name = 'quality flag for suspended sediment load'
         ssl_flag_var.standard_name = 'status_flag'
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)

@@ -4,17 +4,23 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+import sys
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 
 def get_flag(value, thresholds, meanings):
     if pd.isna(value):
-        return meanings.split().index('missing_data')
+        return FILL_VALUE_INT
     if value < thresholds.get('negative', -float('inf')):
-        return meanings.split().index('bad_data')
+        return np.int8(3)
     if value == thresholds.get('zero', -1):
-        return meanings.split().index('suspect_data')
+        return np.int8(2)
     if value > thresholds.get('extreme', float('inf')):
-        return meanings.split().index('good_data')
-    return meanings.split().index('good_data')
+        return np.int8(0)
+    return np.int8(0)
 
 def process_existing_usgs_netcdf():
     input_dir = Path("/Users/zhongwangwei/Downloads/Sediment/Output/daily/USGS")
@@ -81,22 +87,28 @@ def process_existing_usgs_netcdf():
                 new_ds[var_key] = ('time', df[var_name].astype(np.float32).values)
                 new_ds[var_key].attrs = {
                     'long_name': attrs['long_name'], 'standard_name': attrs['standard_name'], 'units': attrs['units'],
-                    '_FillValue': -9999.0, 'ancillary_variables': f'{var_key}_flag',
+                    '_FillValue': FILL_VALUE_FLOAT, 'ancillary_variables': f'{var_key}_flag',
                     'comment': "Source: Original data from USGS. Calculated if applicable."
                 }
                 if f'{var_key}_flag' in df.columns:
                     new_ds[f'{var_key}_flag'] = ('time', df[f'{var_key}_flag'].astype(np.byte).values)
                     new_ds[f'{var_key}_flag'].attrs = {
-                        'long_name': f'Quality flag for {attrs["long_name"]}', '_FillValue': -127,
-                        'flag_values': np.array([0, 1, 2, 3], dtype=np.byte), 'flag_meanings': flag_meanings,
-                        'comment': "Flag definitions: 0=good_data, 1=suspect_data, 2=bad_data, 3=missing_data"
+                        'long_name': f'Quality flag for {attrs["long_name"]}', '_FillValue': FILL_VALUE_INT,
+                        'flag_values': np.array([0, 2, 3, 9], dtype=np.byte), 'flag_meanings': flag_meanings,
+                        'comment': "Flag definitions: 0=good_data, 2=suspect_data, 3=bad_data, 9=missing_data"
                     }
 
         # Coordinates and other metadata
+        def _metadata_or_fill(source_ds, name):
+            if name not in source_ds:
+                return FILL_VALUE_FLOAT
+            value = source_ds[name].item()
+            return value if np.isfinite(value) else FILL_VALUE_FLOAT
+
         new_ds['lat'] = ((), ds.latitude.item())
         new_ds['lon'] = ((), ds.longitude.item())
-        new_ds['altitude'] = ((), ds.altitude.item() if 'altitude' in ds else np.nan)
-        new_ds['upstream_area'] = ((), ds.upstream_area.item() if 'upstream_area' in ds else np.nan)
+        new_ds['altitude'] = ((), _metadata_or_fill(ds, 'altitude'), {'_FillValue': FILL_VALUE_FLOAT})
+        new_ds['upstream_area'] = ((), _metadata_or_fill(ds, 'upstream_area'), {'_FillValue': FILL_VALUE_FLOAT})
 
         # Global attributes
         new_ds.attrs = {

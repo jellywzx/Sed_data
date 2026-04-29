@@ -551,20 +551,20 @@ def main():
             ssc_var.ancillary_variables = 'SSC_flag'
             ssc_var[:,0,0] = df['SSC'].fillna(FILL_VALUE_FLOAT).values
 
-            ssc_flag_var = nc.createVariable('SSC_flag', 'b', ('time', 'lat', 'lon'))
+            ssc_flag_var = nc.createVariable('SSC_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
             ssc_flag_var.long_name = 'Quality flag for Suspended Sediment Concentration'
             ssc_flag_var.flag_values = [0, 1, 2, 3, 9]
             ssc_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
             ssc_flag_var[:,0,0] = df['SSC_flag'].values
 
-            ssl_var = nc.createVariable('SSL', 'f4', ('time', 'lat', 'lon'), fill_value=-9999.0)
+            ssl_var = nc.createVariable('SSL', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
             ssl_var.units = 'ton day-1'
             ssl_var.long_name = 'Suspended Sediment Load'
             ssl_var.standard_name = 'suspended_sediment_load'
             ssl_var.ancillary_variables = 'SSL_flag'
             ssl_var[:,0,0] = df['SSL'].fillna(FILL_VALUE_FLOAT).values
 
-            ssl_flag_var = nc.createVariable('SSL_flag', 'b', ('time', 'lat', 'lon'))
+            ssl_flag_var = nc.createVariable('SSL_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
             ssl_flag_var.long_name = 'Quality flag for Suspended Sediment Load'
             ssl_flag_var.flag_values = [0, 1, 2, 3, 9]
             ssl_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"

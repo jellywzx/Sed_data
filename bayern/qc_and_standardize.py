@@ -425,22 +425,22 @@ def process_station(input_file, output_dir):
             lon_var.valid_range = np.array([-180.0, 180.0], dtype='f4')
             lon_var[:] = lon
 
-            alt_var = ds.createVariable('altitude', 'f4')
+            alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
             alt_var.standard_name = 'altitude'
             alt_var.long_name = 'station altitude above sea level'
             alt_var.units = 'm'
             if not np.isnan(alt):
                 alt_var[:] = alt
             else:
-                alt_var[:] = -9999.0
+                alt_var[:] = FILL_VALUE_FLOAT
 
-            area_var = ds.createVariable('upstream_area', 'f4')
+            area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
             area_var.long_name = 'upstream drainage area'
             area_var.units = 'km2'
             if not np.isnan(upstream_area):
                 area_var[:] = upstream_area
             else:
-                area_var[:] = -9999.0
+                area_var[:] = FILL_VALUE_FLOAT
                 area_var.comment = 'Not available in source data'
 
             # Create data variables (renamed)
@@ -473,21 +473,21 @@ def process_station(input_file, output_dir):
             ssl_var[:] = ssl_data
 
             # Create quality flag variables
-            q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',), zlib=True, complevel=4)
+            q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
             q_flag_var.long_name = 'quality flag for river discharge'
             q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             q_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
             q_flag_var.comment = 'Quality flags: 0=good (passes all checks), 1=estimated, 2=suspect (Q=0 or Q>10000 m³/s), 3=bad (Q<0), 9=missing'
             q_flag_var[:] = q_flags
 
-            ssc_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4)
+            ssc_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
             ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
             ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             ssc_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
             ssc_flag_var.comment = 'Quality flags: 0=good (0≤SSC≤3000 mg/L), 1=estimated, 2=suspect (SSC>3000 mg/L), 3=bad (SSC<0), 9=missing'
             ssc_flag_var[:] = ssc_flags
 
-            ssl_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4)
+            ssl_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
             ssl_flag_var.long_name = 'quality flag for suspended sediment load'
             ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
@@ -499,7 +499,7 @@ def process_station(input_file, output_dir):
             def _write_step_flag(name, arr):
                 if arr is None:
                     return
-                v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4)
+                v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
                 v.long_name = f"step-level provenance flag: {name}"
                 v[:] = np.asarray(arr, dtype=np.int8)
 

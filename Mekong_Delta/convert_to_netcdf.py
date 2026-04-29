@@ -9,6 +9,13 @@ import numpy as np
 import netCDF4 as nc
 from datetime import datetime, timedelta
 import os
+import sys
+from pathlib import Path
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_FLOAT
 
 # Station metadata
 STATIONS = {
@@ -228,18 +235,21 @@ def create_netcdf(filepath, df, station_id, station_meta):
     lon.valid_range = np.array([-180.0, 180.0], dtype='f4')
     lon[:] = station_meta['lon']
 
-    alt = ds.createVariable('altitude', 'f4')
+    alt = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
     alt.standard_name = 'altitude'
     alt.long_name = 'station altitude above sea level'
     alt.units = 'm'
     if not np.isnan(station_meta['altitude']):
         alt[:] = station_meta['altitude']
+    else:
+        alt[:] = FILL_VALUE_FLOAT
 
-    # Upstream area (not available, set to NaN)
-    upstream_area = ds.createVariable('upstream_area', 'f4')
+    # Upstream area (not available)
+    upstream_area = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
     upstream_area.long_name = 'upstream drainage area'
     upstream_area.units = 'km2'
     upstream_area.comment = 'Data not available'
+    upstream_area[:] = FILL_VALUE_FLOAT
 
     # Create data variables
     discharge = ds.createVariable('discharge', 'f4', ('time',),

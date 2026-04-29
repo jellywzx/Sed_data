@@ -268,8 +268,8 @@ def create_netcdf_file(filepath, df, station_meta):
         ds.Number_of_data = str(len(df))
         
         # === DATA VARIABLES ===
-        fill_value = -9999.0
-        flag_fill_value = np.int8(-127)
+        fill_value = FILL_VALUE_FLOAT
+        flag_fill_value = FILL_VALUE_INT
 
         # altitude and upstream_area (not available)
         # altitude
@@ -320,7 +320,7 @@ def create_netcdf_file(filepath, df, station_meta):
             v.standard_name = 'status_flag'
             v.flag_values = np.array(flag_values, dtype='b')
             v.flag_meanings = flag_meanings
-            v.missing_value = np.int8(9)
+            v.missing_value = FILL_VALUE_INT
             v[:] = np.asarray(values, dtype=np.int8)
             return v
 

@@ -736,7 +736,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
         # Optional drainage area metadata. scripts_basin_test reads this field
         # as reported_area when it exists.
         if upstream_area_km2 is not None and pd.notna(upstream_area_km2):
-            area_var = ds.createVariable('upstream_area', 'f4')
+            area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
             area_var.long_name = 'upstream drainage area'
             area_var.units = 'km2'
             area_var.comment = 'Upstream drainage area used as reported_area by scripts_basin_test.'
@@ -756,7 +756,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
 
         # Q Quality Flag
         q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',),
-                                       fill_value=np.int8(-128), zlib=True, complevel=4)
+                                       fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         q_flag_var.long_name = 'quality flag for river discharge'
         q_flag_var.standard_name = 'status_flag'
         q_flag_var.flag_values = np.array([FLAG_GOOD, FLAG_ESTIMATED, FLAG_SUSPECT, FLAG_BAD, FLAG_MISSING], dtype=np.int8)
@@ -779,7 +779,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
 
         # SSC Quality Flag
         ssc_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',),
-                                         fill_value=np.int8(-128), zlib=True, complevel=4)
+                                         fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
         ssc_flag_var.standard_name = 'status_flag'
         ssc_flag_var.flag_values = np.array([FLAG_GOOD, FLAG_ESTIMATED, FLAG_SUSPECT, FLAG_BAD, FLAG_MISSING], dtype=np.int8)
@@ -799,7 +799,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
 
         # SSL Quality Flag
         ssl_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',),
-                                         fill_value=np.int8(-128), zlib=True, complevel=4)
+                                         fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssl_flag_var.long_name = 'quality flag for suspended sediment load'
         ssl_flag_var.standard_name = 'status_flag'
         ssl_flag_var.flag_values = np.array([FLAG_GOOD, FLAG_ESTIMATED, FLAG_SUSPECT, FLAG_BAD, FLAG_MISSING], dtype=np.int8)
@@ -1059,7 +1059,7 @@ def main():
     skip_count = 0
     error_count = 0
 
-    max_workers = max(1, min(os.cpu_count() or 1, 16))
+    max_workers = max(1, min(os.cpu_count() or 1, 24))
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_one_reach, task) for task in tasks]

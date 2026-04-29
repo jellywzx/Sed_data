@@ -448,7 +448,7 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
         q_var.ancillary_variables = "Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr"
         q_var.comment = 'Source: Original data provided by Heppell & Binley (2016). Daily average discharge measurements.'
 
-        q_flag_var = ncfile.createVariable('Q_flag', 'i1', ('time',), fill_value=9)
+        q_flag_var = ncfile.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
         q_flag_var.long_name = 'quality flag for river discharge'
         q_flag_var.standard_name = 'status_flag'
         q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -463,7 +463,7 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
         ssc_var.ancillary_variables = 'ssc_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
         ssc_var.comment = 'Source: Original data provided by Heppell & Binley (2016). Laboratory measurements from water samples.'
 
-        ssc_flag_var = ncfile.createVariable('SSC_flag', 'i1', ('time',), fill_value=9)
+        ssc_flag_var = ncfile.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
         ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
         ssc_flag_var.standard_name = 'status_flag'
         ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -477,7 +477,7 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
         ssl_var.ancillary_variables = 'ssl_flag SSL_flag_qc1_physical SSL_flag_qc3_from_ssc_q'
         ssl_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 0.0864, where 0.0864 = 86400 s/day × 1000 L/m³ / 10⁶ mg/ton.'
 
-        ssl_flag_var = ncfile.createVariable('SSL_flag', 'i1', ('time',), fill_value=9)
+        ssl_flag_var = ncfile.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
         ssl_flag_var.long_name = 'quality flag for suspended sediment load'
         ssl_flag_var.standard_name = 'status_flag'
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -508,12 +508,12 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
         # Step-level provenance/QC flags (write into NetCDF)
         # -------------------------------------------------
         def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
-            v = ncfile.createVariable(name, "i1", ("time",), fill_value=9)
+            v = ncfile.createVariable(name, "i1", ("time",), fill_value=FILL_VALUE_INT)
             v.long_name = long_name
             v.standard_name = "status_flag"
             v.flag_values = np.array(flag_values, dtype=np.int8)
             v.flag_meanings = flag_meanings
-            v.missing_value = np.int8(9)
+            v.missing_value = FILL_VALUE_INT
             v[:] = np.asarray(values, dtype=np.int8)
             return v
 

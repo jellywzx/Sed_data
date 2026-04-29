@@ -543,7 +543,7 @@ def parse_args():
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(4, os.cpu_count() or 1),
+        default=min(24, os.cpu_count() or 1),
         help="Number of worker processes for MERIT matching/tracing. Use 1 to disable parallelism.",
     )
     parser.add_argument(

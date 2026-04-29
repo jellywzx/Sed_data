@@ -435,7 +435,7 @@ def create_netcdf(df, station_info, output_path, history_log):
             var[:] = data.fillna(FILL_VALUE).values
 
         def create_flag_variable(var_name, long_name):
-            flag_var = ds.createVariable(var_name, 'b', ('time',), fill_value=np.int8(-127))
+            flag_var = ds.createVariable(var_name, 'b', ('time',), fill_value=FILL_VALUE_INT)
             flag_var.long_name = long_name
             flag_var.standard_name = "status_flag"
             flag_var.flag_values = np.array([0, 2, 3, 9], dtype=np.int8)
@@ -448,7 +448,8 @@ def create_netcdf(df, station_info, output_path, history_log):
             v.long_name = f"station {name.replace('_', ' ')}"
             v.standard_name = name
             v.units = unit
-            v[:] = station_info.get(var, np.nan)
+            value = station_info.get(var, FILL_VALUE_FLOAT)
+            v[:] = value if np.isfinite(value) else FILL_VALUE_FLOAT
 
         # Q, SSC, SSL and their flags
         create_flag_variable('Q_flag', "Quality flag for River Discharge")
@@ -469,7 +470,7 @@ def create_netcdf(df, station_info, output_path, history_log):
         # Step-level provenance flags (QC1/QC2/QC3)
         # -------------------------------------------------
         def _add_step_flag(name, data, long_name, flag_values, flag_meanings):
-            v = ds.createVariable(name, 'b', ('time',), fill_value=np.int8(-127))
+            v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
             v.long_name = long_name
             v.standard_name = "status_flag"
             v.flag_values = np.array(flag_values, dtype=np.int8)

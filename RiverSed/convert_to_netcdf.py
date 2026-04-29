@@ -1007,13 +1007,13 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         lon_var.missing_value = np.float32(SCALAR_COORD_FILL_VALUE)
         lon_var[:] = longitude if np.isfinite(longitude) else SCALAR_COORD_FILL_VALUE
 
-        alt_var = ds.createVariable('altitude', 'f4')
+        alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.standard_name = 'altitude'
         alt_var.long_name = 'station altitude above sea level'
         alt_var.units = 'm'
-        alt_var[:] = altitude if not np.isnan(altitude) else -9999.0
+        alt_var[:] = altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT
 
-        area_var = ds.createVariable('upstream_area', 'f4')
+        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
         if np.isfinite(upstream_area):
@@ -1021,7 +1021,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
             area_var[:] = upstream_area
         else:
             area_var.comment = 'Not available for satellite-derived data'
-            area_var[:] = -9999.0
+            area_var[:] = FILL_VALUE_FLOAT
 
         # Create data variables. Only SSC contains observations here; Q and SSL
         # are written as missing placeholders to preserve the common schema.

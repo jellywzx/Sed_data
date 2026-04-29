@@ -384,7 +384,7 @@ class HYDATQualityControl:
                     var_Q[:] = Q
 
                     # Q质量标志
-                    var_Q_flag = ds_out.createVariable('Q_flag', 'i1', ('time',), fill_value=np.int8(9))
+                    var_Q_flag = ds_out.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
                     var_Q_flag.long_name = 'quality flag for river discharge'
                     var_Q_flag.standard_name = 'status_flag'
                     var_Q_flag.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -404,7 +404,7 @@ class HYDATQualityControl:
                     var_SSC[:] = SSC
 
                     # SSC质量标志
-                    var_SSC_flag = ds_out.createVariable('SSC_flag', 'i1', ('time',), fill_value=np.int8(9))
+                    var_SSC_flag = ds_out.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
                     var_SSC_flag.long_name = 'quality flag for suspended sediment concentration'
                     var_SSC_flag.standard_name = 'status_flag'
                     var_SSC_flag.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
@@ -423,7 +423,7 @@ class HYDATQualityControl:
                     var_SSL[:] = SSL
 
                     # SSL质量标志
-                    var_SSL_flag = ds_out.createVariable('SSL_flag', 'i1', ('time',), fill_value=np.int8(9))
+                    var_SSL_flag = ds_out.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
                     var_SSL_flag.long_name = 'quality flag for suspended sediment load'
                     var_SSL_flag.standard_name = 'status_flag'
                     var_SSL_flag.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)

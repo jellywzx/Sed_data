@@ -429,10 +429,10 @@ def create_netcdf_file(filepath, df, station_meta):
         ds.Number_of_data = str(len(df))
         
         # === DATA VARIABLES ===
-        fill_value = -9999.0
+        fill_value = FILL_VALUE_FLOAT
 
         # altitude
-        alt_var = ds.createVariable('altitude', 'f4')
+        alt_var = ds.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.long_name = "station altitude"
         alt_var.standard_name = "altitude"
         alt_var.units = "m"
@@ -440,17 +440,17 @@ def create_netcdf_file(filepath, df, station_meta):
         if not np.isnan(station_meta['altitude']):
             alt_var[:] = station_meta['altitude']
         else:
-            alt_var[:] = fill_value
+            alt_var[:] = FILL_VALUE_FLOAT
 
         # upstream_area
-        area_var = ds.createVariable('upstream_area', 'f4')
+        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = "upstream drainage area"
         area_var.units = "km2"
         area_var.missing_value = fill_value
         if not np.isnan(station_meta['upstream_area']):
             area_var[:] = station_meta['upstream_area']
         else:
-            area_var[:] = fill_value
+            area_var[:] = FILL_VALUE_FLOAT
 
         # Q
         q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=fill_value)
@@ -482,7 +482,7 @@ def create_netcdf_file(filepath, df, station_meta):
         ssl_var[:] = df['SSL'].fillna(fill_value).values
 
         # === FLAG VARIABLES ===
-        flag_fill_value = np.int8(-127)
+        flag_fill_value = FILL_VALUE_INT
         
         # Q_flag
         q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=flag_fill_value)
@@ -514,7 +514,7 @@ def create_netcdf_file(filepath, df, station_meta):
             v.standard_name = 'status_flag'
             v.flag_values = np.array(flag_values, dtype='b')
             v.flag_meanings = flag_meanings
-            v.missing_value = np.int8(flag_fill_value)
+            v.missing_value = FILL_VALUE_INT
             v[:] = np.asarray(values, dtype=np.int8)
             return v
 

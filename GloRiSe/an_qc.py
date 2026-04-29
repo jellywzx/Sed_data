@@ -256,17 +256,17 @@ def process_one_file(input_path):
         lon_var.valid_range = np.array([-180.0, 180.0], dtype=np.float32)
         lon_var[:] = np.float32(lon)
 
-        alt_var = ds_out.createVariable('altitude', 'f4')
+        alt_var = ds_out.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.standard_name = 'altitude'
         alt_var.long_name = 'station elevation above sea level'
         alt_var.units = 'm'
         alt_var.positive = 'up'
-        alt_var[:] = np.float32(alt)
+        alt_var[:] = np.float32(alt if np.isfinite(alt) else FILL_VALUE_FLOAT)
 
-        area_var = ds_out.createVariable('upstream_area', 'f4')
+        area_var = ds_out.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.long_name = 'upstream drainage area'
         area_var.units = 'km2'
-        area_var[:] = np.float32(upstream_area)
+        area_var[:] = np.float32(upstream_area if np.isfinite(upstream_area) else FILL_VALUE_FLOAT)
 
         # 数据变量：统一为 (time,) 或 (sample,) 一维，与 2_qc 一致
         q_var = ds_out.createVariable('Q', 'f4', (dim_list[0],), fill_value=-9999.0, zlib=True, complevel=4)
@@ -293,21 +293,21 @@ def process_one_file(input_path):
         ssl_var.comment = 'SSL = Q × SSC × 0.0864'
         ssl_var[:] = SSL
 
-        q_flag_var = ds_out.createVariable('Q_flag', 'i1', (dim_list[0],), fill_value=9, zlib=True, complevel=4)
+        q_flag_var = ds_out.createVariable('Q_flag', 'i1', (dim_list[0],), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         q_flag_var.long_name = 'quality flag for river discharge'
         q_flag_var.standard_name = 'status_flag'
         q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
         q_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         q_flag_var[:] = q_flag
 
-        ssc_flag_var = ds_out.createVariable('SSC_flag', 'i1', (dim_list[0],), fill_value=9, zlib=True, complevel=4)
+        ssc_flag_var = ds_out.createVariable('SSC_flag', 'i1', (dim_list[0],), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
         ssc_flag_var.standard_name = 'status_flag'
         ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
         ssc_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         ssc_flag_var[:] = ssc_flag
 
-        ssl_flag_var = ds_out.createVariable('SSL_flag', 'i1', (dim_list[0],), fill_value=9, zlib=True, complevel=4)
+        ssl_flag_var = ds_out.createVariable('SSL_flag', 'i1', (dim_list[0],), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssl_flag_var.long_name = 'quality flag for suspended sediment load'
         ssl_flag_var.standard_name = 'status_flag'
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)

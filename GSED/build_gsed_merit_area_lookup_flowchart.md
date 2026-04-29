@@ -3,7 +3,7 @@
 这个脚本的目标是：
 
 1. 读取 GSED 的 `R_ID`
-2. 从 `GSED_Reach.shp/.dbf` 恢复每条 reach 的 centroid、端点候选和层级信息
+2. 从 `GSED_Reach.shp/.dbf` 恢复每条 reach 的 midpoint、端点候选和层级信息
 3. 先把端点候选匹配到 MERIT reach，并据此推断下游锚点
 4. 再从已知 MERIT reach 直接追溯上游 basin，避免重复做第二次 reach 匹配
 5. 把匹配到的 `uparea` 写成 `R_ID -> upstream_area_km2` lookup 表
@@ -21,20 +21,20 @@ flowchart TD
 
     E --> F[读取 GSED_Reach.dbf]
     F --> G[按记录顺序读取 GSED_Reach.shp]
-    G --> H[提取 centroid 和所有端点候选<br/>_extract_polyline_representatives]
-    H --> I[组合 reach 元数据<br/>R_ID / R_level / Length / centroid / endpoints / basin_code_l1-l4]
+    G --> H[提取 midpoint 和所有端点候选<br/>_extract_polyline_representatives]
+    H --> I[组合 reach 元数据<br/>R_ID / R_level / Length / midpoint / endpoints / basin_code_l1-l4]
 
     I --> J[动态导入 basin_tracer.py 和 basin_policy.py]
     J --> K[实例化 UpstreamBasinTracer]
 
     K --> L{遍历每个 GSED R_ID}
-    L --> M[读取 centroid 与端点候选]
+    L --> M[读取 midpoint 与端点候选]
     M --> N{是否至少有一个可用锚点}
     N -- 否 --> O[写入空匹配结果<br/>missing_gsed_coords]
     N -- 是 --> P[遍历端点候选<br/>逐个调用 tracer.find_best_reach]
     P --> Q{是否至少有一个端点匹配成功}
     Q -- 是 --> R[选 uparea 最大的端点<br/>若并列取距离更近]
-    Q -- 否 --> S[回退 centroid<br/>调用 tracer.find_best_reach]
+    Q -- 否 --> S[回退 midpoint<br/>调用 tracer.find_best_reach]
     R --> T[调用 tracer.get_upstream_basin_from_reach]
     S --> T
     T --> U[得到 MERIT basin 结果<br/>basin_id/COMID<br/>uparea_merit<br/>distance<br/>pfaf_code<br/>point_in_local<br/>point_in_basin<br/>method]
@@ -44,7 +44,7 @@ flowchart TD
     W -- 否 --> X[merit_lookup_accept = False]
     W -- 是 --> Y[merit_lookup_accept = True]
 
-    X --> Z[写入 lookup 行<br/>含 gsed_anchor_source / gsed_endpoint_match_count]
+    X --> Z[写入 lookup 行<br/>含 midpoint 坐标、anchor 坐标、gsed_anchor_source / gsed_endpoint_match_count]
     Y --> Z
     O --> Z
 
@@ -86,6 +86,8 @@ flowchart TD
 12. `merit_lookup_accept`
 13. `gsed_anchor_source`
 14. `gsed_endpoint_match_count`
+15. `gsed_lat` / `gsed_lon`（reach midpoint）
+16. `gsed_anchor_lat` / `gsed_anchor_lon`（实际 MERIT 匹配锚点）
 
 ## 与后续 GSED 主流程的关系
 

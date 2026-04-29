@@ -516,7 +516,7 @@ def process_rhine_data(output_path, source_path):
             q.ancillary_variables = 'Q_flag'
             q[:] = merged['q'].values
 
-            q_flag = ds.createVariable('Q_flag', 'b', ('time',))
+            q_flag = ds.createVariable('Q_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
             q_flag.long_name = "Quality flag for River Discharge"
             q_flag.flag_values = [0, 2, 3, 9]
             q_flag.flag_meanings = "good_data suspect_data bad_data missing_data"
@@ -530,7 +530,7 @@ def process_rhine_data(output_path, source_path):
             ssc.ancillary_variables = 'SSC_flag'
             ssc[:] = merged['ssc'].values
 
-            ssc_flag = ds.createVariable('SSC_flag', 'b', ('time',))
+            ssc_flag = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
             ssc_flag.long_name = "Quality flag for Suspended Sediment Concentration"
             ssc_flag.flag_values = [0, 2, 3, 9]
             ssc_flag.flag_meanings = "good_data suspect_data bad_data missing_data"
@@ -544,7 +544,7 @@ def process_rhine_data(output_path, source_path):
             ssl.comment = "Source: Calculated. Formula: SSL = Q * SSC * 0.0864"
             ssl[:] = merged['ssl'].values
 
-            ssl_flag = ds.createVariable('SSL_flag', 'b', ('time',))
+            ssl_flag = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
             ssl_flag.long_name = "Quality flag for Suspended Sediment Load"
             ssl_flag.flag_values = [0, 3, 9]
             ssl_flag.flag_meanings = "good_data bad_data missing_data"
@@ -553,12 +553,12 @@ def process_rhine_data(output_path, source_path):
             # step/provenance flag variables
             # ------------------------------
             def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
-                v = ds.createVariable(name, 'b', ('time',), fill_value=np.int8(9))
+                v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
                 v.long_name = long_name
                 v.standard_name = 'status_flag'
                 v.flag_values = np.array(flag_values, dtype='b')
                 v.flag_meanings = flag_meanings
-                v.missing_value = np.int8(9)
+                v.missing_value = FILL_VALUE_INT
                 v[:] = np.asarray(values, dtype=np.int8)
                 return v
 

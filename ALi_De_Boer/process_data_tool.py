@@ -294,11 +294,11 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         alt_var[:] = elevation
 
     # Upstream drainage area (scalar data variable)
-    area_var = nc.createVariable('upstream_area', 'f4', fill_value=-9999.0)
+    area_var = nc.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
     area_var.long_name = 'upstream drainage area'
     area_var.units = 'km2'
     area_var.comment = 'Source: Original data provided by Ali & De Boer (2007).'
-    area_var[:] = drainage_area if not pd.isna(drainage_area) else -9999.0
+    area_var[:] = drainage_area if not pd.isna(drainage_area) else FILL_VALUE_FLOAT
 
     # Discharge (Q)
     Q_var = nc.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
@@ -317,7 +317,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         Q_var[0] = -9999.0
 
     # Q quality flag
-    Q_flag_var = nc.createVariable('Q_flag', 'i1', ('time',), fill_value=9)
+    Q_flag_var = nc.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     Q_flag_var.long_name = 'quality flag for river discharge'
     Q_flag_var.standard_name = 'status_flag'
     Q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -343,7 +343,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         SSC_var[0] = -9999.0
 
     # SSC quality flag
-    SSC_flag_var = nc.createVariable('SSC_flag', 'i1', ('time',), fill_value=9)
+    SSC_flag_var = nc.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSC_flag_var.long_name = 'quality flag for suspended sediment concentration'
     SSC_flag_var.standard_name = 'status_flag'
     SSC_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -369,7 +369,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         SSL_var[0] = -9999.0
 
     # SSL quality flag
-    SSL_flag_var = nc.createVariable('SSL_flag', 'i1', ('time',), fill_value=9)
+    SSL_flag_var = nc.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSL_flag_var.long_name = 'quality flag for suspended sediment load'
     SSL_flag_var.standard_name = 'status_flag'
     SSL_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')

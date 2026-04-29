@@ -447,18 +447,18 @@ class HYBAMProcessor:
             # Static Variables
             # =============
             if altitude is not None:
-                alt_var = ds.createVariable('altitude', 'f4', zlib=True)
+                alt_var = ds.createVariable('altitude', 'f4', zlib=True, fill_value=FILL_VALUE_FLOAT)
                 alt_var.standard_name = 'altitude'
                 alt_var.long_name = 'station elevation above sea level'
                 alt_var.units = 'm'
                 alt_var.positive = 'up'
-                alt_var[:] = altitude
+                alt_var[:] = altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT
 
             if upstream_area is not None:
-                area_var = ds.createVariable('upstream_area', 'f4', zlib=True)
+                area_var = ds.createVariable('upstream_area', 'f4', zlib=True, fill_value=FILL_VALUE_FLOAT)
                 area_var.long_name = 'upstream drainage area'
                 area_var.units = 'km2'
-                area_var[:] = upstream_area
+                area_var[:] = upstream_area if np.isfinite(upstream_area) else FILL_VALUE_FLOAT
 
             # =============
             # Data Variables with Quality Flags

@@ -15,6 +15,12 @@ from datetime import datetime
 from pathlib import Path
 import re
 import bibtexparser
+import sys
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+from code.constants import FILL_VALUE_INT
 
 # ---------------------------------------------------------------------
 # File paths
@@ -156,7 +162,7 @@ def create_netcdf_for_an_samples(location_id, an_data, location_info, df_id, sum
 
         # === Flag 变量 ===
         def make_flag(name, flag):
-            fvar = ds.createVariable(name, "i1", ("sample",), fill_value=9)
+            fvar = ds.createVariable(name, "i1", ("sample",), fill_value=FILL_VALUE_INT)
             fvar.long_name = f"quality flag for {name.replace('_flag','')}"
             fvar.standard_name = "status_flag"
             fvar.flag_values = np.array([0,1,2,3,9], dtype=np.int8)

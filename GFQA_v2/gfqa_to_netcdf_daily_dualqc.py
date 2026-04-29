@@ -22,6 +22,9 @@ import os
 from pathlib import Path
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -107,6 +110,50 @@ def parse_float(value):
         return -9999.0
 
 
+def get_station_altitude(station_row, fill_value=-9999.0):
+    """
+    Return station altitude/elevation from GEMStat metadata.
+
+    GFQA station metadata usually stores this as ``Elevation`` rather than
+    ``altitude``. Several possible names are checked so the converter keeps
+    working if the source metadata uses a slightly different header.
+    """
+    altitude_columns = [
+        'Elevation',
+        'Elevation (m)',
+        'Elevation_m',
+        'Altitude',
+        'Altitude (m)',
+        'Altitude_m',
+        'altitude',
+        'elevation',
+    ]
+
+    for col in altitude_columns:
+        if col in station_row.index:
+            return parse_float(station_row.get(col, fill_value))
+    return fill_value
+
+
+def report_station_metadata_altitude(station_df):
+    """Print whether the source station metadata contains altitude/elevation."""
+    altitude_columns = [
+        'Elevation', 'Elevation (m)', 'Elevation_m',
+        'Altitude', 'Altitude (m)', 'Altitude_m',
+        'altitude', 'elevation',
+    ]
+    matched = [c for c in altitude_columns if c in station_df.columns]
+    if not matched:
+        print('Altitude/Elevation column not found in GEMStat_station_metadata.xlsx')
+        print('Available station metadata columns:', list(station_df.columns))
+        return
+
+    col = matched[0]
+    parsed = station_df[col].apply(parse_float)
+    valid = parsed != -9999.0
+    print(f"Altitude/Elevation source column: {col} ({int(valid.sum())}/{len(station_df)} valid values)")
+
+
 # ==========================================================
 # 数据读取与预处理
 # ==========================================================
@@ -124,6 +171,7 @@ def read_csv_files():
     flux_df['GEMS.Station.Number'] = flux_df['GEMS.Station.Number'].astype(str).str.strip()
     water_df['GEMS.Station.Number'] = water_df['GEMS.Station.Number'].astype(str).str.strip()
     station_df['GEMS Station Number'] = station_df['GEMS Station Number'].astype(str).str.strip()
+    report_station_metadata_altitude(station_df)
     flux_df['Parameter.Code'] = flux_df['Parameter.Code'].astype(str).str.strip()
     water_df['Parameter.Code'] = water_df['Parameter.Code'].astype(str).str.strip()
     # print("Flux station sample:", list(flux_stations)[:5])
@@ -250,11 +298,19 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     lon_var.standard_name = 'longitude'
     lon_var[:] = lon
 
+    altitude = get_station_altitude(station_row)
+    alt_var = ds.createVariable('altitude', 'f4', fill_value=-9999.0)
+    alt_var.units = 'm'
+    alt_var.standard_name = 'altitude'
+    alt_var.long_name = 'station altitude above mean sea level'
+    alt_var.positive = 'up'
+    alt_var[:] = altitude
+
     # --------------------------
     # helper: add flag var
     # --------------------------
     def _add_flag_var(name, values, long_name, flag_values, flag_meanings, comment=""):
-        v = ds.createVariable(name, 'b', ('time',), fill_value=-127)
+        v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
         v.long_name = long_name
         v.flag_values = np.array(flag_values, dtype=np.byte)
         v.flag_meanings = flag_meanings
@@ -269,17 +325,17 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=-9999.0)
     q_var.units = 'm3 s-1'
     q_var.long_name = 'river discharge'
-    q_var.coordinates = "latitude longitude"
+    q_var.coordinates = "latitude longitude altitude"
 
     ssc_var = ds.createVariable('SSC', 'f4', ('time',), fill_value=-9999.0)
     ssc_var.units = 'mg L-1'
     ssc_var.long_name = 'suspended sediment concentration'
-    ssc_var.coordinates = "latitude longitude"
+    ssc_var.coordinates = "latitude longitude altitude"
 
     ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0)
     ssl_var.units = 'ton day-1'
     ssl_var.long_name = 'suspended sediment load'
-    ssl_var.coordinates = "latitude longitude"
+    ssl_var.coordinates = "latitude longitude altitude"
 
     q_var[:] = discharge
     ssc_var[:] = ssc
@@ -386,7 +442,7 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     # --------------------------
     # scalar metadata
     # --------------------------
-    ds.altitude = parse_float(station_row.get('Elevation', -9999.0))
+    ds.altitude = altitude
     ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
 
     ds.Conventions = 'CF-1.8'
@@ -415,45 +471,39 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
 # ==========================================================
 # main processing function
 # ==========================================================
+def process_one_station(args):
+    station_id, flux_df, water_df, station_df, output_dir = args
 
-def process_all_stations(flux_df, water_df, station_df, output_dir):
-    all_records = []
-    stations_info = []
-
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    flux_stations = set(flux_df['GEMS.Station.Number'].unique())
-    water_stations = set(water_df['GEMS.Station.Number'].unique())
-    common_stations = flux_stations & water_stations
-
-    # print("Flux station sample:", list(flux_stations)[:5])
-    # print("Water station sample:", list(water_stations)[:5])
-    # print("Intersection size:", len(common_stations))
-
-
-    for station_id in sorted(common_stations):
+    try:
         print(f"\nProcessing station {station_id}")
-        station_row = station_df[station_df['GEMS Station Number'] == station_id].iloc[0]
 
+        station_match = station_df[station_df['GEMS Station Number'] == station_id]
+        if station_match.empty:
+            return None, None, f"Skipped {station_id}: station metadata not found"
+
+        station_row = station_match.iloc[0]
 
         discharge_data, sediment_data = extract_station_data(station_id, flux_df, water_df)
         start, end = find_overlapping_period(discharge_data, sediment_data)
         if start is None:
-            print("  ⚠️ Skipped: no overlapping period")
-            continue
+            return None, None, f"Skipped {station_id}: no overlapping period"
 
         discharge_daily = aggregate_to_daily(discharge_data)
         sediment_daily = aggregate_to_daily(sediment_data)
-        merged = pd.merge(discharge_daily, sediment_daily, on='Date', how='inner', suffixes=('_Q', '_SSC'))
+
+        merged = pd.merge(
+            discharge_daily,
+            sediment_daily,
+            on='Date',
+            how='inner',
+            suffixes=('_Q', '_SSC')
+        )
+
         if merged.empty:
-            print("  ⚠️ Skipped: no same-day data")
-            continue
+            return None, None, f"Skipped {station_id}: no same-day data"
 
         merged['SSL'] = merged['Clean_Value_Q'] * merged['Clean_Value_SSC'] * 0.0864
-        
-        # ==================================================
-        # ✅ 用 tool.py 的一键QC（含分步provenance flags）
-        # ==================================================
+
         time_arr = pd.to_datetime(merged['Date']).values
         Q_arr = merged['Clean_Value_Q'].to_numpy(dtype=float)
         SSC_arr = merged['Clean_Value_SSC'].to_numpy(dtype=float)
@@ -466,38 +516,58 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             SSL=SSL_arr,
             Q_is_independent=True,
             SSC_is_independent=True,
-            SSL_is_independent=False,          # SSL = Q*SSC 推导
+            SSL_is_independent=False,
             ssl_is_derived_from_q_ssc=True,
             qc2_k=1.5,
             qc2_min_samples=5,
             qc3_k=1.5,
             qc3_min_samples=5,
         )
-        if qc is None:
-            print("  ⚠️ Skipped: QC produced no valid data")
-            continue
 
-        # 写回 merged（用于导出/诊断图）
+        if qc is None:
+            return None, None, f"Skipped {station_id}: QC produced no valid data"
+
         merged['Q_flag'] = qc['Q_flag']
         merged['SSC_flag'] = qc['SSC_flag']
         merged['SSL_flag'] = qc['SSL_flag']
 
-        merged['Q_flag_qc1_physical'] = qc.get('Q_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
-        merged['SSC_flag_qc1_physical'] = qc.get('SSC_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
-        merged['SSL_flag_qc1_physical'] = qc.get('SSL_flag_qc1_physical', np.full(len(merged), FILL_VALUE_INT, dtype=np.int8))
+        merged['Q_flag_qc1_physical'] = qc.get(
+            'Q_flag_qc1_physical',
+            np.full(len(merged), FILL_VALUE_INT, dtype=np.int8)
+        )
+        merged['SSC_flag_qc1_physical'] = qc.get(
+            'SSC_flag_qc1_physical',
+            np.full(len(merged), FILL_VALUE_INT, dtype=np.int8)
+        )
+        merged['SSL_flag_qc1_physical'] = qc.get(
+            'SSL_flag_qc1_physical',
+            np.full(len(merged), FILL_VALUE_INT, dtype=np.int8)
+        )
 
-        merged['Q_flag_qc2_log_iqr'] = qc.get('Q_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
-        merged['SSC_flag_qc2_log_iqr'] = qc.get('SSC_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
-        merged['SSL_flag_qc2_log_iqr'] = qc.get('SSL_flag_qc2_log_iqr', np.full(len(merged), 8, dtype=np.int8))
+        merged['Q_flag_qc2_log_iqr'] = qc.get(
+            'Q_flag_qc2_log_iqr',
+            np.full(len(merged), 8, dtype=np.int8)
+        )
+        merged['SSC_flag_qc2_log_iqr'] = qc.get(
+            'SSC_flag_qc2_log_iqr',
+            np.full(len(merged), 8, dtype=np.int8)
+        )
+        merged['SSL_flag_qc2_log_iqr'] = qc.get(
+            'SSL_flag_qc2_log_iqr',
+            np.full(len(merged), 8, dtype=np.int8)
+        )
 
-        merged['SSC_flag_qc3_ssc_q'] = qc.get('SSC_flag_qc3_ssc_q', np.full(len(merged), 8, dtype=np.int8))
-        merged['SSL_flag_qc3_from_ssc_q'] = qc.get('SSL_flag_qc3_from_ssc_q', np.full(len(merged), 8, dtype=np.int8))
+        merged['SSC_flag_qc3_ssc_q'] = qc.get(
+            'SSC_flag_qc3_ssc_q',
+            np.full(len(merged), 8, dtype=np.int8)
+        )
+        merged['SSL_flag_qc3_from_ssc_q'] = qc.get(
+            'SSL_flag_qc3_from_ssc_q',
+            np.full(len(merged), 8, dtype=np.int8)
+        )
 
         ssc_q_bounds = qc.get("ssc_q_bounds", None)
-            
-        # --------------------------------------------------
-        # SSC–Q diagnostic plot (station-level)
-        # --------------------------------------------------
+
         if ssc_q_bounds is not None:
             plot_dir = Path(output_dir) / "diagnostic"
             plot_dir.mkdir(exist_ok=True)
@@ -516,13 +586,9 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
                 out_png=str(out_png),
             )
 
-        # === 收集所有站点的合并数据 ===
         export_df = merged.copy()
-        export_df['Station_ID'] = station_id     # 加入站点号
-        all_records.append(export_df)
-        # ==========================
-        # 站点QC统计（用于CSV汇总）
-        # ==========================
+        export_df['Station_ID'] = station_id
+
         lat, lon = parse_lat_lon(station_row)
 
         def _count_final(f):
@@ -532,7 +598,7 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
                 "estimated": int(np.sum(f == 1)),
                 "suspect": int(np.sum(f == 2)),
                 "bad": int(np.sum(f == 3)),
-                "missing": int(np.sum(f == FILL_VALUE_INT)),  # 9
+                "missing": int(np.sum(f == FILL_VALUE_INT)),
             }
 
         def _count_step(f, mapping):
@@ -547,37 +613,35 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             "QC_n_days": int(len(merged)),
         }
 
-        # final flags（你现在 merged 里已有 Q_flag/SSC_flag/SSL_flag）
-        c = _count_final(merged["Q_flag"].to_numpy());   station_info.update({f"Q_final_{k}": v for k, v in c.items()})
-        c = _count_final(merged["SSC_flag"].to_numpy()); station_info.update({f"SSC_final_{k}": v for k, v in c.items()})
-        c = _count_final(merged["SSL_flag"].to_numpy()); station_info.update({f"SSL_final_{k}": v for k, v in c.items()})
+        c = _count_final(merged["Q_flag"].to_numpy())
+        station_info.update({f"Q_final_{k}": v for k, v in c.items()})
 
-        # 如果你已经把分步 flags 写回 merged（比如 Q_flag_qc1_physical 等），这里再统计：
+        c = _count_final(merged["SSC_flag"].to_numpy())
+        station_info.update({f"SSC_final_{k}": v for k, v in c.items()})
+
+        c = _count_final(merged["SSL_flag"].to_numpy())
+        station_info.update({f"SSL_final_{k}": v for k, v in c.items()})
+
         qc1_map = {"pass": 0, "bad": 3, "missing": 9}
         qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
 
-        if "Q_flag_qc1_physical" in merged.columns:
-            c = _count_step(merged["Q_flag_qc1_physical"].to_numpy(), qc1_map)
-            station_info.update({f"Q_qc1_{k}": v for k, v in c.items()})
-        if "Q_flag_qc2_log_iqr" in merged.columns:
-            c = _count_step(merged["Q_flag_qc2_log_iqr"].to_numpy(), qc2_map)
-            station_info.update({f"Q_qc2_{k}": v for k, v in c.items()})
+        c = _count_step(merged["Q_flag_qc1_physical"].to_numpy(), qc1_map)
+        station_info.update({f"Q_qc1_{k}": v for k, v in c.items()})
 
-        # SSC/SSL 分步同理（你有这些列就统计，没有就自动跳过）
-        if "SSC_flag_qc1_physical" in merged.columns:
-            c = _count_step(merged["SSC_flag_qc1_physical"].to_numpy(), qc1_map)
-            station_info.update({f"SSC_qc1_{k}": v for k, v in c.items()})
-        if "SSC_flag_qc2_log_iqr" in merged.columns:
-            c = _count_step(merged["SSC_flag_qc2_log_iqr"].to_numpy(), qc2_map)
-            station_info.update({f"SSC_qc2_{k}": v for k, v in c.items()})
-        if "SSL_flag_qc1_physical" in merged.columns:
-            c = _count_step(merged["SSL_flag_qc1_physical"].to_numpy(), qc1_map)
-            station_info.update({f"SSL_qc1_{k}": v for k, v in c.items()})
-        if "SSL_flag_qc2_log_iqr" in merged.columns:
-            c = _count_step(merged["SSL_flag_qc2_log_iqr"].to_numpy(), qc2_map)
-            station_info.update({f"SSL_qc2_{k}": v for k, v in c.items()})
+        c = _count_step(merged["Q_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+        station_info.update({f"Q_qc2_{k}": v for k, v in c.items()})
 
-        stations_info.append(station_info)
+        c = _count_step(merged["SSC_flag_qc1_physical"].to_numpy(), qc1_map)
+        station_info.update({f"SSC_qc1_{k}": v for k, v in c.items()})
+
+        c = _count_step(merged["SSC_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+        station_info.update({f"SSC_qc2_{k}": v for k, v in c.items()})
+
+        c = _count_step(merged["SSL_flag_qc1_physical"].to_numpy(), qc1_map)
+        station_info.update({f"SSL_qc1_{k}": v for k, v in c.items()})
+
+        c = _count_step(merged["SSL_flag_qc2_log_iqr"].to_numpy(), qc2_map)
+        station_info.update({f"SSL_qc2_{k}": v for k, v in c.items()})
 
         create_netcdf_file(
             station_id=station_id,
@@ -588,23 +652,46 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             output_dir=output_dir,
         )
 
+        return export_df, station_info, f"Finished {station_id}"
 
-        # errors, warnings = check_nc_completeness(filepath, strict=False)
+    except Exception as e:
+        return None, None, f"Failed {station_id}: {repr(e)}"
 
-        # if errors:
-        #     print("  ❌ NetCDF CF/ACDD compliance errors:")
-        #     for e in errors:
-        #         print(f"     - {e}")
-        #     raise RuntimeError("NetCDF completeness check failed")
 
-        # if warnings:
-        #     print("  ⚠️ NetCDF CF/ACDD compliance warnings:")
-        #     for w in warnings:
-        #         print(f"     - {w}")
+def process_all_stations(flux_df, water_df, station_df, output_dir):
+    all_records = []
+    stations_info = []
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    flux_stations = set(flux_df['GEMS.Station.Number'].unique())
+    water_stations = set(water_df['GEMS.Station.Number'].unique())
+    common_stations = flux_stations & water_stations
+
+    tasks = [
+        (station_id, flux_df, water_df, station_df, output_dir)
+        for station_id in sorted(common_stations)
+    ]
+
+    max_workers = min(24, max(1, mp.cpu_count() - 1))
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_one_station, task) for task in tasks]
+
+        for future in as_completed(futures):
+            export_df, station_info, message = future.result()
+            print(message)
+
+            if export_df is not None:
+                all_records.append(export_df)
+
+            if station_info is not None:
+                stations_info.append(station_info)
 
     # === 所有站点合并输出 Excel ===
     if all_records:
         big_df = pd.concat(all_records, ignore_index=True)
+        big_df = big_df.sort_values(["Station_ID", "Date"]).reset_index(drop=True)
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -613,6 +700,7 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
         big_df.to_excel(out_path, index=False)
 
         print(f"\n📘 Saved merged Excel for all stations: {out_path}")
+
     # === 输出两个CSV汇总 ===
     if stations_info:
         out_dir = Path(output_dir)
@@ -624,8 +712,6 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
             stations_info,
             str(out_dir / "GFQA_station_qc_results.csv")
         )
-
-
 
 
 def main():

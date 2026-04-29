@@ -516,8 +516,9 @@ def process_yajiang():
         new_ds['lon'] = ((), lon)
         new_ds['lat'].attrs = {'long_name': 'station latitude', 'standard_name': 'latitude', 'units': 'degrees_north'}
         new_ds['lon'].attrs = {'long_name': 'station longitude', 'standard_name': 'longitude', 'units': 'degrees_east'}
-        new_ds['altitude'] = ((), ds.altitude.item() if 'altitude' in ds else np.nan)
-        new_ds['upstream_area'] = ((), np.nan) # Not available
+        altitude = ds.altitude.item() if 'altitude' in ds else FILL_VALUE_FLOAT
+        new_ds['altitude'] = ((), altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT})
+        new_ds['upstream_area'] = ((), FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT}) # Not available
 
         # Global attributes
         new_ds.attrs = {

@@ -172,7 +172,7 @@ def log_station_qc(station_name, source_id, n_samples,
 # ==========================================================
 # QC Results Summary helpers (final + step/provenance)
 # ==========================================================
-MISSING_CODE = 9  # 约定 missing 计数用 9（同时兼容 _FillValue=-127）
+MISSING_CODE = 9  # 约定 missing 计数用 9
 
 def _as_np(a):
     if a is None:

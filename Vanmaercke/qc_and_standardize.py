@@ -254,7 +254,7 @@ def standardize_netcdf_file(input_file, output_dir):
         q_var[:] = [-9999.0]
 
         # Q quality flag
-        q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=9, zlib=True, complevel=4)
+        q_flag_var = ds.createVariable('Q_flag', 'b', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         q_flag_var.long_name = "quality flag for river discharge"
         q_flag_var.standard_name = "status_flag"
         q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
@@ -275,7 +275,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ssc_var[:] = [-9999.0]
 
         # SSC quality flag
-        ssc_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=9, zlib=True, complevel=4)
+        ssc_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssc_flag_var.long_name = "quality flag for suspended sediment concentration"
         ssc_flag_var.standard_name = "status_flag"
         ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
@@ -296,7 +296,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ssl_var[:] = [ssl_val if not np.isnan(ssl_val) else -9999.0]
 
         # SSL quality flag
-        ssl_flag_var = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=9, zlib=True, complevel=4)
+        ssl_flag_var = ds.createVariable('SSL_flag', 'b', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
         ssl_flag_var.long_name = "quality flag for suspended sediment load"
         ssl_flag_var.standard_name = "status_flag"
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)

@@ -18,6 +18,7 @@ SCRIPT_ROOT = CURRENT_DIR.parent
 CODE_DIR = SCRIPT_ROOT / 'code'
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
+from constants import FILL_VALUE_FLOAT
 from runtime import ensure_directory, resolve_output_root, resolve_source_root
 from validation import read_excel_validated, require_existing_file
 
@@ -156,20 +157,20 @@ def create_netcdf_file(station_data, output_path):
         lon_var.standard_name = 'longitude'
         lon_var.assignValue(lon)
 
-        # Create altitude variable (scalar - set to NaN since not provided)
-        alt_var = dataset.createVariable('altitude', 'f4')
+        # Create altitude variable (scalar - not provided)
+        alt_var = dataset.createVariable('altitude', 'f4', fill_value=FILL_VALUE_FLOAT)
         alt_var.units = 'm'
         alt_var.long_name = 'altitude'
         alt_var.standard_name = 'altitude'
         alt_var.comment = 'Not available in source dataset'
-        alt_var.assignValue(np.nan)
+        alt_var.assignValue(FILL_VALUE_FLOAT)
 
         # Create upstream area variable (scalar)
-        area_var = dataset.createVariable('upstream_area', 'f4')
+        area_var = dataset.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
         area_var.units = 'km2'
         area_var.long_name = 'upstream drainage area'
         area_var.comment = 'Catchment area from source dataset, used in sediment_load calculation'
-        area_var.assignValue(area)
+        area_var.assignValue(area if np.isfinite(area) else FILL_VALUE_FLOAT)
 
         # Create sediment load variable
         sed_var = dataset.createVariable('sediment_load', 'f4', ('time',),

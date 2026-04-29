@@ -29,6 +29,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 from code.output import generate_qc_results_csv, generate_station_summary_csv
 from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
@@ -67,7 +68,7 @@ SSC_MAX_THRESHOLD = 3000.0 # As per user request
 SSL_MIN_THRESHOLD = 0.0
 
 # Metadata
-FILL_VALUE = -9999.0
+FILL_VALUE = FILL_VALUE_FLOAT
 REFERENCE_DATE = "1970-01-01 00:00:00"
 CONVENTIONS = "CF-1.8, ACDD-1.3"
 CREATOR_NAME = "Zhongwang Wei"
@@ -310,7 +311,7 @@ def create_netcdf_file(station_id, event_id, meta, data, output_dir):
             var.ancillary_variables = f"{name}_flag"
             var[:] = values.fillna(FILL_VALUE).values
 
-            flag_var = ds.createVariable(f"{name}_flag", 'i1', ('time',), fill_value=9)
+            flag_var = ds.createVariable(f"{name}_flag", 'i1', ('time',), fill_value=FILL_VALUE_INT)
             flag_var.long_name = f"Quality flag for {long_name}"
             flag_var.standard_name = "status_flag"
             flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')

@@ -17,10 +17,12 @@ import os
 import glob
 import logging
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import xarray as xr
 import sys
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
@@ -46,6 +48,13 @@ from code.units import convert_ssl_units_if_needed
 # =========================
 # 全局 QC / FLAG 设置
 # =========================
+# =========================
+# 并行设置
+# =========================
+# None 或 <=0：自动使用 os.cpu_count() - 1
+# 1：串行运行，适合调试
+# >1：指定使用的进程数
+MAX_WORKERS = 32
 
 FLAG_GOOD = 0       # good_data
 FLAG_EST = 1        # estimated_data（当前未使用，预留）
@@ -59,7 +68,7 @@ FLAG_MISS = 9       # missing_data
 # SSL_EXTREME_HIGH = 1_000_000.0 # ton/day，可按需要调整
 
 FILL_FLOAT = -9999.0
-FILL_FLAG = np.int8(-127)
+FILL_FLAG = FILL_VALUE_INT
 
 
 # =========================
@@ -771,10 +780,45 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     return summary
 
-
-def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv_path: str):
+def _process_single_netcdf_worker(args):
     """
-    批量处理 Dethier 源数据文件夹中的 NetCDF
+    多进程 worker：每个进程处理一个 NetCDF 文件。
+    """
+    nc_file, output_dir = args
+
+    # 每个进程写自己的日志，避免多个进程同时写同一个 log 文件
+    worker_log = f"process_dethier_worker_{os.getpid()}.log"
+    setup_logging(output_dir, worker_log)
+
+    try:
+        summary = process_single_netcdf(nc_file, output_dir)
+        return {
+            "nc_file": nc_file,
+            "summary": summary,
+            "error": None,
+        }
+    except Exception as e:
+        LOGGER.exception("Unexpected error while processing %s: %s", nc_file, e)
+        return {
+            "nc_file": nc_file,
+            "summary": None,
+            "error": repr(e),
+        }
+
+
+def process_dethier_data_from_nc(
+    input_nc_dir: str,
+    output_dir: str,
+    summary_csv_path: str,
+    max_workers: int | None = None,
+):
+    """
+    批量处理 Dethier 源数据文件夹中的 NetCDF。
+
+    max_workers:
+    - None 或 <=0：自动使用 os.cpu_count() - 1
+    - 1：串行运行，适合调试
+    - >1：指定使用的进程数
     """
     setup_logging(output_dir)
 
@@ -794,33 +838,84 @@ def process_dethier_data_from_nc(input_nc_dir: str, output_dir: str, summary_csv
         LOGGER.warning("No .nc files found in %s", input_nc_dir)
         return
 
+    if max_workers is None or max_workers <= 0:
+        cpu_count = os.cpu_count() or 1
+        max_workers = max(1, cpu_count - 1)
+
+    # 文件数少于核心数时，不需要开太多进程
+    max_workers = min(max_workers, len(nc_files))
+
+    LOGGER.info("Using max_workers=%d", max_workers)
+
     summaries = []
     success = 0
     skipped = 0
 
-    for nc_file in nc_files:
-        try:
-            summary = process_single_netcdf(nc_file, output_dir)
-            if summary is not None:
-                summaries.append(summary)
-                success += 1
-            else:
+    if max_workers == 1:
+        # 串行模式，方便调试
+        for nc_file in nc_files:
+            try:
+                summary = process_single_netcdf(nc_file, output_dir)
+                if summary is not None:
+                    summaries.append(summary)
+                    success += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                LOGGER.exception("Unexpected error while processing %s: %s", nc_file, e)
                 skipped += 1
-        except Exception as e:
-            LOGGER.exception("Unexpected error while processing %s: %s", nc_file, e)
-            skipped += 1
+
+    else:
+        # 多进程模式
+        tasks = [(nc_file, output_dir) for nc_file in nc_files]
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {
+                executor.submit(_process_single_netcdf_worker, task): task[0]
+                for task in tasks
+            }
+
+            for future in as_completed(future_to_file):
+                nc_file = future_to_file[future]
+                basename = os.path.basename(nc_file)
+
+                try:
+                    result = future.result()
+                except Exception as e:
+                    LOGGER.exception("Worker crashed while processing %s: %s", basename, e)
+                    skipped += 1
+                    continue
+
+                if result["error"] is not None:
+                    LOGGER.error("Failed: %s | %s", basename, result["error"])
+                    skipped += 1
+                    continue
+
+                if result["summary"] is not None:
+                    summaries.append(result["summary"])
+                    success += 1
+                    LOGGER.info("Finished: %s", basename)
+                else:
+                    skipped += 1
+                    LOGGER.warning("Skipped: %s", basename)
+
+    # 并行完成顺序是不固定的，这里排序，保证 CSV 输出顺序稳定
+    summaries = sorted(summaries, key=lambda x: str(x.get("Source_ID", "")))
 
     # 写 summary CSV
     if summaries:
-        generate_csv_summary_tool(summaries,summary_csv_path)
-        # 写 2) QC results CSV（同目录下另存一份）
+        generate_csv_summary_tool(summaries, summary_csv_path)
+
         qc_csv_path = os.path.join(output_dir, "Dethier_qc_results.csv")
-        generate_qc_results_csv_tool(summaries,qc_csv_path)
+        generate_qc_results_csv_tool(summaries, qc_csv_path)
+
         LOGGER.info("Summary CSV saved to: %s", summary_csv_path)
+        LOGGER.info("QC results CSV saved to: %s", qc_csv_path)
     else:
         LOGGER.warning("No valid stations processed, summary CSV not created.")
 
     LOGGER.info("Processing finished. Success: %d, Skipped/Failed: %d", success, skipped)
+
 
 # =========================
 # main 入口
@@ -835,4 +930,5 @@ if __name__ == "__main__":
         os.fspath(input_nc_dir),
         os.fspath(output_dir),
         os.fspath(summary_csv),
+        max_workers=MAX_WORKERS,
     )

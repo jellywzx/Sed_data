@@ -16,8 +16,15 @@ import netCDF4 as nc
 from datetime import datetime
 import os
 import warnings
+import sys
 
 warnings.filterwarnings('ignore')
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.constants import FILL_VALUE_INT
 
 # Station metadata based on NERC documentation
 # Reference: Heppell, C.M.; Binley, A. (2016). Hampshire Avon: Daily discharge, stage
@@ -211,17 +218,17 @@ def process_station(station_code, data_dir, output_dir):
         area_var.units = 'km2'
 
         # Flag variables
-        q_flag_var = ncfile.createVariable('Q_flag', 'b', ('time',), fill_value=9)
+        q_flag_var = ncfile.createVariable('Q_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         q_flag_var.long_name = 'Quality flag for River Discharge'
         q_flag_var.flag_values = np.array([0, 2, 3, 9], dtype='b')
         q_flag_var.flag_meanings = 'good_data suspect_data bad_data missing_data'
         
-        ssc_flag_var = ncfile.createVariable('SSC_flag', 'b', ('time',), fill_value=9)
+        ssc_flag_var = ncfile.createVariable('SSC_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         ssc_flag_var.long_name = 'Quality flag for Suspended Sediment Concentration'
         ssc_flag_var.flag_values = np.array([0, 2, 3, 9], dtype='b')
         ssc_flag_var.flag_meanings = 'good_data suspect_data bad_data missing_data'
 
-        ssl_flag_var = ncfile.createVariable('SSL_flag', 'b', ('time',), fill_value=9)
+        ssl_flag_var = ncfile.createVariable('SSL_flag', 'b', ('time',), fill_value=FILL_VALUE_INT)
         ssl_flag_var.long_name = 'Quality flag for Suspended Sediment Load'
         ssl_flag_var.flag_values = np.array([0, 3, 9], dtype='b')
         ssl_flag_var.flag_meanings = 'good_data bad_data missing_data'

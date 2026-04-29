@@ -10,8 +10,7 @@ This script:
    - climatology: collapses annual values into one climatological annual mean
 4. Generates two station summary CSVs
 5. Saves outputs to:
-   - Output_r/annual/Huanghe
-   - Output_r/climatology/Huanghe
+    Output_r/annually_climatology
 """
 
 import pandas as pd
@@ -328,7 +327,7 @@ def write_standardized_file(
             "SSC_flag",
             "b",
             ("time",),
-            fill_value=9,
+            fill_value=FILL_VALUE_INT,
             zlib=True,
             complevel=4,
         )
@@ -1043,12 +1042,12 @@ def run_standard_pipeline():
         description="HuangHe intermediate NetCDF directory",
     )
 
-    output_dir_ann = ensure_directory(
-        resolve_output_root(start=__file__) / "annual" / "Huanghe"
+    output_dir_all = ensure_directory(
+        resolve_output_root(start=__file__) / "annually_climatology"/"Huanghe"
     )
-    output_dir_clim = ensure_directory(
-        resolve_output_root(start=__file__) / "climatology" / "Huanghe"
-    )
+    output_dir_ann = output_dir_all
+    output_dir_clim = output_dir_all
+
     source_excel_file = resolve_source_root(start=__file__) / "HuangHe" / SOURCE_EXCEL_FILENAME
     climatology_lookup = load_climatology_lookup_from_excel(source_excel_file)
 
@@ -1183,8 +1182,9 @@ def run_standard_pipeline():
 
 def parse_args():
     """Parse command-line arguments."""
-    default_annual_dir = resolve_output_root(start=__file__) / "annual" / "Huanghe"
-    default_clim_dir = resolve_output_root(start=__file__) / "climatology" / "Huanghe"
+    default_all_dir = resolve_output_root(start=__file__) / "annually_climatology"
+    default_annual_dir = default_all_dir
+    default_clim_dir = default_all_dir
 
     parser = argparse.ArgumentParser(
         description=(
@@ -1204,14 +1204,14 @@ def parse_args():
     parser.add_argument(
         "--annual-dir",
         default=str(default_annual_dir),
-        help="Directory containing existing annual files (default: Output_r/annual/Huanghe).",
+        help="Directory containing existing annual files (default: Output_r/annually_climatology).",
     )
     parser.add_argument(
         "--clim-output-dir",
         default=str(default_clim_dir),
         help=(
             "Directory to write rebuilt climatology files "
-            "(default: Output_r/climatology/Huanghe)."
+            "(default: Output_r/annually_climatology)."
         ),
     )
     parser.add_argument(

@@ -30,6 +30,10 @@ import netCDF4 as nc
 from datetime import datetime
 import warnings
 import json
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 warnings.filterwarnings('ignore')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -59,6 +63,24 @@ OUTPUT_DIR = os.fspath(
     resolve_output_root(start=__file__) / "monthly" / "EUSEDcollab" / "qc"
 )
 METADATA_FILE = os.path.join(SOURCE_DIR, "ALL_METADATA.csv")
+
+
+def _default_worker_count():
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 1)
+
+
+# Built-in runtime parameters. Edit these constants directly when needed.
+RUN_IN_PARALLEL = True
+N_WORKERS = _default_worker_count()
+QC_IQR_K = 1.5
+QC_MIN_SAMPLES_ENVELOPE = 5
+WRITE_DIAGNOSTIC_PLOTS = True
+DIAGNOSTIC_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
+DIAGNOSTIC_PLOT_DIR = os.path.join(OUTPUT_DIR, "diagnostic_plots")
 
 FILL_VALUE = -9999.0
 # =============================================================================
@@ -649,13 +671,12 @@ def process_station(station_id, country):
     # ------------------------------------------
     # QC using tool.py
     # ------------------------------------------
-    DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
     # 如果你想把 turbidity-derived SSC 标为 estimated(1)，可以传 mask：
     # estimated_mask = {"SSC": (df.get("SSC_flag", 0) == FLAG_ESTIMATED)}  # 你目前 detect_and_convert_columns 有写 SSC_flag=FLAG_ESTIMATED
     estimated_mask = {
-    "Q": df["derived"].values,
-    "SSC": df["derived"].values,
-    "SSL": df["derived"].values,
+        "Q": df["derived"].values,
+        "SSC": df["derived"].values,
+        "SSL": df["derived"].values,
     }
 
 
@@ -664,9 +685,9 @@ def process_station(station_id, country):
         station_id=station_id,
         station_name=metadata["station_name"],
         output_dir=OUTPUT_DIR,          # 用于保存 provenance JSON
-        diagnostic_dir=DIAG_DIR,
-        iqr_k=1.5,
-        min_samples_envelope=5,
+        diagnostic_dir=DIAGNOSTIC_DIR if WRITE_DIAGNOSTIC_PLOTS else None,
+        iqr_k=QC_IQR_K,
+        min_samples_envelope=QC_MIN_SAMPLES_ENVELOPE,
         flag_estimated_mask=estimated_mask
     )
     print("  QC provenance summary:")
@@ -699,25 +720,25 @@ def process_station(station_id, country):
     # --------------------------------------------------
     # SSC–Q diagnostic plot
     # --------------------------------------------------
-    plot_dir = os.path.join(OUTPUT_DIR, "diagnostic_plots")
-    os.makedirs(plot_dir, exist_ok=True)
+    if WRITE_DIAGNOSTIC_PLOTS:
+        os.makedirs(DIAGNOSTIC_PLOT_DIR, exist_ok=True)
 
-    plot_file = os.path.join(
-        plot_dir,
-        f"EUSEDcollab_{country}-{metadata['station_name']}-ID{station_id}_ssc_q.png"
-    )
+        plot_file = os.path.join(
+            DIAGNOSTIC_PLOT_DIR,
+            f"EUSEDcollab_{country}-{metadata['station_name']}-ID{station_id}_ssc_q.png"
+        )
 
-    plot_ssc_q_diagnostic(
-        time=df['date'].values,
-        Q=df['Q'].values,
-        SSC=df['SSC'].values,
-        Q_flag=q_flag,
-        SSC_flag=ssc_flag,
-        ssc_q_bounds=ssc_q_bounds,
-        station_id=str(station_id),
-        station_name=metadata['station_name'],
-        out_png=plot_file,
-    )
+        plot_ssc_q_diagnostic(
+            time=df['date'].values,
+            Q=df['Q'].values,
+            SSC=df['SSC'].values,
+            Q_flag=q_flag,
+            SSC_flag=ssc_flag,
+            ssc_q_bounds=ssc_q_bounds,
+            station_id=str(station_id),
+            station_name=metadata['station_name'],
+            out_png=plot_file,
+        )
 
 
     # Create NetCDF file
@@ -778,7 +799,7 @@ def process_station(station_id, country):
         'upstream_area': metadata['drainage_area'],
         'Data Source Name': 'EUSEDcollab Dataset',
         'Type': 'In-situ',
-        'Temporal Resolution': 'daily',
+        'Temporal Resolution': 'monthly',
         'Temporal Span': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
         'Variables Provided': 'Q, SSC, SSL',
         'Geographic Coverage': f"{metadata['country']}",
@@ -1066,6 +1087,112 @@ def generate_summary_csv(station_list, output_dir):
 # Main Execution
 # =============================================================================
 
+def _build_station_tasks(meta_df):
+    """Build picklable station tasks from metadata rows."""
+    tasks = []
+    for idx, row in meta_df.iterrows():
+        tasks.append((int(idx), row['Catchment ID'], row['Country']))
+    return tasks
+
+
+def _process_station_task(task):
+    """Run one station in a worker process and return logs plus result."""
+    idx, station_id, country = task
+    log_stream = StringIO()
+
+    with redirect_stdout(log_stream), redirect_stderr(log_stream):
+        try:
+            station_info = process_station(station_id, country)
+            ok = True
+            error = None
+        except Exception as exc:
+            station_info = None
+            ok = False
+            error = str(exc)
+            traceback.print_exc()
+
+    return {
+        "idx": idx,
+        "station_id": station_id,
+        "country": country,
+        "ok": ok,
+        "error": error,
+        "station_info": station_info,
+        "log": log_stream.getvalue(),
+    }
+
+
+def _run_station_tasks_parallel(tasks):
+    """Process station tasks with multiple CPU cores."""
+    if len(tasks) == 0:
+        return []
+
+    max_workers = min(N_WORKERS, len(tasks))
+    print(f"\nParallel processing enabled: {max_workers} worker(s)")
+
+    results = []
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(_process_station_task, task): task
+            for task in tasks
+        }
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            _, station_id, country = task
+            completed += 1
+
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"\n  ERROR processing station ID_{station_id}_{country}: {exc}")
+                traceback.print_exc()
+                continue
+
+            log_text = result.get("log", "").rstrip()
+            if log_text:
+                print(log_text)
+
+            if result["ok"]:
+                print(f"  [{completed}/{len(tasks)}] Finished station ID_{station_id}_{country}")
+            else:
+                print(
+                    f"  [{completed}/{len(tasks)}] ERROR processing station "
+                    f"ID_{station_id}_{country}: {result['error']}"
+                )
+
+            results.append(result)
+
+    results.sort(key=lambda item: item["idx"])
+    return [
+        item["station_info"]
+        for item in results
+        if item["ok"] and item["station_info"] is not None
+    ]
+
+
+def _run_station_tasks_sequential(tasks):
+    """Process station tasks sequentially using the same error handling."""
+    station_list = []
+
+    for completed, task in enumerate(tasks, start=1):
+        _, station_id, country = task
+
+        try:
+            station_info = process_station(station_id, country)
+            if station_info is not None:
+                station_list.append(station_info)
+            print(f"  [{completed}/{len(tasks)}] Finished station ID_{station_id}_{country}")
+        except Exception as e:
+            print(f"  ERROR processing station ID_{station_id}_{country}: {str(e)}")
+            traceback.print_exc()
+            continue
+
+    return station_list
+
+
 def main():
     """Main processing function"""
 
@@ -1075,29 +1202,24 @@ def main():
 
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if WRITE_DIAGNOSTIC_PLOTS:
+        os.makedirs(DIAGNOSTIC_DIR, exist_ok=True)
+        os.makedirs(DIAGNOSTIC_PLOT_DIR, exist_ok=True)
 
     # Read metadata to get list of stations
     meta_df = pd.read_csv(METADATA_FILE, encoding='utf-8-sig')
 
     print(f"\nFound {len(meta_df)} stations in metadata")
     print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Parallel mode: {RUN_IN_PARALLEL}")
+    print(f"Configured workers: {N_WORKERS}")
 
     # Process each station
-    station_list = []
-
-    for idx, row in meta_df.iterrows():
-        station_id = row['Catchment ID']
-        country = row['Country']
-
-        try:
-            station_info = process_station(station_id, country)
-            if station_info is not None:
-                station_list.append(station_info)
-        except Exception as e:
-            print(f"  ERROR processing station ID_{station_id}_{country}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
+    tasks = _build_station_tasks(meta_df)
+    if RUN_IN_PARALLEL and N_WORKERS > 1:
+        station_list = _run_station_tasks_parallel(tasks)
+    else:
+        station_list = _run_station_tasks_sequential(tasks)
 
     # Generate summary CSV
     generate_summary_csv(station_list, OUTPUT_DIR)

@@ -395,15 +395,16 @@ def process_single_station(args):
             flag_var = f"{var}_flag"
             ds[flag_var] = ('time', df[flag_var].astype(np.int8))
             ds[flag_var].attrs = {
-                'flag_values': np.array([0, 1, 2, 3], dtype=np.int8),
-                'flag_meanings': 'good_data suspect_data bad_data missing_data',
+                '_FillValue': FILL_VALUE_INT,
+                'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.int8),
+                'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
             }
 
         # Coordinates
         ds['lat'] = ((), station_info['dec_lat_va'])
         ds['lon'] = ((), station_info['dec_long_va'])
-        ds['altitude'] = ((), station_info['alt_va'] * FEET_TO_METERS if pd.notna(station_info['alt_va']) else np.nan)
-        ds['upstream_area'] = ((), station_info['drain_area_va'] * MILES_TO_KM**2 if pd.notna(station_info['drain_area_va']) else np.nan)
+        ds['altitude'] = ((), station_info['alt_va'] * FEET_TO_METERS if pd.notna(station_info['alt_va']) else FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT})
+        ds['upstream_area'] = ((), station_info['drain_area_va'] * MILES_TO_KM**2 if pd.notna(station_info['drain_area_va']) else FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT})
 
         # Global attributes
         ds.attrs = {

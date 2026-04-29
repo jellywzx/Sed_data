@@ -474,7 +474,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     Q_var[:] = [Q]
 
     # Q_flag
-    Q_flag_var = nc.createVariable('Q_flag', 'i1', ('time',), fill_value=9)
+    Q_flag_var = nc.createVariable('Q_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     Q_flag_var.long_name = 'quality flag for river discharge'
     Q_flag_var.standard_name = 'status_flag'
     Q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -497,7 +497,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     SSC_var[:] = [SSC]
 
     # SSC_flag
-    SSC_flag_var = nc.createVariable('SSC_flag', 'i1', ('time',), fill_value=9)
+    SSC_flag_var = nc.createVariable('SSC_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSC_flag_var.long_name = 'quality flag for suspended sediment concentration'
     SSC_flag_var.standard_name = 'status_flag'
     SSC_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
@@ -515,7 +515,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     SSL_var[:] = [SSL]
 
     # SSL_flag
-    SSL_flag_var = nc.createVariable('SSL_flag', 'i1', ('time',), fill_value=9)
+    SSL_flag_var = nc.createVariable('SSL_flag', 'i1', ('time',), fill_value=FILL_VALUE_INT)
     SSL_flag_var.long_name = 'quality flag for suspended sediment load'
     SSL_flag_var.standard_name = 'status_flag'
     SSL_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='i1')
