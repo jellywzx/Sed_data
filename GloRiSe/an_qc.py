@@ -16,7 +16,6 @@ import numpy as np
 import netCDF4 as nc4
 from pathlib import Path
 from datetime import datetime
-
 CURRENT_DIR = Path(__file__).resolve().parent
 SCRIPT_ROOT = CURRENT_DIR.parent
 if str(SCRIPT_ROOT) not in sys.path:
@@ -25,6 +24,7 @@ from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 from code.qc import apply_quality_flag
 from code.runtime import ensure_directory, resolve_output_root
 from code.units import calculate_ssc
+from code.time_utils import climatology_mid_datetime
 
 # 路径配置
 INPUT_DIR = resolve_output_root(start=__file__) / 'annually_climatology' / 'GloRiSe'
@@ -227,6 +227,49 @@ def process_one_file(input_path):
             time_vals = np.array([0.0])
             time_units = 'days since 1970-01-01 00:00:00'
             time_calendar = 'gregorian'
+    # Collapse annually_climatology to one representative climatology record.
+    # The source period is derived from the input time axis when available.
+    source_start_year = None
+    source_end_year = None
+
+    if time_dim_name == "time" and len(time_vals) > 0:
+        _dates = nc4.num2date(time_vals, units=time_units, calendar=time_calendar)
+        _years = [int(d.year) for d in _dates]
+        source_start_year = min(_years)
+        source_end_year = max(_years)
+    else:
+        source_start_year = None
+        source_end_year = None
+
+    output_time_units = "days since 1970-01-01 00:00:00"
+    output_time_calendar = "gregorian"
+
+    if source_start_year is not None and source_end_year is not None:
+        mid_date = climatology_mid_datetime(source_start_year, source_end_year)
+        time_vals_out = np.array(
+            [nc4.date2num(mid_date, units=output_time_units, calendar=output_time_calendar)],
+            dtype=np.float64,
+        )
+    else:
+        time_vals_out = np.array([0.0], dtype=np.float64)
+
+    def _mean_valid(arr):
+        arr = np.asarray(arr, dtype=np.float64).flatten()
+        fill = float(FILL_VALUE_FLOAT)
+        valid = np.isfinite(arr) & (arr != fill) & (arr != -9999.0)
+        if np.any(valid):
+            return np.float32(np.nanmean(arr[valid]))
+        return np.float32(fill)
+
+    Q = np.array([_mean_valid(Q)], dtype=np.float32)
+    SSC = np.array([_mean_valid(SSC)], dtype=np.float32)
+    SSL = np.array([_mean_valid(SSL)], dtype=np.float32)
+    q_flag, ssc_flag, ssl_flag = apply_qc_flags_only(Q, SSC, SSL)
+
+    dim_list = ["time"]
+    n = 1
+    time_units = output_time_units
+    time_calendar = output_time_calendar
 
         ds_out = nc4.Dataset(output_path, 'w', format='NETCDF4')
 
@@ -240,7 +283,12 @@ def process_one_file(input_path):
         t_var.units = time_units
         t_var.calendar = time_calendar
         t_var.axis = 'T'
-        t_var[:] = time_vals
+        t_var.long_name = "representative time of climatological mean"
+        t_var.comment = (
+            "Representative timestamp for climatological data. "
+            "It is set to July 1 of the middle year of the source period."
+        )
+        t_var[:] = time_vals_out
 
         lat_var = ds_out.createVariable('lat', 'f4')
         lat_var.standard_name = 'latitude'
@@ -349,11 +397,10 @@ def process_one_file(input_path):
         ds_out.creator_institution = DATA_SOURCE['creator_institution']
         ds_out.date_created = datetime.now().strftime('%Y-%m-%d')
         # Add temporal coverage derived from actual time data
-        if time_dim_name == 'time' and len(time_vals) > 0:
-            _dates = nc4.num2date(time_vals, units=time_units, calendar=time_calendar)
-            _years = [d.year for d in _dates]
-            ds_out.time_coverage_start = f"{min(_years)}-01-01"
-            ds_out.time_coverage_end   = f"{max(_years)}-12-31"
+        if source_start_year is not None and source_end_year is not None:
+            ds_out.time_coverage_start = f"{source_start_year}-01-01"
+            ds_out.time_coverage_end = f"{source_end_year}-12-31"
+            ds_out.temporal_span = f"{source_start_year}-{source_end_year}"
         ds_out.date_modified = datetime.now().strftime('%Y-%m-%d')
         ds_out.processing_level = 'Variable unified and QC (apply_quality_flag, calculate_ssc)'
         history_entry = (

@@ -611,7 +611,7 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
         clim_temporal_span, fallback_start=ssc_start_date, fallback_end=ssc_end_date
     )
 
-    clim_year = int(round((clim_start_year + clim_end_year) / 2.0))
+    clim_year = (clim_start_year + clim_end_year) // 2
     clim_date = datetime(clim_year, 7, 1)
     clim_time_vals = np.array(
         [nc.date2num(clim_date, units=OUTPUT_TIME_UNITS, calendar=OUTPUT_TIME_CALENDAR)],

@@ -42,6 +42,7 @@ from code.qc import (
 from code.runtime import ensure_directory, resolve_output_root
 from code.units import convert_ssl_units_if_needed
 from code.validation import require_existing_directory
+from code.time_utils import climatology_mid_datetime
 
 def standardize_netcdf_file(input_file, output_dir):
     """
@@ -125,6 +126,9 @@ def standardize_netcdf_file(input_file, output_dir):
 
     import re
 
+    output_time_units = "days since 1970-01-01 00:00:00"
+    output_time_calendar = "gregorian"
+    representative_time_val = time_val
     # --------------------------------------------------
     # Derive temporal coverage
     # Priority:
@@ -149,6 +153,12 @@ def standardize_netcdf_file(input_file, output_dir):
         temporal_span = f"{start_year}-{end_year}"
         ssl_start_date = time_coverage_start
         ssl_end_date = time_coverage_end
+        mid_date = climatology_mid_datetime(start_year, end_year)
+        representative_time_val = nc.date2num(
+            mid_date,
+            units=output_time_units,
+            calendar=output_time_calendar,
+        )    
 
     elif match_single:
         year = int(match_single.group(1))
@@ -157,6 +167,13 @@ def standardize_netcdf_file(input_file, output_dir):
         temporal_span = f"{year}"
         ssl_start_date = time_coverage_start
         ssl_end_date = time_coverage_end
+
+        mid_date = climatology_mid_datetime(year, year)
+        representative_time_val = nc.date2num(
+            mid_date,
+            units=output_time_units,
+            calendar=output_time_calendar,
+        )
 
     else:
         # Only fallback to time variable when period metadata is missing/unusable
@@ -200,10 +217,15 @@ def standardize_netcdf_file(input_file, output_dir):
         time_var = ds.createVariable('time', 'f8', ('time',))
         time_var.long_name = "time"
         time_var.standard_name = "time"
-        time_var.units = "days since 1970-01-01 00:00:00"
-        time_var.calendar = "gregorian"
+        time_var.units = output_time_units
+        time_var.calendar = output_time_calendar
         time_var.axis = "T"
-        time_var[:] = [time_val]
+        time_var.long_name = "representative time of climatological mean"
+        time_var.comment = (
+            "Representative timestamp for climatological data. "
+            "It is set to July 1 of the middle year of the source measurement period."
+        )
+        time_var[:] = [representative_time_val]
 
         # Latitude (scalar)
         lat_var = ds.createVariable('lat', 'f4')
@@ -398,7 +420,7 @@ def standardize_netcdf_file(input_file, output_dir):
         os.makedirs(diagnostic_dir, exist_ok=True)
         
         # For Vanmaercke data without Q and SSC, create placeholder arrays
-        time_array = np.array([time_val])
+        time_array = np.array([representative_time_val])
         Q = np.full_like(time_array, np.nan, dtype=float)  # All NaN (missing discharge)
         SSC = np.full_like(time_array, np.nan, dtype=float)  # All NaN (missing SSC)
         Q_flag_array = np.array([q_flag], dtype=np.int8)  # All 9 (missing)
