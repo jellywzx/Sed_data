@@ -2,7 +2,7 @@ import pandas as pd
 from pathlib import Path
 
 # === 设置路径 ===
-base_dir = Path(r"/mnt/d/sediment_data/Source/USGS/usgs_data_by_station")
+base_dir = Path(r"/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/USGS/usgs_data_by_station")
 output_file = base_dir.parent / "common_sites_info.csv"
 
 # === 查找所有站点文件夹 ===

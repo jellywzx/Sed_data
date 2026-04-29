@@ -112,6 +112,16 @@ def standardize_netcdf_file(input_file, output_dir):
             if hasattr(ds_in, "time_coverage_end")
             else ""
         )
+        source_temporal_coverage_status = (
+            str(ds_in.temporal_coverage_status).strip()
+            if hasattr(ds_in, "temporal_coverage_status")
+            else ""
+        )
+        source_representative_time_note = (
+            str(ds_in.representative_time_note).strip()
+            if hasattr(ds_in, "representative_time_note")
+            else ""
+        )
 
         # Get time units for metadata
         time_units = ds_in.variables['time'].units
@@ -146,20 +156,22 @@ def standardize_netcdf_file(input_file, output_dir):
     ssc_percent = 100.0 if ssc_flag == 0 else 0.0
     ssl_percent = 100.0 if ssl_flag == 0 else 0.0
 
-    # Derive representative climatology time from source period when available
+    # Derive representative climatology time from a real source period when available.
     start_year, end_year = parse_year_period(source_period)
+    has_observation_period = start_year is not None and end_year is not None
 
-    # Fallback: try time_coverage_start/end if source_period is missing
-    if start_year is None or end_year is None:
+    # Fallback: try time_coverage_start/end only when no explicit source period exists.
+    if not has_observation_period and not source_period:
         sy, _ = parse_year_period(source_time_coverage_start[:4])
         ey, _ = parse_year_period(source_time_coverage_end[:4])
         if sy is not None and ey is not None:
             start_year, end_year = sy, ey
+            has_observation_period = True
 
     output_time_units = "days since 1970-01-01 00:00:00"
     output_time_calendar = "gregorian"
 
-    if start_year is not None and end_year is not None:
+    if has_observation_period:
         mid_date = climatology_mid_datetime(start_year, end_year)
         representative_time_val = nc.date2num(
             mid_date,
@@ -170,14 +182,31 @@ def standardize_netcdf_file(input_file, output_dir):
         temporal_span = f"{start_year}-{end_year}"
         time_coverage_start = f"{start_year}-01-01"
         time_coverage_end = f"{end_year}-12-31"
+        time_coverage_comment = ""
+        temporal_coverage_status = "station-specific observation period available"
+        representative_time_note = (
+            "Time coordinate is July 1 of the middle year of the observation period."
+        )
     else:
         # Last-resort fallback only. This is not true source-period midpoint.
         dates = nc.num2date([time_val], units=time_units, calendar=time_calendar)
         representative_year = dates[0].year if len(dates) > 0 else 2000
         representative_time_val = time_val
-        temporal_span = "various (pre-2012)"
+        temporal_span = source_period or "various (pre-2012)"
         time_coverage_start = ""
         time_coverage_end = ""
+        time_coverage_comment = (
+            "Exact station-specific observation period unavailable; "
+            "time coordinate is representative only."
+        )
+        temporal_coverage_status = (
+            source_temporal_coverage_status
+            or "station-specific observation period unavailable"
+        )
+        representative_time_note = (
+            source_representative_time_note
+            or "1995-07-01 is a non-observational representative timestamp for climatological data"
+        )
         print(
             f"  WARNING: no station-specific source period found for {os.path.basename(input_file)}; "
             "kept original representative time."
@@ -199,7 +228,6 @@ def standardize_netcdf_file(input_file, output_dir):
         # Create coordinate variables
         # Time
         time_var = ds.createVariable('time', 'f8', ('time',))
-        time_var.long_name = "time"
         time_var.standard_name = "time"
         time_var.units = output_time_units
         time_var.calendar = output_time_calendar
@@ -208,7 +236,8 @@ def standardize_netcdf_file(input_file, output_dir):
         time_var.comment = (
             "Representative timestamp for climatological data. "
             "When station-specific source period is available, it is set to July 1 "
-            "of the middle year of that period."
+            "of the middle year of that period. Otherwise, it is a non-observational "
+            "representative timestamp."
         )
         time_var[:] = [representative_time_val]
 
@@ -354,9 +383,13 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.creator_institution = "Sun Yat-sen University, China"
 
         # Temporal coverage
-        ds.time_coverage_start = time_coverage_start or f"{representative_year}-01-01"
-        ds.time_coverage_end = time_coverage_end or f"{representative_year}-12-31"
+        ds.time_coverage_start = time_coverage_start
+        ds.time_coverage_end = time_coverage_end
+        if time_coverage_comment:
+            ds.time_coverage_comment = time_coverage_comment
         ds.temporal_span = temporal_span
+        ds.temporal_coverage_status = temporal_coverage_status
+        ds.representative_time_note = representative_time_note
         ds.temporal_resolution = "climatology"
 
         # Spatial coverage
@@ -422,14 +455,14 @@ def standardize_netcdf_file(input_file, output_dir):
         'Variables Provided': vars_provided_str,
         'Geographic Coverage': f"{country}, {continent}",
         'Reference/DOI': 'https://doi.org/10.1126/science.abn7980',
-        'Q_start_date': start_year if start_year is not None and not np.isnan(q_val) and q_val != -9999.0 else 'N/A',
-        'Q_end_date': end_year if end_year is not None and not np.isnan(q_val) and q_val != -9999.0 else 'N/A',
+        'Q_start_date': start_year if has_observation_period and not np.isnan(q_val) and q_val != -9999.0 else 'N/A',
+        'Q_end_date': end_year if has_observation_period and not np.isnan(q_val) and q_val != -9999.0 else 'N/A',
         'Q_percent_complete': q_percent if not np.isnan(q_val) and q_val != -9999.0 else 'N/A',
-        'SSC_start_date': start_year if start_year is not None and not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
-        'SSC_end_date': end_year if end_year is not None and not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
+        'SSC_start_date': start_year if has_observation_period and not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
+        'SSC_end_date': end_year if has_observation_period and not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
         'SSC_percent_complete': ssc_percent if not np.isnan(ssc_val) and ssc_val != -9999.0 else 'N/A',
-        'SSL_start_date': start_year if start_year is not None and not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
-        'SSL_end_date': end_year if end_year is not None and not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
+        'SSL_start_date': start_year if has_observation_period and not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
+        'SSL_end_date': end_year if has_observation_period and not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
         'SSL_percent_complete': ssl_percent if not np.isnan(tss_val) and tss_val != -9999.0 else 'N/A',
         "Q_flag": int(q_flag),
         "SSC_flag": int(ssc_flag),

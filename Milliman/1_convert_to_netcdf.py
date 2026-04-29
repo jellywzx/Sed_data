@@ -246,6 +246,9 @@ def convert_milliman_database(input_csv, output_dir):
             'ocean': row['Ocean'] if pd.notna(row['Ocean']) else 'N/A',
             'data_type': 'long-term average',
             'time_period': 'various (pre-2012)',
+            'temporal_span': 'various (pre-2012)',
+            'temporal_coverage_status': 'station-specific observation period unavailable',
+            'representative_time_note': '1995-07-01 is a non-observational representative timestamp for climatological data',
             'sediment_concentration_mg_L': row['SedConc'] if pd.notna(row['SedConc']) else 'N/A',
         }
 

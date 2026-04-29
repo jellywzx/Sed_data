@@ -227,49 +227,50 @@ def process_one_file(input_path):
             time_vals = np.array([0.0])
             time_units = 'days since 1970-01-01 00:00:00'
             time_calendar = 'gregorian'
-    # Collapse annually_climatology to one representative climatology record.
-    # The source period is derived from the input time axis when available.
-    source_start_year = None
-    source_end_year = None
 
-    if time_dim_name == "time" and len(time_vals) > 0:
-        _dates = nc4.num2date(time_vals, units=time_units, calendar=time_calendar)
-        _years = [int(d.year) for d in _dates]
-        source_start_year = min(_years)
-        source_end_year = max(_years)
-    else:
+        # Collapse annually_climatology to one representative climatology record.
+        # The source period is derived from the input time axis when available.
         source_start_year = None
         source_end_year = None
 
-    output_time_units = "days since 1970-01-01 00:00:00"
-    output_time_calendar = "gregorian"
+        if time_dim_name == "time" and len(time_vals) > 0:
+            _dates = nc4.num2date(time_vals, units=time_units, calendar=time_calendar)
+            _years = [int(d.year) for d in _dates]
+            source_start_year = min(_years)
+            source_end_year = max(_years)
+        else:
+            source_start_year = None
+            source_end_year = None
 
-    if source_start_year is not None and source_end_year is not None:
-        mid_date = climatology_mid_datetime(source_start_year, source_end_year)
-        time_vals_out = np.array(
-            [nc4.date2num(mid_date, units=output_time_units, calendar=output_time_calendar)],
-            dtype=np.float64,
-        )
-    else:
-        time_vals_out = np.array([0.0], dtype=np.float64)
+        output_time_units = "days since 1970-01-01 00:00:00"
+        output_time_calendar = "gregorian"
 
-    def _mean_valid(arr):
-        arr = np.asarray(arr, dtype=np.float64).flatten()
-        fill = float(FILL_VALUE_FLOAT)
-        valid = np.isfinite(arr) & (arr != fill) & (arr != -9999.0)
-        if np.any(valid):
-            return np.float32(np.nanmean(arr[valid]))
-        return np.float32(fill)
+        if source_start_year is not None and source_end_year is not None:
+            mid_date = climatology_mid_datetime(source_start_year, source_end_year)
+            time_vals_out = np.array(
+                [nc4.date2num(mid_date, units=output_time_units, calendar=output_time_calendar)],
+                dtype=np.float64,
+            )
+        else:
+            time_vals_out = np.array([0.0], dtype=np.float64)
 
-    Q = np.array([_mean_valid(Q)], dtype=np.float32)
-    SSC = np.array([_mean_valid(SSC)], dtype=np.float32)
-    SSL = np.array([_mean_valid(SSL)], dtype=np.float32)
-    q_flag, ssc_flag, ssl_flag = apply_qc_flags_only(Q, SSC, SSL)
+        def _mean_valid(arr):
+            arr = np.asarray(arr, dtype=np.float64).flatten()
+            fill = float(FILL_VALUE_FLOAT)
+            valid = np.isfinite(arr) & (arr != fill) & (arr != -9999.0)
+            if np.any(valid):
+                return np.float32(np.nanmean(arr[valid]))
+            return np.float32(fill)
 
-    dim_list = ["time"]
-    n = 1
-    time_units = output_time_units
-    time_calendar = output_time_calendar
+        Q = np.array([_mean_valid(Q)], dtype=np.float32)
+        SSC = np.array([_mean_valid(SSC)], dtype=np.float32)
+        SSL = np.array([_mean_valid(SSL)], dtype=np.float32)
+        q_flag, ssc_flag, ssl_flag = apply_qc_flags_only(Q, SSC, SSL)
+
+        dim_list = ["time"]
+        n = 1
+        time_units = output_time_units
+        time_calendar = output_time_calendar
 
         ds_out = nc4.Dataset(output_path, 'w', format='NETCDF4')
 

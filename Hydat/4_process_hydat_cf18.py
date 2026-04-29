@@ -704,7 +704,7 @@ def main():
     """主函数"""
     output_root = resolve_output_root(start=__file__, create=True)
     input_dir = output_root / "daily" / "HYDAT" / "sediment_update"
-    output_dir = output_root / "daily" / "HYDAT" / "output_update"
+    output_dir = output_root / "daily" / "HYDAT" / "qc"
 
     csv_file = output_dir / 'HYDAT_station_summary.csv'
 

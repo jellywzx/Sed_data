@@ -215,7 +215,6 @@ def standardize_netcdf_file(input_file, output_dir):
         # Create coordinate variables
         # Time
         time_var = ds.createVariable('time', 'f8', ('time',))
-        time_var.long_name = "time"
         time_var.standard_name = "time"
         time_var.units = output_time_units
         time_var.calendar = output_time_calendar

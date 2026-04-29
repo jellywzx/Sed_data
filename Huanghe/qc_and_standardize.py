@@ -34,6 +34,7 @@ if SCRIPT_ROOT not in sys.path:
 from code.qc import apply_quality_flag, compute_log_iqr_bounds
 from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
 from code.validation import require_existing_directory
+from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 
 
 OUTPUT_TIME_UNITS = "days since 1970-01-01 00:00:00"
@@ -545,10 +546,11 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
     ann_ssc_vals = np.array(ssc_vals, dtype=np.float32)
     ann_flag_vals = np.array(SSC_flag, dtype=np.int8)
 
-    # Climatology output: prefer long-term mean from source workbook.
-    clim_ssc_source = "fallback_annual_mean"
+    # Climatology output: use ONLY long-term mean from source workbook.
+    clim_ssc_source = "source_long_term_mean"
     clim_source_period = original_time_range
     clim_temporal_span = original_time_range
+
     clim_ssc_val_from_lookup, clim_source_period_lookup, matched_station = (
         resolve_climatology_from_lookup(
             climatology_lookup=climatology_lookup,
@@ -556,6 +558,7 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             station_name_chinese=station_name_chinese,
         )
     )
+
     if clim_ssc_val_from_lookup is not None:
         clim_ssc_vals = np.array([clim_ssc_val_from_lookup], dtype=np.float32)
         clim_flag_vals = np.array([0], dtype=np.int8)
@@ -567,46 +570,37 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             "bad": 0,
             "missing": 0,
         }
-        clim_ssc_source = "source_long_term_mean"
+
         if clim_source_period_lookup:
             clim_source_period = clim_source_period_lookup
+
         clim_temporal_span = canonical_time_span(
             clim_source_period, fallback=original_time_range
         )
-        print(
-            f"  Climatology source: source workbook long-term mean ({matched_station}, {clim_source_period})"
-        )
-    else:
-        valid_clim = (SSC_flag == 0) & np.isfinite(ssc_vals)
-        if np.any(valid_clim):
-            clim_ssc_vals = np.array([np.mean(ssc_vals[valid_clim])], dtype=np.float32)
-            clim_flag_vals = np.array([0], dtype=np.int8)
-            ssc_percent_complete_clim = 100.0
-            qc_counts_clim = {
-                "total": 1,
-                "good": 1,
-                "suspect": 0,
-                "bad": 0,
-                "missing": 0,
-            }
-            print(
-                "  Climatology source: fallback annual-sequence mean (source workbook value not found)."
-            )
-        else:
-            clim_ssc_vals = np.array([-9999.0], dtype=np.float32)
-            clim_flag_vals = np.array([9], dtype=np.int8)
-            ssc_percent_complete_clim = 0.0
-            qc_counts_clim = {
-                "total": 1,
-                "good": 0,
-                "suspect": 0,
-                "bad": 0,
-                "missing": 1,
-            }
-            print(
-                "  Climatology source: fallback missing (no source workbook value and no valid annual values)."
-            )
 
+        print(
+            f"  Climatology source: source workbook long-term mean "
+            f"({matched_station}, {clim_source_period})"
+        )
+
+    else:
+        clim_ssc_vals = np.array([-9999.0], dtype=np.float32)
+        clim_flag_vals = np.array([9], dtype=np.int8)
+        ssc_percent_complete_clim = 0.0
+        qc_counts_clim = {
+            "total": 1,
+            "good": 0,
+            "suspect": 0,
+            "bad": 0,
+            "missing": 1,
+        }
+        clim_ssc_source = "source_long_term_mean_missing"
+
+        print(
+            f"  Climatology source: missing "
+            f"(station not found in source workbook: {station_name_chinese}/{station_name})."
+        )
+    
     clim_start_year, clim_end_year = years_from_time_span(
         clim_temporal_span, fallback_start=ssc_start_date, fallback_end=ssc_end_date
     )
@@ -708,14 +702,14 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             + (
                 f"Value represents source long-term mean SSC from {clim_source_period}."
                 if clim_ssc_source == "source_long_term_mean"
-                else "Value represents the climatological annual mean derived from available annual means."
+                else "Value is missing because the station was not found in the source workbook."
             )
         ),
         global_comment=(
             (
                 f"Climatological annual mean SSC from source long-term mean period {clim_source_period}. "
                 if clim_ssc_source == "source_long_term_mean"
-                else f"Climatological annual mean SSC derived from annual mean observations over {clim_temporal_span}. "
+                else "Climatological annual mean SSC is missing because the station was not found in the source workbook. "
             )
             + "Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
             + "Note: Discharge and sediment load data are NOT available in the original dataset."
@@ -781,27 +775,25 @@ def generate_annual_metadata_text(station_name, river_name, original_time_range)
     )
     return title, summary, comment
 
-
 def generate_climatology_metadata_text(station_name, river_name, original_time_range):
     """Return climatology metadata text fields."""
     title = "Yellow River suspended sediment concentration (climatological annual mean)"
     summary = (
         f"Suspended sediment concentration data for {station_name} station on the {river_name} "
         f"in the Yellow River Basin, China. This file contains one climatological annual mean "
-        f"for the climatology period {clim_temporal_span}."
+        f"for the climatology period {original_time_range}."
     )
     ssc_comment = (
-        "Source: Original data provided by Yellow River Sediment Bulletin (2015-2019). "
+        "Source: Original data provided by Yellow River Sediment Bulletin. "
         "Unit conversion: Original unit kg/m³ × 1000 = mg/L. "
-        f"Value represents the climatological annual mean derived from available annual means over {original_time_range}."
+        f"Value represents source long-term mean SSC from {original_time_range} when available."
     )
     global_comment = (
-        f"Climatological annual mean SSC derived from annual mean observations over {clim_temporal_span}. "
+        f"Climatological annual mean SSC from source workbook over {original_time_range}. "
         f"Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
         f"Note: Discharge and sediment load data are NOT available in the original dataset."
     )
     return title, summary, ssc_comment, global_comment
-
 
 def get_scalar_value(ds, candidates):
     """Get scalar value from candidate variable names."""
@@ -877,31 +869,38 @@ def repair_one_annual_file_and_write_climatology(
         else:
             ds_ann.history = repair_line
 
-    clim_ssc_source = "fallback_annual_mean"
+    clim_ssc_source = "source_long_term_mean"
     clim_source_period = original_time_range
     clim_temporal_span = original_time_range
+
     clim_ssc_val_from_lookup, clim_source_period_lookup, _ = resolve_climatology_from_lookup(
         climatology_lookup=climatology_lookup,
         station_name=station_name,
         station_name_chinese=station_name_chinese,
     )
+
     if clim_ssc_val_from_lookup is not None:
         clim_ssc_vals = np.array([clim_ssc_val_from_lookup], dtype=np.float32)
         clim_flag_vals = np.array([0], dtype=np.int8)
         clim_ssc_source = "source_long_term_mean"
+
         if clim_source_period_lookup:
             clim_source_period = clim_source_period_lookup
+
         clim_temporal_span = canonical_time_span(
             clim_source_period, fallback=original_time_range
         )
+
     else:
-        valid_clim = (ssc_flag_vals == 0) & np.isfinite(ssc_vals)
-        if np.any(valid_clim):
-            clim_ssc_vals = np.array([np.mean(ssc_vals[valid_clim])], dtype=np.float32)
-            clim_flag_vals = np.array([0], dtype=np.int8)
-        else:
-            clim_ssc_vals = np.array([-9999.0], dtype=np.float32)
-            clim_flag_vals = np.array([9], dtype=np.int8)
+        clim_ssc_vals = np.array([-9999.0], dtype=np.float32)
+        clim_flag_vals = np.array([9], dtype=np.int8)
+        clim_ssc_source = "source_long_term_mean_missing"
+
+        print(
+            f"  Climatology source: missing "
+            f"(station not found in source workbook: {station_name_chinese}/{station_name})."
+        )
+
 
     clim_start_year, clim_end_year = years_from_time_span(
         clim_temporal_span, fallback_start=ssc_start_date, fallback_end=ssc_end_date
@@ -1043,7 +1042,7 @@ def run_standard_pipeline():
     )
 
     output_dir_all = ensure_directory(
-        resolve_output_root(start=__file__) / "annually_climatology"/"Huanghe"
+        resolve_output_root(start=__file__) / "annually_climatology"/"Huanghe"/"qc"
     )
     output_dir_ann = output_dir_all
     output_dir_clim = output_dir_all
