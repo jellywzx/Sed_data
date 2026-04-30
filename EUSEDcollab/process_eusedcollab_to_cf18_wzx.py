@@ -982,7 +982,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         # Temporal information
         start_date = df['date'].min()
         end_date = df['date'].max()
-        ds.temporal_resolution = 'daily'
+        ds.temporal_resolution = 'monthly'
         ds.temporal_span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         ds.time_coverage_start = start_date.strftime('%Y-%m-%d')
         ds.time_coverage_end = end_date.strftime('%Y-%m-%d')
