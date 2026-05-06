@@ -40,6 +40,50 @@ from code.units import convert_ssl_units_if_needed
 
 warnings.filterwarnings('ignore')
 
+SOURCE_TIME_ZONE = "Asia/Tokyo"
+SOURCE_TIME_ZONE_ABBREVIATION = "JST"
+SOURCE_UTC_OFFSET = "+09:00"
+SOURCE_TIME_BASIS = "Japan Standard Time (JST, UTC+09:00)"
+OUTPUT_TIME_ZONE = "UTC"
+OUTPUT_TIME_ZONE_ABBREVIATION = "UTC"
+OUTPUT_UTC_OFFSET = "+00:00"
+OUTPUT_TIME_BASIS = "Coordinated Universal Time (UTC)"
+
+
+def localize_source_time_to_utc_naive(source_time):
+    """
+    Interpret source timestamps as JST and return timezone-naive UTC timestamps.
+
+    The timezone is stripped after conversion because the rest of this script
+    expects timezone-naive pandas datetimes for resampling and NetCDF writing.
+    """
+    source_series = pd.Series(source_time)
+    return (
+        source_series
+        .dt.tz_localize(SOURCE_TIME_ZONE)
+        .dt.tz_convert(OUTPUT_TIME_ZONE)
+        .dt.tz_localize(None)
+    )
+
+
+def format_utc_iso(timestamp):
+    """Format a UTC timestamp as an explicit ISO-8601 string."""
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(OUTPUT_TIME_ZONE).tz_localize(None)
+    return f"{ts.strftime('%Y-%m-%dT%H:%M:%S')}Z"
+
+
+def format_jst_iso_from_utc(timestamp):
+    """Convert a UTC timestamp to the corresponding source JST ISO-8601 string."""
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(OUTPUT_TIME_ZONE)
+    else:
+        ts = ts.tz_convert(OUTPUT_TIME_ZONE)
+    ts = ts.tz_convert(SOURCE_TIME_ZONE)
+    return f"{ts.strftime('%Y-%m-%dT%H:%M:%S')}{SOURCE_UTC_OFFSET}"
+
 
 def read_doi00147_data(filepath):
     """
@@ -79,14 +123,17 @@ def read_doi00147_data(filepath):
         # Extract station name
         station_name = data.iloc[0, 2]  # Column 2 is station
         
-        # Create datetime from components
-        data['datetime'] = pd.to_datetime({
+        # Create datetime from source components. DOI00147 does not store a
+        # timezone field; source timestamps are interpreted as JST and converted
+        # to UTC before aggregation and NetCDF writing.
+        source_datetime_jst = pd.to_datetime({
             'year': data[3].astype(int),
             'month': data[4].astype(int),
             'day': data[5].astype(int),
             'hour': data[6].astype(int),
             'minute': data[7].astype(int)
         })
+        data['datetime'] = localize_source_time_to_utc_naive(source_datetime_jst)
         
         # Extract relevant columns
         df_clean = pd.DataFrame({
@@ -130,7 +177,7 @@ def read_doi00147_data(filepath):
 
 def aggregate_to_daily(df):
     """
-    Aggregate high-frequency data to daily averages.
+    Aggregate high-frequency UTC data to daily UTC averages.
     
     Parameters:
     -----------
@@ -447,7 +494,15 @@ def perform_qc_checks(daily_df):
 
 
 
-def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None):
+def create_netcdf_cf18(
+    filepath,
+    data,
+    station_name,
+    river_name,
+    source_id=None,
+    source_time_start_utc=None,
+    source_time_end_utc=None,
+):
     """
     Create CF-1.8 and ACDD-1.3 compliant NetCDF file with quality flags.
     
@@ -463,6 +518,8 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
         River name
     source_id : str
         Source identifier (e.g., 'DOI00147_Haramachi')
+    source_time_start_utc, source_time_end_utc : datetime-like
+        Original high-frequency source coverage after conversion to UTC.
     """
     # Get coordinates from first row (they're constant)
     lat = data['latitude'].iloc[0]
@@ -479,15 +536,21 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     time_var = dataset.createVariable('time', 'f8', ('time',))
     time_var.standard_name = 'time'
     time_var.long_name = 'time'
-    t0 = pd.to_datetime(data.index).min()
-    time_var.units = f"days since {t0.strftime('%Y-%m-%d')} 00:00:00"
+    dt_utc = pd.DatetimeIndex(pd.to_datetime(data.index))
+    ref_utc = dt_utc.min().floor("D")
+    time_var.units = f"days since {ref_utc.strftime('%Y-%m-%d %H:%M:%S')} {OUTPUT_UTC_OFFSET}"
     time_var.calendar = 'gregorian'
     time_var.axis = 'T'
+    time_var.time_zone = OUTPUT_TIME_ZONE
+    time_var.time_zone_abbreviation = OUTPUT_TIME_ZONE_ABBREVIATION
+    time_var.utc_offset = OUTPUT_UTC_OFFSET
+    time_var.comment = (
+        "Source timestamps are interpreted as Japan Standard Time "
+        "(JST, UTC+09:00), converted to UTC, and aggregated by UTC calendar day."
+    )
 
-    # Convert dates to days since epoch (use index only)
-    dt = pd.to_datetime(data.index)          # DatetimeIndex / array
-    ref = dt.min().floor("D")               # Timestamp (00:00:00)
-    time_var[:] = (dt.floor("D") - ref).days.astype(float)
+    # Convert UTC timestamps to elapsed days since the UTC reference.
+    time_var[:] = ((dt_utc - ref_utc).total_seconds() / 86400.0).astype(float)
     
     # Create scalar coordinate variables
     lat_var = dataset.createVariable('lat', 'f4')
@@ -582,15 +645,27 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     dataset.Conventions = 'CF-1.8, ACDD-1.3'
     dataset.title = 'Harmonized Global River Discharge and Sediment'
     
-    dt_index = pd.to_datetime(data.index)
-    time_start = dt_index.min().strftime('%Y-%m-%d')
-    time_end = dt_index.max().strftime('%Y-%m-%d')
+    dt_index = pd.DatetimeIndex(pd.to_datetime(data.index))
+    time_start = format_utc_iso(dt_index.min())
+    time_end = format_utc_iso(dt_index.max())
+    source_start_utc = pd.Timestamp(source_time_start_utc) if source_time_start_utc is not None else dt_index.min()
+    source_end_utc = pd.Timestamp(source_time_end_utc) if source_time_end_utc is not None else dt_index.max()
+    source_time_start = format_jst_iso_from_utc(source_start_utc)
+    source_time_end = format_jst_iso_from_utc(source_end_utc)
     
     
     dataset.summary = f'River discharge and suspended sediment data for {station_name} station on the {river_name} in Fukushima, Japan. This dataset contains daily averages of water discharge, suspended sediment concentration, and calculated sediment load over the period {time_start} to {time_end}. Data has been quality checked and flagged.'
     
     dataset.source = 'In-situ station data'
     dataset.data_source_name = 'Fukushima Niida River Dataset'
+    dataset.source_time_zone = SOURCE_TIME_ZONE
+    dataset.source_time_zone_abbreviation = SOURCE_TIME_ZONE_ABBREVIATION
+    dataset.source_utc_offset = SOURCE_UTC_OFFSET
+    dataset.source_time_basis = SOURCE_TIME_BASIS
+    dataset.time_conversion = (
+        "Source JST timestamps were converted to UTC before daily aggregation, "
+        "quality control, and NetCDF export."
+    )
 
     dataset.comment_auxiliary_variables = (
     "Station altitude and upstream drainage area are not included in the current "
@@ -618,6 +693,13 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     # Temporal attributes
     dataset.time_coverage_start = time_start
     dataset.time_coverage_end = time_end
+    dataset.source_time_coverage_start = source_time_start
+    dataset.source_time_coverage_end = source_time_end
+    dataset.source_time_coverage_start_utc = format_utc_iso(source_start_utc)
+    dataset.source_time_coverage_end_utc = format_utc_iso(source_end_utc)
+    dataset.time_zone = OUTPUT_TIME_ZONE
+    dataset.time_zone_abbreviation = OUTPUT_TIME_ZONE_ABBREVIATION
+    dataset.utc_offset = OUTPUT_UTC_OFFSET
     dataset.Temporal_Resolution = 'daily'
     dataset.Variables_Provided = 'Q, SSC, SSL'
     
@@ -634,8 +716,9 @@ def create_netcdf_cf18(filepath, data, station_name, river_name, source_id=None)
     dataset.contributor_role = 'Data processor and QC'
     
     # Data processing history
-    history_msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} - Enhanced with QC flags, CF-1.8 metadata, and standardized formatting by fukushima_qc_and_cf_enhancement.py; "
-    history_msg += f"Aggregated from high-frequency measurements to daily averages; "
+    history_msg = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} - Enhanced with QC flags, CF-1.8 metadata, and standardized formatting by fukushima_qc_and_cf_enhancement.py; "
+    history_msg += f"Interpreted source timestamps as {SOURCE_TIME_BASIS} and converted them to UTC; "
+    history_msg += f"Aggregated from high-frequency measurements to UTC daily averages; "
     history_msg += f"Applied physical constraint QC checks; "
     history_msg += f"Added quality flag variables (Q_flag, SSC_flag, SSL_flag)"
     dataset.history = history_msg
@@ -666,6 +749,8 @@ def process_fukushima_data():
     print("=" * 90)
     print("FUKUSHIMA NIIDA RIVER DATA - QC & CF-1.8 ENHANCEMENT")
     print("DOI: 10.34355/CRiED.U.Tsukuba.00147")
+    print(f"Source time zone: {SOURCE_TIME_BASIS}")
+    print(f"Output time zone: {OUTPUT_TIME_BASIS}")
     print("=" * 90)
     print()
     
@@ -690,7 +775,7 @@ def process_fukushima_data():
     for station_name, data in station_data.items():
         print(f"\n{station_name}:")
         print(f"  Total records: {len(data)}")
-        print(f"  Date range: {data['datetime'].min()} to {data['datetime'].max()}")
+        print(f"  Date range (UTC): {data['datetime'].min()} to {data['datetime'].max()}")
         print(f"  Valid discharge: {(~data['discharge'].isna()).sum()}")
         print(f"  Valid SSC: {(~data['ssc'].isna()).sum()}")
         
@@ -768,7 +853,15 @@ def process_fukushima_data():
         output_file = os.path.join(output_dir, f"Fukushima_{safe_name}.nc")
         
         try:
-            create_netcdf_cf18(output_file, qc_data, station_name, 'Niida River', source_id)
+            create_netcdf_cf18(
+                output_file,
+                qc_data,
+                station_name,
+                'Niida River',
+                source_id,
+                source_time_start_utc=data['datetime'].min(),
+                source_time_end_utc=data['datetime'].max(),
+            )
 
         # -----------------------------------------------
         # CF-1.8 / ACDD-1.3 completeness check
@@ -834,6 +927,12 @@ def process_fukushima_data():
                 'Type': 'In-situ',
                 'Temporal Resolution': 'daily',
                 'Temporal Span': f"{data['datetime'].min().strftime('%Y-%m-%d')} to {data['datetime'].max().strftime('%Y-%m-%d')}",
+                'Time Zone': OUTPUT_TIME_BASIS,
+                'Time Zone Database Name': OUTPUT_TIME_ZONE,
+                'UTC Offset': OUTPUT_UTC_OFFSET,
+                'Source Time Zone': SOURCE_TIME_BASIS,
+                'Source Time Zone Database Name': SOURCE_TIME_ZONE,
+                'Source UTC Offset': SOURCE_UTC_OFFSET,
                 'Variables Provided': 'Q, SSC, SSL',
                 'Geographic Coverage': 'Niida River Basin, Fukushima, Japan',
                 'Reference/DOI': 'https://doi.org/10.34355/CRiED.U.Tsukuba.00147',
