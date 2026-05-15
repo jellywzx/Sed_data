@@ -23,6 +23,7 @@ flowline geometry is only used to derive a representative reach coordinate.
 """
 
 import re
+import json
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
@@ -69,7 +70,7 @@ RIVERSED_METADATA_FIELD_MAP = {
     "REACHCO": "reach_code",
     "VPUID": "vpu_id",
     "RPUID": "rpu_id",
-    "TtDASKM": "upstream_area",
+    "TtDASKM": "source_nhdplus_upstream_area",
 }
 RIVERSED_FLOWLINE_FIELD_MAP = {
     "ID": "ID",
@@ -394,6 +395,79 @@ def _derive_representative_point(geometry):
         return None
 
 
+def _iter_line_geometries(geometry):
+    if geometry is None or geometry.is_empty:
+        return []
+    geom_type = getattr(geometry, "geom_type", "")
+    if geom_type == "LineString":
+        return [geometry]
+    if geom_type == "MultiLineString":
+        return list(geometry.geoms)
+    if hasattr(geometry, "geoms"):
+        lines = []
+        for part in geometry.geoms:
+            lines.extend(_iter_line_geometries(part))
+        return lines
+    return []
+
+
+def _extract_flowline_endpoint_candidates(geometry):
+    candidates = []
+    seen = set()
+    for line in _iter_line_geometries(geometry):
+        coords = list(line.coords)
+        if not coords:
+            continue
+        for endpoint_index, (lon, lat, *_) in enumerate((coords[0], coords[-1]), start=1):
+            lat = float(lat)
+            lon = float(lon)
+            if not _coordinates_within_conus(lat, lon):
+                continue
+            key = (round(lat, 12), round(lon, 12))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "part_endpoint": endpoint_index,
+                }
+            )
+    return candidates
+
+
+def _safe_float_or_nan(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _endpoint_value(endpoint_candidates, index, key):
+    try:
+        return _safe_float_or_nan(endpoint_candidates[index].get(key))
+    except (IndexError, AttributeError, TypeError):
+        return np.nan
+
+
+def _write_scalar_float_var(ds, name, value, long_name, units=None):
+    var = ds.createVariable(name, 'f4', fill_value=FILL_VALUE_FLOAT)
+    var.long_name = long_name
+    if units:
+        var.units = units
+    var[:] = value if np.isfinite(value) else FILL_VALUE_FLOAT
+    return var
+
+
+def _write_scalar_text_var(ds, name, value, long_name):
+    var = ds.createVariable(name, str)
+    var.long_name = long_name
+    var.assignValue(str(value or ""))
+    return var
+
+
 def load_riversed_flowline_reference(shp_path):
     """Load RiverSed flowlines and compute representative reach coordinates."""
     print(f"Loading RiverSed flowline geometry from {shp_path}...")
@@ -455,6 +529,25 @@ def load_riversed_flowline_reference(shp_path):
 
     flowline_gdf["long"] = representative_points.x.astype(float)
     flowline_gdf["lat"] = representative_points.y.astype(float)
+    flowline_gdf["reach_midpoint_lon"] = flowline_gdf["long"]
+    flowline_gdf["reach_midpoint_lat"] = flowline_gdf["lat"]
+
+    endpoint_candidates = flowline_gdf.geometry.apply(_extract_flowline_endpoint_candidates)
+    flowline_gdf["reach_endpoint_candidates_json"] = endpoint_candidates.map(
+        lambda candidates: json.dumps(candidates, ensure_ascii=True, separators=(",", ":"))
+    )
+    flowline_gdf["reach_endpoint_1_lat"] = endpoint_candidates.map(
+        lambda candidates: _endpoint_value(candidates, 0, "latitude")
+    )
+    flowline_gdf["reach_endpoint_1_lon"] = endpoint_candidates.map(
+        lambda candidates: _endpoint_value(candidates, 0, "longitude")
+    )
+    flowline_gdf["reach_endpoint_2_lat"] = endpoint_candidates.map(
+        lambda candidates: _endpoint_value(candidates, 1, "latitude")
+    )
+    flowline_gdf["reach_endpoint_2_lon"] = endpoint_candidates.map(
+        lambda candidates: _endpoint_value(candidates, 1, "longitude")
+    )
 
     invalid_coordinate_mask = ~flowline_gdf.apply(
         lambda row: _coordinates_within_conus(row["lat"], row["long"]),
@@ -469,7 +562,20 @@ def load_riversed_flowline_reference(shp_path):
             "  Warning: {0} flowlines produced out-of-range coordinates and will "
             "remain unfilled. Sample IDs: {1}".format(invalid_count, invalid_sample)
         )
-        flowline_gdf.loc[invalid_coordinate_mask, ["lat", "long"]] = np.nan
+        flowline_gdf.loc[
+            invalid_coordinate_mask,
+            [
+                "lat",
+                "long",
+                "reach_midpoint_lat",
+                "reach_midpoint_lon",
+                "reach_endpoint_1_lat",
+                "reach_endpoint_1_lon",
+                "reach_endpoint_2_lat",
+                "reach_endpoint_2_lon",
+            ],
+        ] = np.nan
+        flowline_gdf.loc[invalid_coordinate_mask, "reach_endpoint_candidates_json"] = "[]"
 
     valid_coordinate_count = int(flowline_gdf["lat"].notna().sum())
     if valid_coordinate_count == 0:
@@ -481,6 +587,8 @@ def load_riversed_flowline_reference(shp_path):
     flowline_gdf["coordinate_source"] = os.path.basename(shp_path)
     flowline_gdf["coordinate_method"] = "flowline_midpoint_by_id"
     flowline_gdf["coordinate_confidence"] = "high"
+    flowline_gdf["reach_coordinate_method"] = "flowline_midpoint"
+    flowline_gdf["reach_geometry_source"] = os.path.basename(shp_path)
 
     print(
         "  Loaded {0} flowlines with representative coordinates for {1} IDs".format(
@@ -565,8 +673,8 @@ def load_riversed_station_metadata(
             "RiverSed metadata DBF contains duplicate IDs: {0}".format(dup_sample)
         )
 
-    metadata_df["upstream_area"] = pd.to_numeric(
-        metadata_df["upstream_area"], errors="coerce"
+    metadata_df["source_nhdplus_upstream_area"] = pd.to_numeric(
+        metadata_df["source_nhdplus_upstream_area"], errors="coerce"
     )
 
     flowline_df = load_riversed_flowline_reference(flowline_path)
@@ -574,6 +682,15 @@ def load_riversed_station_metadata(
         "ID",
         "lat",
         "long",
+        "reach_midpoint_lat",
+        "reach_midpoint_lon",
+        "reach_endpoint_1_lat",
+        "reach_endpoint_1_lon",
+        "reach_endpoint_2_lat",
+        "reach_endpoint_2_lon",
+        "reach_endpoint_candidates_json",
+        "reach_coordinate_method",
+        "reach_geometry_source",
         "coordinate_source",
         "coordinate_method",
         "coordinate_confidence",
@@ -725,9 +842,18 @@ def load_riversed_data(
         'reach_code',
         'vpu_id',
         'rpu_id',
-        'upstream_area',
+        'source_nhdplus_upstream_area',
         'lat',
         'long',
+        'reach_midpoint_lat',
+        'reach_midpoint_lon',
+        'reach_endpoint_1_lat',
+        'reach_endpoint_1_lon',
+        'reach_endpoint_2_lat',
+        'reach_endpoint_2_lon',
+        'reach_endpoint_candidates_json',
+        'reach_coordinate_method',
+        'reach_geometry_source',
         'coordinate_source',
         'coordinate_method',
         'coordinate_confidence',
@@ -937,7 +1063,25 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
     latitude = _first_valid_numeric(tss_df, "lat")
     longitude = _first_valid_numeric(tss_df, "long")
     altitude = _first_valid_numeric(tss_df, "elevation")
-    upstream_area = _first_valid_numeric(tss_df, "upstream_area")
+    source_nhdplus_upstream_area = _first_valid_numeric(tss_df, "source_nhdplus_upstream_area")
+    reach_midpoint_lat = _first_valid_numeric(tss_df, "reach_midpoint_lat")
+    reach_midpoint_lon = _first_valid_numeric(tss_df, "reach_midpoint_lon")
+    reach_endpoint_1_lat = _first_valid_numeric(tss_df, "reach_endpoint_1_lat")
+    reach_endpoint_1_lon = _first_valid_numeric(tss_df, "reach_endpoint_1_lon")
+    reach_endpoint_2_lat = _first_valid_numeric(tss_df, "reach_endpoint_2_lat")
+    reach_endpoint_2_lon = _first_valid_numeric(tss_df, "reach_endpoint_2_lon")
+    reach_endpoint_candidates_json = _first_nonempty_text(tss_df, "reach_endpoint_candidates_json")
+    reach_coordinate_method = _first_nonempty_text(tss_df, "reach_coordinate_method")
+    reach_geometry_source = _first_nonempty_text(tss_df, "reach_geometry_source")
+
+    if not np.isfinite(reach_midpoint_lat):
+        reach_midpoint_lat = latitude
+    if not np.isfinite(reach_midpoint_lon):
+        reach_midpoint_lon = longitude
+    if not reach_coordinate_method:
+        reach_coordinate_method = "flowline_midpoint"
+    if not reach_geometry_source:
+        reach_geometry_source = _first_nonempty_text(tss_df, "coordinate_source")
 
     river_name = _first_nonempty_text(tss_df, "river_name")
     comid = _first_nonempty_text(tss_df, "comid")
@@ -1013,12 +1157,76 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         alt_var.units = 'm'
         alt_var[:] = altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT
 
-        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
-        area_var.long_name = 'upstream drainage area'
+        _write_scalar_float_var(
+            ds,
+            'reach_midpoint_lat',
+            reach_midpoint_lat,
+            'RiverSed flowline midpoint latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_midpoint_lon',
+            reach_midpoint_lon,
+            'RiverSed flowline midpoint longitude',
+            'degrees_east',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_1_lat',
+            reach_endpoint_1_lat,
+            'RiverSed flowline endpoint candidate 1 latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_1_lon',
+            reach_endpoint_1_lon,
+            'RiverSed flowline endpoint candidate 1 longitude',
+            'degrees_east',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_2_lat',
+            reach_endpoint_2_lat,
+            'RiverSed flowline endpoint candidate 2 latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_2_lon',
+            reach_endpoint_2_lon,
+            'RiverSed flowline endpoint candidate 2 longitude',
+            'degrees_east',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_endpoint_candidates_json',
+            reach_endpoint_candidates_json,
+            'JSON list of RiverSed reach endpoint candidates',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_coordinate_method',
+            reach_coordinate_method,
+            'method used to derive the representative reach coordinate',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_geometry_source',
+            reach_geometry_source,
+            'source geometry used to derive reach coordinate hints',
+        )
+
+        area_var = ds.createVariable('source_nhdplus_upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
+        area_var.long_name = 'source NHDPlus-derived upstream drainage area'
         area_var.units = 'km2'
-        if np.isfinite(upstream_area):
-            area_var.comment = 'Upstream drainage area from modified NHDPlusV2 metadata joined by RiverSed reach ID'
-            area_var[:] = upstream_area
+        if np.isfinite(source_nhdplus_upstream_area):
+            area_var.comment = (
+                'Source upstream drainage area from modified NHDPlusV2 metadata '
+                'joined by RiverSed reach ID; not used as basin-tracer reported_area.'
+            )
+            area_var[:] = source_nhdplus_upstream_area
         else:
             area_var.comment = 'Not available for satellite-derived data'
             area_var[:] = FILL_VALUE_FLOAT
@@ -1178,7 +1386,20 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         "longitude": float(longitude) if not np.isnan(longitude) else np.nan,
         "latitude": float(latitude) if not np.isnan(latitude) else np.nan,
         "altitude": float(altitude) if not np.isnan(altitude) else np.nan,
-        "upstream_area": float(upstream_area) if np.isfinite(upstream_area) else np.nan,
+        "source_nhdplus_upstream_area_km2": (
+            float(source_nhdplus_upstream_area)
+            if np.isfinite(source_nhdplus_upstream_area)
+            else np.nan
+        ),
+        "reach_midpoint_lat": float(reach_midpoint_lat) if np.isfinite(reach_midpoint_lat) else np.nan,
+        "reach_midpoint_lon": float(reach_midpoint_lon) if np.isfinite(reach_midpoint_lon) else np.nan,
+        "reach_endpoint_1_lat": float(reach_endpoint_1_lat) if np.isfinite(reach_endpoint_1_lat) else np.nan,
+        "reach_endpoint_1_lon": float(reach_endpoint_1_lon) if np.isfinite(reach_endpoint_1_lon) else np.nan,
+        "reach_endpoint_2_lat": float(reach_endpoint_2_lat) if np.isfinite(reach_endpoint_2_lat) else np.nan,
+        "reach_endpoint_2_lon": float(reach_endpoint_2_lon) if np.isfinite(reach_endpoint_2_lon) else np.nan,
+        "reach_endpoint_candidates_json": reach_endpoint_candidates_json,
+        "reach_coordinate_method": reach_coordinate_method,
+        "reach_geometry_source": reach_geometry_source,
         "Data Source Name": "RiverSed / Aquasat (satellite-derived TSS)",
         "Type": "Satellite",
         "Temporal Resolution": "daily",

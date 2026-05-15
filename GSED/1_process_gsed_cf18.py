@@ -15,6 +15,7 @@ Date: 2025-10-26
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
+import json
 from datetime import datetime
 from pathlib import Path
 import struct
@@ -50,38 +51,6 @@ FLAG_SUSPECT = 2    # Suspect data (e.g., extreme values)
 FLAG_BAD = 3        # Bad data (e.g., negative values)
 FLAG_MISSING = 9    # Missing in source
 
-GSED_AREA_LOOKUP_FILENAMES = (
-    'GSED_Reach_upstream_area.csv',
-    'GSED_Reach_upstream_area.tsv',
-    'GSED_Reach_upstream_area.txt',
-    'GSED_Reach_upstream_area.xlsx',
-    'GSED_Reach_upstream_area.xls',
-)
-GSED_AREA_ID_COLUMNS = (
-    'R_ID',
-    'r_id',
-    'RID',
-    'reach_id',
-    'reach_code',
-    'station_id',
-    'Source_ID',
-)
-GSED_AREA_VALUE_COLUMNS = (
-    'upstream_area_km2',
-    'upstream_area',
-    'drainage_area_km2',
-    'drainage_area',
-    'basin_area',
-    'catchment_area',
-    'uparea_km2',
-    'uparea',
-)
-GSED_AREA_ACCEPT_COLUMNS = (
-    'merit_lookup_accept',
-    'lookup_accept',
-    'accept',
-)
-
 def process_one_reach(task):
     idx, total, r_id, ssc_data, r_id_str, reach_meta, time_array, output_dir = task
 
@@ -94,6 +63,11 @@ def process_one_reach(task):
         reach_meta.setdefault('reach_length_m', None)
         reach_meta.setdefault('latitude', None)
         reach_meta.setdefault('longitude', None)
+        reach_meta.setdefault('midpoint_latitude', reach_meta.get('latitude'))
+        reach_meta.setdefault('midpoint_longitude', reach_meta.get('longitude'))
+        reach_meta.setdefault('endpoint_candidates', [])
+        reach_meta.setdefault('coordinate_method', 'reach_midpoint')
+        reach_meta.setdefault('geometry_source', '')
 
         if pd.isna(reach_meta.get('latitude')) or pd.isna(reach_meta.get('longitude')):
             print(f"  Warning: Could not extract coordinates for R_ID {r_id}")
@@ -266,12 +240,14 @@ def _extract_polyline_parts(record_content):
     return parts
 
 
-def _extract_polyline_midpoint(record_content):
-    """Extract the 50%-along-line midpoint from a polyline shapefile record."""
+def _extract_polyline_representatives(record_content):
+    """Extract the 50%-along-line midpoint and unique part endpoints."""
     parts = _extract_polyline_parts(record_content)
     if not parts:
-        return None, None
+        return None, None, []
 
+    endpoint_candidates = []
+    seen_endpoints = set()
     fallback_point = None
     total_length = 0.0
     for part_points in parts:
@@ -279,15 +255,27 @@ def _extract_polyline_midpoint(record_content):
             continue
         if fallback_point is None:
             fallback_point = part_points[0]
+        for endpoint_index, (lon, lat) in enumerate((part_points[0], part_points[-1]), start=1):
+            key = (round(float(lat), 12), round(float(lon), 12))
+            if key in seen_endpoints:
+                continue
+            seen_endpoints.add(key)
+            endpoint_candidates.append(
+                {
+                    'latitude': float(lat),
+                    'longitude': float(lon),
+                    'part_endpoint': endpoint_index,
+                }
+            )
         for (lon0, lat0), (lon1, lat1) in zip(part_points[:-1], part_points[1:]):
             total_length += float(np.hypot(lon1 - lon0, lat1 - lat0))
 
     if fallback_point is None:
-        return None, None
+        return None, None, endpoint_candidates
 
     if total_length <= 0.0:
         fallback_lon, fallback_lat = fallback_point
-        return float(fallback_lat), float(fallback_lon)
+        return float(fallback_lat), float(fallback_lon), endpoint_candidates
 
     midpoint_distance = total_length / 2.0
     traversed = 0.0
@@ -307,11 +295,17 @@ def _extract_polyline_midpoint(record_content):
                 ratio = (midpoint_distance - traversed) / segment_length
                 midpoint_lon = lon0 + ratio * (lon1 - lon0)
                 midpoint_lat = lat0 + ratio * (lat1 - lat0)
-                return float(midpoint_lat), float(midpoint_lon)
+                return float(midpoint_lat), float(midpoint_lon), endpoint_candidates
             traversed = next_traversed
 
     last_lon, last_lat = last_point
-    return float(last_lat), float(last_lon)
+    return float(last_lat), float(last_lon), endpoint_candidates
+
+
+def _extract_polyline_midpoint(record_content):
+    """Extract the 50%-along-line midpoint from a polyline shapefile record."""
+    midpoint_lat, midpoint_lon, _ = _extract_polyline_representatives(record_content)
+    return midpoint_lat, midpoint_lon
 
 
 def load_gsed_reach_metadata(shapefile_path, target_rids=None):
@@ -352,7 +346,7 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
                 if target_rids and r_id_str not in target_rids:
                     continue
 
-                lat, lon = _extract_polyline_midpoint(content)
+                lat, lon, endpoint_candidates = _extract_polyline_representatives(content)
                 basin_info = _derive_basin_info_from_rid(r_id_str)
                 metadata[r_id_str] = {
                     'r_id_str': r_id_str,
@@ -362,6 +356,9 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
                     'longitude': lon,
                     'midpoint_latitude': lat,
                     'midpoint_longitude': lon,
+                    'endpoint_candidates': endpoint_candidates,
+                    'coordinate_method': 'reach_midpoint',
+                    'geometry_source': shapefile_path.name,
                     **basin_info,
                 }
 
@@ -370,131 +367,6 @@ def load_gsed_reach_metadata(shapefile_path, target_rids=None):
         print(f"Error loading GSED reach metadata from {shapefile_path}: {e}")
         return metadata
 
-
-def find_gsed_area_lookup_file(source_dir):
-    """
-    Locate an optional external lookup table that maps R_ID to upstream area.
-
-    Search order:
-    1. Environment variable GSED_UPSTREAM_AREA_FILE
-    2. Standard filenames in the nested GSED source folder
-    3. Standard filenames in the parent GSED source folder
-    """
-    env_path = os.environ.get('GSED_UPSTREAM_AREA_FILE')
-    if env_path:
-        candidate = Path(env_path).expanduser()
-        if candidate.exists():
-            return candidate
-        print(f"Warning: GSED_UPSTREAM_AREA_FILE not found: {candidate}")
-
-    search_roots = [Path(source_dir), Path(source_dir).parent]
-    for root in search_roots:
-        for filename in GSED_AREA_LOOKUP_FILENAMES:
-            candidate = root / filename
-            if candidate.exists():
-                return candidate
-
-    return None
-
-
-def _read_gsed_area_table(file_path):
-    """Read a CSV/TSV/TXT/Excel lookup table with pandas."""
-    file_path = Path(file_path)
-    suffix = file_path.suffix.lower()
-
-    if suffix == '.csv':
-        return pd.read_csv(file_path)
-    if suffix == '.tsv':
-        return pd.read_csv(file_path, sep='\t')
-    if suffix == '.txt':
-        return pd.read_csv(file_path, sep=None, engine='python')
-    if suffix in {'.xlsx', '.xls'}:
-        return pd.read_excel(file_path)
-
-    raise ValueError(f"Unsupported lookup table format: {file_path}")
-
-
-def load_gsed_area_lookup(file_path, target_rids=None):
-    """
-    Load an external R_ID -> upstream_area_km2 table.
-
-    The table is expected to provide at least one ID column and one area
-    column. Area values are interpreted as km2 because downstream basin
-    scripts expect reported_area in square kilometres.
-    """
-    df = _read_gsed_area_table(file_path)
-    if df.empty:
-        raise ValueError(f"Area lookup table is empty: {file_path}")
-
-    id_col = next((col for col in GSED_AREA_ID_COLUMNS if col in df.columns), None)
-    if id_col is None:
-        raise ValueError(
-            f"Area lookup table {file_path} is missing an R_ID column. "
-            f"Supported names: {', '.join(GSED_AREA_ID_COLUMNS)}"
-        )
-
-    area_col = next((col for col in GSED_AREA_VALUE_COLUMNS if col in df.columns), None)
-    if area_col is None:
-        raise ValueError(
-            f"Area lookup table {file_path} is missing an upstream area column. "
-            f"Supported names: {', '.join(GSED_AREA_VALUE_COLUMNS)}"
-        )
-
-    area_df = df[[id_col, area_col]].copy()
-    accept_col = next((col for col in GSED_AREA_ACCEPT_COLUMNS if col in df.columns), None)
-    if accept_col is not None:
-        accept_mask = (
-            df[accept_col]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .isin({'1', 'true', 'yes', 'y', 't'})
-        )
-        area_df = area_df.loc[accept_mask].copy()
-    area_df['r_id_str'] = area_df[id_col].map(_normalize_gsed_rid)
-    area_df['upstream_area_km2'] = pd.to_numeric(area_df[area_col], errors='coerce')
-    area_df = area_df.dropna(subset=['r_id_str', 'upstream_area_km2'])
-
-    if target_rids is not None:
-        area_df = area_df[area_df['r_id_str'].isin(target_rids)]
-
-    duplicate_count = int(area_df['r_id_str'].duplicated(keep='first').sum())
-    if duplicate_count:
-        print(
-            f"Warning: {duplicate_count} duplicate R_ID rows found in "
-            f"{file_path.name}; keeping the first non-missing value."
-        )
-        area_df = area_df.drop_duplicates(subset=['r_id_str'], keep='first')
-
-    return {
-        row['r_id_str']: {
-            'upstream_area_km2': float(row['upstream_area_km2']),
-            'upstream_area_source': str(Path(file_path).name),
-        }
-        for _, row in area_df.iterrows()
-    }
-
-
-def merge_gsed_area_lookup(reach_metadata, area_lookup, target_rids=None):
-    """
-    Merge an external upstream-area lookup into the reach metadata mapping.
-    """
-    target_rids = set(target_rids) if target_rids is not None else None
-    attached_count = 0
-
-    for r_id_str, area_meta in area_lookup.items():
-        if target_rids is not None and r_id_str not in target_rids:
-            continue
-
-        reach_meta = reach_metadata.setdefault(r_id_str, _derive_basin_info_from_rid(r_id_str))
-        reach_meta.setdefault('r_level', None)
-        reach_meta.setdefault('reach_length_m', None)
-        reach_meta.setdefault('latitude', None)
-        reach_meta.setdefault('longitude', None)
-        reach_meta.update(area_meta)
-        attached_count += 1
-
-    return attached_count
 
 def create_time_array(start_year=1985, start_month=1, n_months=432):
     """
@@ -631,6 +503,39 @@ def find_data_period(ssc_data, flags):
 
     return start_idx, end_idx
 
+
+def _safe_float_or_nan(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _endpoint_coordinate(endpoint_candidates, index, key):
+    try:
+        value = endpoint_candidates[index].get(key)
+    except (IndexError, AttributeError, TypeError):
+        return np.nan
+    return _safe_float_or_nan(value)
+
+
+def _write_scalar_float_var(ds, name, value, long_name, units=None):
+    var = ds.createVariable(name, 'f4', fill_value=FILL_VALUE_FLOAT)
+    var.long_name = long_name
+    if units:
+        var.units = units
+    var[:] = value if np.isfinite(value) else FILL_VALUE_FLOAT
+    return var
+
+
+def _write_scalar_text_var(ds, name, value, long_name):
+    var = ds.createVariable(name, str)
+    var.long_name = long_name
+    var.assignValue(str(value or ""))
+    return var
+
+
 def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
     """
     Create CF-1.8 compliant netCDF file for a single station
@@ -647,14 +552,30 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
     """
     lat = reach_meta.get('latitude')
     lon = reach_meta.get('longitude')
+    midpoint_lat = _safe_float_or_nan(reach_meta.get('midpoint_latitude', lat))
+    midpoint_lon = _safe_float_or_nan(reach_meta.get('midpoint_longitude', lon))
+    if np.isfinite(midpoint_lat):
+        lat = midpoint_lat
+    if np.isfinite(midpoint_lon):
+        lon = midpoint_lon
+    endpoint_candidates = reach_meta.get('endpoint_candidates') or []
+    endpoint_candidates_json = json.dumps(
+        endpoint_candidates,
+        ensure_ascii=True,
+        separators=(',', ':'),
+    )
+    endpoint_1_lat = _endpoint_coordinate(endpoint_candidates, 0, 'latitude')
+    endpoint_1_lon = _endpoint_coordinate(endpoint_candidates, 0, 'longitude')
+    endpoint_2_lat = _endpoint_coordinate(endpoint_candidates, 1, 'latitude')
+    endpoint_2_lon = _endpoint_coordinate(endpoint_candidates, 1, 'longitude')
+    coordinate_method = reach_meta.get('coordinate_method') or 'reach_midpoint'
+    geometry_source = reach_meta.get('geometry_source') or 'GSED_Reach.shp'
     length = reach_meta.get('reach_length_m')
     reach_level = reach_meta.get('r_level')
     basin_code_l1 = reach_meta.get('basin_code_l1')
     basin_code_l2 = reach_meta.get('basin_code_l2')
     basin_code_l3 = reach_meta.get('basin_code_l3')
     basin_code_l4 = reach_meta.get('basin_code_l4')
-    upstream_area_km2 = reach_meta.get('upstream_area_km2')
-    upstream_area_source = reach_meta.get('upstream_area_source')
 
     # Apply QC and get flags
     ssc_qc, flags, qc_stats = apply_gsed_qc_with_tool(ssc_data)
@@ -733,14 +654,76 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
         lon_var.valid_range = np.array([-180.0, 180.0], dtype='f4')
         lon_var[:] = lon if lon is not None else np.nan
 
-        # Optional drainage area metadata. scripts_basin_test reads this field
-        # as reported_area when it exists.
-        if upstream_area_km2 is not None and pd.notna(upstream_area_km2):
-            area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
-            area_var.long_name = 'upstream drainage area'
-            area_var.units = 'km2'
-            area_var.comment = 'Upstream drainage area used as reported_area by scripts_basin_test.'
-            area_var[:] = float(upstream_area_km2)
+        _write_scalar_float_var(
+            ds,
+            'reach_midpoint_lat',
+            midpoint_lat,
+            'GSED reach midpoint latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_midpoint_lon',
+            midpoint_lon,
+            'GSED reach midpoint longitude',
+            'degrees_east',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_1_lat',
+            endpoint_1_lat,
+            'GSED reach endpoint candidate 1 latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_1_lon',
+            endpoint_1_lon,
+            'GSED reach endpoint candidate 1 longitude',
+            'degrees_east',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_2_lat',
+            endpoint_2_lat,
+            'GSED reach endpoint candidate 2 latitude',
+            'degrees_north',
+        )
+        _write_scalar_float_var(
+            ds,
+            'reach_endpoint_2_lon',
+            endpoint_2_lon,
+            'GSED reach endpoint candidate 2 longitude',
+            'degrees_east',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_endpoint_candidates_json',
+            endpoint_candidates_json,
+            'JSON list of GSED reach endpoint candidates',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_coordinate_method',
+            coordinate_method,
+            'method used to derive the representative reach coordinate',
+        )
+        _write_scalar_text_var(
+            ds,
+            'reach_geometry_source',
+            geometry_source,
+            'source geometry used to derive reach coordinate hints',
+        )
+
+        # Public GSED source data does not provide upstream drainage area.
+        area_var = ds.createVariable('upstream_area', 'f4', fill_value=FILL_VALUE_FLOAT)
+        area_var.long_name = 'upstream drainage area'
+        area_var.units = 'km2'
+        area_var.comment = (
+            'Not available in public GSED source data. No external MERIT Hydro '
+            'or basin-matching area is used.'
+        )
+        area_var.assignValue(FILL_VALUE_FLOAT)
 
         # ===== Data Variables =====
         # Q (Discharge) - Not available in GSED
@@ -863,10 +846,25 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
 
         if length is not None:
             ds.reach_length_m = float(length)
-        if upstream_area_km2 is not None and pd.notna(upstream_area_km2):
-            ds.upstream_area = float(upstream_area_km2)
-            if upstream_area_source:
-                ds.upstream_area_source = upstream_area_source
+        if np.isfinite(midpoint_lat):
+            ds.reach_midpoint_lat = float(midpoint_lat)
+        if np.isfinite(midpoint_lon):
+            ds.reach_midpoint_lon = float(midpoint_lon)
+        if np.isfinite(endpoint_1_lat):
+            ds.reach_endpoint_1_lat = float(endpoint_1_lat)
+        if np.isfinite(endpoint_1_lon):
+            ds.reach_endpoint_1_lon = float(endpoint_1_lon)
+        if np.isfinite(endpoint_2_lat):
+            ds.reach_endpoint_2_lat = float(endpoint_2_lat)
+        if np.isfinite(endpoint_2_lon):
+            ds.reach_endpoint_2_lon = float(endpoint_2_lon)
+        ds.reach_endpoint_candidates_json = endpoint_candidates_json
+        ds.reach_coordinate_method = coordinate_method
+        ds.reach_geometry_source = geometry_source
+        ds.upstream_area_note = (
+            'Not available in public GSED source data; upstream_area is stored '
+            'as the fill value.'
+        )
 
         # Variables
         ds.variables_provided = 'Q, SSC, SSL'
@@ -920,9 +918,16 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
         'basin_code_l4': basin_code_l4 if basin_code_l4 is not None else '',
         'longitude': lon if lon is not None else np.nan,
         'latitude': lat if lat is not None else np.nan,
+        'reach_midpoint_lon': midpoint_lon,
+        'reach_midpoint_lat': midpoint_lat,
+        'reach_endpoint_1_lon': endpoint_1_lon,
+        'reach_endpoint_1_lat': endpoint_1_lat,
+        'reach_endpoint_2_lon': endpoint_2_lon,
+        'reach_endpoint_2_lat': endpoint_2_lat,
+        'reach_endpoint_candidates_json': endpoint_candidates_json,
+        'reach_coordinate_method': coordinate_method,
+        'reach_geometry_source': geometry_source,
         'reach_length_m': length if length is not None else np.nan,
-        'upstream_area_km2': upstream_area_km2 if upstream_area_km2 is not None else np.nan,
-        'upstream_area_source': upstream_area_source if upstream_area_source is not None else '',
         'SSC_start_date': f'{start_year}-{start_month:02d}',
         'SSC_end_date': f'{end_year}-{end_month:02d}',
         'SSC_percent_complete': percent_complete,
@@ -966,8 +971,13 @@ def create_summary_csv(stats_list, output_dir):
     columns = [
         'Source_ID', 'reach_id', 'reach_level',
         'basin_code_l1', 'basin_code_l2', 'basin_code_l3', 'basin_code_l4',
-        'longitude', 'latitude', 'reach_length_m', 'upstream_area_km2',
-        'upstream_area_source',
+        'longitude', 'latitude',
+        'reach_midpoint_lon', 'reach_midpoint_lat',
+        'reach_endpoint_1_lon', 'reach_endpoint_1_lat',
+        'reach_endpoint_2_lon', 'reach_endpoint_2_lat',
+        'reach_endpoint_candidates_json',
+        'reach_coordinate_method', 'reach_geometry_source',
+        'reach_length_m',
         'Data Source Name', 'Type', 'Temporal Resolution', 'temporal_span',
         'Variables Provided', 'Geographic Coverage', 'Reference/DOI',
         'Q_start_date', 'Q_end_date', 'Q_percent_complete',
@@ -1010,20 +1020,10 @@ def main():
     reach_metadata = load_gsed_reach_metadata(shapefile, target_rids=target_rids)
     print(f"Loaded metadata for {len(reach_metadata)} reaches used by GSED")
 
-    area_lookup_file = find_gsed_area_lookup_file(source_dir)
-    if area_lookup_file is not None:
-        print(f"Loading external upstream area lookup: {area_lookup_file}")
-        area_lookup = load_gsed_area_lookup(area_lookup_file, target_rids=target_rids)
-        attached_count = merge_gsed_area_lookup(reach_metadata, area_lookup, target_rids=target_rids)
-        print(
-            f"Attached upstream area metadata to {attached_count} reaches from "
-            f"{area_lookup_file.name}"
-        )
-    else:
-        print(
-            "No external upstream-area lookup found. Continuing without "
-            "reported drainage area for GSED."
-        )
+    print(
+        "Using only source GSED reach metadata. Upstream drainage area is not "
+        "provided by the public source files and will be written as missing."
+    )
 
     # Create time array for all months (1985-01 to 2020-12)
     time_array = create_time_array(1985, 1, 432)

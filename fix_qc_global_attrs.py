@@ -18,7 +18,7 @@ from code.runtime import resolve_output_root
 from tqdm import tqdm
 
 
-DEFAULT_WORKERS = 24
+DEFAULT_WORKERS = 32
 REPORT_REL_DIR = Path("scripts_basin_test") / "output"
 REPORT_CSV_NAME = "fix_qc_global_attrs_report.csv"
 REPORT_TXT_NAME = "fix_qc_global_attrs_summary.txt"
