@@ -530,9 +530,13 @@ def _write_scalar_float_var(ds, name, value, long_name, units=None):
 
 
 def _write_scalar_text_var(ds, name, value, long_name):
-    var = ds.createVariable(name, str)
+    dim_name = "string_scalar"
+    if dim_name not in ds.dimensions:
+        ds.createDimension(dim_name, 1)
+
+    var = ds.createVariable(name, str, (dim_name,))
     var.long_name = long_name
-    var.assignValue(str(value or ""))
+    var[0] = str(value or "")
     return var
 
 
