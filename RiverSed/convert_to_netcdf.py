@@ -1,11 +1,11 @@
 """
-Convert Aquasat and RiverSed CSV data to netCDF format
+Convert RiverSed CSV data to netCDF format, with optional Aquasat processing.
 Following HYBAM example structure
 Discharge is set to NaN (no in-situ discharge available)
 
 Workflow overview
 -----------------
-1. Read Aquasat source rows and standardize them to a common station/date/tss schema.
+1. Optionally read Aquasat source rows and standardize them to a common station/date/tss schema.
 2. Read RiverSed source rows, load the modified NHDPlus DBF lookup table,
    and derive representative reach coordinates from the matching flowlines.
 3. Normalize RiverSed IDs in both tables, then attach reach/basin metadata by ID.
@@ -22,6 +22,7 @@ already encode the reach/basin assignment prepared upstream, and the matched
 flowline geometry is only used to derive a representative reach coordinate.
 """
 
+import argparse
 import re
 import json
 import pandas as pd
@@ -1457,20 +1458,32 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Convert RiverSed satellite-derived TSS data to netCDF."
+    )
+    parser.add_argument(
+        "--include-aquasat",
+        action="store_true",
+        default=False,
+        help="Also load and process the optional Aquasat source table.",
+    )
+    args = parser.parse_args()
+
     total_started_at = time.perf_counter()
 
     # End-to-end workflow in main():
     # 1. Resolve input/output paths and runtime settings.
-    # 2. Load Aquasat and RiverSed tables.
+    # 2. Load RiverSed table, and optionally Aquasat.
     # 3. Build station group indices for parallel processing.
-    # 4. Process Aquasat stations in parallel.
+    # 4. Optionally process Aquasat stations in parallel.
     # 5. Process RiverSed reaches/stations in parallel.
     # 6. Write station summary CSV products.
     # 7. Print overall counts and timing diagnostics.
 
     # Configuration with WSL absolute paths
-    aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
     riversed_file = os.path.join(SOURCE_DIR, 'RiverSed_USA_V1.1.txt')
+    if args.include_aquasat:
+        aquasat_file = os.path.join(SOURCE_DIR, 'Aquasat_TSS_v1.1.csv')
     riversed_metadata_dbf = RIVERSED_METADATA_DBF
     riversed_metadata_flowline = RIVERSED_METADATA_FLOWLINE
     output_nc_dir = OUTPUT_NC_DIR
@@ -1490,9 +1503,10 @@ def main():
     print("LOADING DATA")
     print("="*80)
 
-    # Stage 1: load the two source tables and attach RiverSed metadata.
+    # Stage 1: load the source table(s) and attach RiverSed metadata.
     load_started_at = time.perf_counter()
-    aquasat_df = load_aquasat_data(aquasat_file)
+    if args.include_aquasat:
+        aquasat_df = load_aquasat_data(aquasat_file)
     riversed_df = load_riversed_data(
         riversed_file,
         metadata_dbf_path=riversed_metadata_dbf,
@@ -1505,8 +1519,9 @@ def main():
     group_started_at = time.perf_counter()
     # Build station-to-row lookups once. These indices drive both the parallel
     # scheduler and the RiverSed minimum-observation filter.
-    aquasat_group_indices = _build_station_group_indices(aquasat_df)
-    aquasat_stations = list(aquasat_group_indices.keys())
+    if args.include_aquasat:
+        aquasat_group_indices = _build_station_group_indices(aquasat_df)
+        aquasat_stations = list(aquasat_group_indices.keys())
 
     riversed_all_group_indices = _build_station_group_indices(riversed_df)
     # RiverSed exports only reaches with at least 5 original observations so
@@ -1525,34 +1540,38 @@ def main():
     # Child workers recover station slices from shared in-memory tables instead
     # of receiving a pickled DataFrame for each submitted station.
     _WORKER_DATASETS = {
-        "aquasat": aquasat_df,
         "riversed": riversed_df,
     }
     _WORKER_GROUP_INDICES = {
-        "aquasat": aquasat_group_indices,
         "riversed": riversed_group_indices,
     }
+    if args.include_aquasat:
+        _WORKER_DATASETS["aquasat"] = aquasat_df
+        _WORKER_GROUP_INDICES["aquasat"] = aquasat_group_indices
     timing_stats["build_station_groups"] = time.perf_counter() - group_started_at
 
-    # Stage 3: process the two datasets separately but with the same station-
-    # level export logic so the downstream netCDF/CSV products stay consistent.
+    # Stage 3: process selected dataset(s) with the same station-level export
+    # logic so the downstream netCDF/CSV products stay consistent.
     # Process each dataset separately
-    print("\n" + "="*80)
-    print("PROCESSING AQUASAT STATIONS")
-    print("="*80)
-    print(f"Processing {len(aquasat_stations)} Aquasat stations...")
-    print(f"Using {num_workers} parallel workers...")
-    aquasat_success, aquasat_failed, timing_stats["process_aquasat"] = _process_station_collection(
-        "aquasat",
-        aquasat_df,
-        aquasat_group_indices,
-        aquasat_stations,
-        output_nc_dir,
-        num_workers,
-        stations_info,
-        stage_label="Aquasat",
-        verbose_station_logs=verbose_station_logs,
-    )
+    aquasat_success = 0
+    aquasat_failed = 0
+    if args.include_aquasat:
+        print("\n" + "="*80)
+        print("PROCESSING AQUASAT STATIONS")
+        print("="*80)
+        print(f"Processing {len(aquasat_stations)} Aquasat stations...")
+        print(f"Using {num_workers} parallel workers...")
+        aquasat_success, aquasat_failed, timing_stats["process_aquasat"] = _process_station_collection(
+            "aquasat",
+            aquasat_df,
+            aquasat_group_indices,
+            aquasat_stations,
+            output_nc_dir,
+            num_workers,
+            stations_info,
+            stage_label="Aquasat",
+            verbose_station_logs=verbose_station_logs,
+        )
 
     print("\n" + "="*80)
     print("PROCESSING RIVERSED STATIONS")
@@ -1571,7 +1590,7 @@ def main():
         verbose_station_logs=verbose_station_logs,
     )
 
-    # Stage 4: write aggregated station-level summary products after both
+    # Stage 4: write aggregated station-level summary products after all selected
     # datasets have finished. stations_info already contains one dict per file.
     # -----------------------------
     # Generate CSV outputs (summary + QC results)
@@ -1589,11 +1608,13 @@ def main():
     print("\n" + "="*80)
     print("SUMMARY")
     print("="*80)
-    print(f"Aquasat:")
-    print(f"  Total stations: {len(aquasat_stations)}")
-    print(f"  Successfully created: {aquasat_success}")
-    print(f"  Failed (all NaN or no data): {aquasat_failed}")
-    print(f"\nRiverSed:")
+    if args.include_aquasat:
+        print(f"Aquasat:")
+        print(f"  Total stations: {len(aquasat_stations)}")
+        print(f"  Successfully created: {aquasat_success}")
+        print(f"  Failed (all NaN or no data): {aquasat_failed}")
+        print()
+    print(f"RiverSed:")
     print(f"  Total stations (with ≥5 obs): {len(riversed_stations)}")
     print(f"  Successfully created: {riversed_success}")
     print(f"  Failed (all NaN or no data): {riversed_failed}")
@@ -1601,7 +1622,8 @@ def main():
     print(f"\nTiming:")
     print(f"  Load data: {_format_duration(timing_stats['load_data'])}")
     print(f"  Build groups: {_format_duration(timing_stats['build_station_groups'])}")
-    print(f"  Aquasat processing: {_format_duration(timing_stats['process_aquasat'])}")
+    if args.include_aquasat:
+        print(f"  Aquasat processing: {_format_duration(timing_stats['process_aquasat'])}")
     print(f"  RiverSed processing: {_format_duration(timing_stats['process_riversed'])}")
     print(f"  Write CSV: {_format_duration(timing_stats['write_csv'])}")
     print(f"  Total runtime: {_format_duration(timing_stats['total'])}")

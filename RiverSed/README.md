@@ -7,9 +7,9 @@ RiverSed 这条处理链目前包含两个核心脚本：
 - `convert_to_netcdf.py`
 - `fill_missing_coordinates.py`
 
-它们共同的目标是把两套卫星反演悬浮泥沙数据统一整理成
+默认流程会把 RiverSed 卫星反演悬浮泥沙数据整理成
 “每个站点/河段一个 netCDF 文件”的格式，并尽可能为 RiverSed reach
-补充合理的代表坐标：
+补充合理的代表坐标；加 `--include-aquasat` 时也会处理 Aquasat：
 
 - `Aquasat_TSS_v1.1.csv`
 - `RiverSed_USA_V1.1.txt`
@@ -34,12 +34,15 @@ RiverSed 这条处理链目前包含两个核心脚本：
 
 ## 2. 输入文件
 
-脚本会自动解析 `Source/RiverSed` 目录，主要依赖下面四个文件：
+脚本会自动解析 `Source/RiverSed` 目录。默认依赖：
 
-- `Aquasat_TSS_v1.1.csv`
 - `RiverSed_USA_V1.1.txt`
 - `nhdplusv2_modified_v1.0.dbf`
 - `nhdplusv2_modified_v1.0.shp`
+
+可选 Aquasat 输入（使用 `--include-aquasat` 时）：
+
+- `Aquasat_TSS_v1.1.csv`
 
 其中最关键的是后两个 NHDPlus 文件：
 
@@ -67,7 +70,7 @@ RiverSed 这条处理链目前包含两个核心脚本：
 脚本主流程可以概括为：
 
 1. 解析源数据和输出目录。
-2. 读取 Aquasat 数据，只保留实际要用的列。
+2. 如果启用 `--include-aquasat`，读取 Aquasat 数据，只保留实际要用的列。
 3. 读取 RiverSed 观测数据，只保留实际要用的列。
 4. 从修改后的 NHDPlus DBF 中读取河段/流域元数据。
 5. 从修改后的 NHDPlus flowline shapefile 中读取河段几何。
@@ -87,7 +90,7 @@ RiverSed 这条处理链目前包含两个核心脚本：
 
 ## 5. Aquasat 分支在做什么
 
-Aquasat 的处理相对直接，但现在也会顺手保留后续会用到的站点元数据：
+Aquasat 分支仅在 `--include-aquasat` 时启用；处理相对直接，也会保留后续会用到的站点元数据：
 
 - 读取 `SiteID`、`date`、`value`、`lat`、`long`、`elevation`
 - 额外读取 `GNIS_NAME`、`COMID`、`REACHCODE`、`RPUID`、`VPUID`
@@ -428,7 +431,7 @@ DataFrame，从而减少进程间传输开销。
 
 - 读取数据耗时
 - 构建分组耗时
-- Aquasat 处理耗时
+- Aquasat 处理耗时（仅 `--include-aquasat`）
 - RiverSed 处理耗时
 - CSV 写出耗时
 - 总耗时
@@ -495,7 +498,7 @@ RiverSed 在正式处理前会先过滤一次：
 
 上面 1 到 13 节主要解释的是：
 
-- 如何从源表重新生成 RiverSed / Aquasat netCDF
+- 如何从源表重新生成 RiverSed netCDF，或可选的 Aquasat netCDF
 
 但在实际工作中，经常还会遇到另一类需求：
 
@@ -762,8 +765,13 @@ reference 表来自：
 ### 18.3 整套重跑 RiverSed
 
 ```bash
-/share/home/dq134/.conda/envs/wzx/bin/python3.9 \
-  /share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/RiverSed/convert_to_netcdf.py
+python RiverSed/convert_to_netcdf.py
+```
+
+如需同时处理 Aquasat：
+
+```bash
+python RiverSed/convert_to_netcdf.py --include-aquasat
 ```
 
 适合：
