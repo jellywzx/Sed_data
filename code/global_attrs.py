@@ -116,6 +116,18 @@ ALT_VAR_NAMES = ["altitude", "Altitude", "elevation", "Elevation"]
 UPSTREAM_AREA_VAR_NAMES = ["upstream_area", "drainage_area", "basin_area", "catchment_area"]
 PREFERRED_DATA_VARS = ["Q", "SSC", "SSL", "altitude", "upstream_area", "sediment_yield", "reach_id", "reach_length_m"]
 
+OBS_IN_SITU = "In-situ station data"
+OBS_SATELLITE = "Satellite"
+OBS_MODEL = "Model"
+OBS_LITERATURE = "Literature compilation"
+
+SOURCE_IN_SITU = "In-situ station data"
+SOURCE_LITERATURE = "Annual average estimates from literature compilation"
+SOURCE_SATELLITE_STATION = "Satellite station"
+SOURCE_RIVERSED = "Satellite-derived TSS from Aquasat/RiverSed database"
+SOURCE_GFQA = "Global Flow and Water Quality Archive v2"
+SOURCE_GLORISE = "Global River Sediment Database v1.1 - quality controlled and standardized"
+
 
 def _stringify_attr(value):
     if value is None:
@@ -129,6 +141,76 @@ def _stringify_attr(value):
     if text.lower() in ("none", "nan"):
         return ""
     return text
+
+
+def _normalize_attr_text(value):
+    text = _stringify_attr(value).lower()
+    text = text.replace("_", " ").replace("-", "-")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("in situ", "in-situ").replace("insitu", "in-situ")
+    return text
+
+
+def _normalize_observation_type(value):
+    """Map legacy observation-type spellings to a small canonical vocabulary."""
+    original = _stringify_attr(value)
+    if not original:
+        return ""
+
+    text = _normalize_attr_text(original)
+    exact = {
+        "in-situ": OBS_IN_SITU,
+        "in-situ data": OBS_IN_SITU,
+        "in-situ station": OBS_IN_SITU,
+        "in-situ station data": OBS_IN_SITU,
+        "station data": OBS_IN_SITU,
+        "satellite": OBS_SATELLITE,
+        "satellite data": OBS_SATELLITE,
+        "satellite station": OBS_SATELLITE,
+        "satellite-derived": OBS_SATELLITE,
+        "satellite derived": OBS_SATELLITE,
+        "model": OBS_MODEL,
+        "model output": OBS_MODEL,
+        "literature compilation": OBS_LITERATURE,
+        "literature-derived estimates": OBS_LITERATURE,
+        "compiled literature estimates": OBS_LITERATURE,
+    }
+    if text in exact:
+        return exact[text]
+    if "satellite" in text:
+        return OBS_SATELLITE
+    if "literature" in text or "compilation" in text or "compiled" in text:
+        return OBS_LITERATURE
+    if "model" in text:
+        return OBS_MODEL
+    if "in-situ" in text or "station" in text:
+        return OBS_IN_SITU
+    return original
+
+
+def _normalize_source(value):
+    """Normalize high-level source labels while preserving dataset-specific names."""
+    original = _stringify_attr(value)
+    if not original:
+        return ""
+
+    text = _normalize_attr_text(original)
+    exact = {
+        "in-situ": SOURCE_IN_SITU,
+        "in-situ data": SOURCE_IN_SITU,
+        "in-situ station": SOURCE_IN_SITU,
+        "in-situ station data": SOURCE_IN_SITU,
+        "satellite station": SOURCE_SATELLITE_STATION,
+        "satellite-derived tss from aquasat/riversed database": SOURCE_RIVERSED,
+        "global flow and water quality archive v2": SOURCE_GFQA,
+        "global river sediment database v1.1 - quality controlled and standardized": SOURCE_GLORISE,
+        "annual average estimates from literature compilation": SOURCE_LITERATURE,
+    }
+    if text in exact:
+        return exact[text]
+    if "annual average" in text and ("literature" in text or "compilation" in text or "compiled" in text):
+        return SOURCE_LITERATURE
+    return original
 
 
 def _first_nonempty(existing, candidates):
@@ -332,11 +414,11 @@ def _infer_source_data_link(existing, profile):
 def _infer_observation_type(existing, profile):
     value = _first_nonempty(existing, ATTR_PRIORITY_MAP["observation_type"])
     if value:
-        return value
+        return _normalize_observation_type(value)
 
     default_value = _stringify_attr(profile.get("default_observation_type", ""))
     if default_value:
-        return default_value
+        return _normalize_observation_type(default_value)
 
     joined = " ".join(
         [
@@ -347,11 +429,13 @@ def _infer_observation_type(existing, profile):
         ]
     ).lower()
     if "satellite" in joined:
-        return "Satellite"
+        return OBS_SATELLITE
     if "model" in joined:
-        return "Model"
+        return OBS_MODEL
+    if "literature" in joined or "compilation" in joined or "compiled" in joined:
+        return OBS_LITERATURE
     if "station" in joined or "in-situ" in joined or "insitu" in joined:
-        return "In-situ station data"
+        return OBS_IN_SITU
     return ""
 
 
@@ -545,7 +629,9 @@ def build_canonical_attrs(context):
         variables
     )
     attrs["data_limitations"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["data_limitations"])
-    attrs["source"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["source"]) or _stringify_attr(profile.get("default_source", ""))
+    attrs["source"] = _normalize_source(
+        _first_nonempty(existing, ATTR_PRIORITY_MAP["source"]) or _stringify_attr(profile.get("default_source", ""))
+    )
     attrs["data_source_name"] = data_source_name
     attrs["source_data_link"] = _infer_source_data_link(existing, profile)
     attrs["references"] = _merge_references(existing)
