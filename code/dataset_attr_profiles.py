@@ -127,13 +127,6 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
     },
-    "Land2sea": {
-        "data_source_name": "Land2Sea Database",
-        "source_data_link": "https://doi.org/10.1029/2008GC002356",
-        "default_observation_type": OBS_IN_SITU,
-        "default_source": "Annual average estimates from literature compilation",
-        "default_comment": "Annual average sediment flux and discharge estimates compiled from literature sources.",
-    },
     "Mekong_Delta": {
         "data_source_name": "Mekong Delta (Darby et al., 2020)",
         "source_data_link": "https://doi.org/10.5285/ac5b28ca-e087-4aec-974a-5a9f84b06595",
