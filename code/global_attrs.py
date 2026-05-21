@@ -4,6 +4,7 @@ import math
 import re
 from contextlib import contextmanager
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -118,11 +119,8 @@ PREFERRED_DATA_VARS = ["Q", "SSC", "SSL", "altitude", "upstream_area", "sediment
 
 OBS_IN_SITU = "In-situ station data"
 OBS_SATELLITE = "Satellite"
-OBS_MODEL = "Model"
-OBS_LITERATURE = "Literature compilation"
 
 SOURCE_IN_SITU = "In-situ station data"
-SOURCE_LITERATURE = "Annual average estimates from literature compilation"
 SOURCE_SATELLITE_STATION = "Satellite station"
 SOURCE_RIVERSED = "Satellite-derived TSS from Aquasat/RiverSed database"
 SOURCE_GFQA = "Global Flow and Water Quality Archive v2"
@@ -152,7 +150,7 @@ def _normalize_attr_text(value):
 
 
 def _normalize_observation_type(value):
-    """Map legacy observation-type spellings to a small canonical vocabulary."""
+    """Map legacy observation-type spellings to the current canonical vocabulary."""
     original = _stringify_attr(value)
     if not original:
         return ""
@@ -169,20 +167,11 @@ def _normalize_observation_type(value):
         "satellite station": OBS_SATELLITE,
         "satellite-derived": OBS_SATELLITE,
         "satellite derived": OBS_SATELLITE,
-        "model": OBS_MODEL,
-        "model output": OBS_MODEL,
-        "literature compilation": OBS_LITERATURE,
-        "literature-derived estimates": OBS_LITERATURE,
-        "compiled literature estimates": OBS_LITERATURE,
     }
     if text in exact:
         return exact[text]
     if "satellite" in text:
         return OBS_SATELLITE
-    if "literature" in text or "compilation" in text or "compiled" in text:
-        return OBS_LITERATURE
-    if "model" in text:
-        return OBS_MODEL
     if "in-situ" in text or "station" in text:
         return OBS_IN_SITU
     return original
@@ -204,12 +193,9 @@ def _normalize_source(value):
         "satellite-derived tss from aquasat/riversed database": SOURCE_RIVERSED,
         "global flow and water quality archive v2": SOURCE_GFQA,
         "global river sediment database v1.1 - quality controlled and standardized": SOURCE_GLORISE,
-        "annual average estimates from literature compilation": SOURCE_LITERATURE,
     }
     if text in exact:
         return exact[text]
-    if "annual average" in text and ("literature" in text or "compilation" in text or "compiled" in text):
-        return SOURCE_LITERATURE
     return original
 
 
@@ -430,10 +416,6 @@ def _infer_observation_type(existing, profile):
     ).lower()
     if "satellite" in joined:
         return OBS_SATELLITE
-    if "model" in joined:
-        return OBS_MODEL
-    if "literature" in joined or "compilation" in joined or "compiled" in joined:
-        return OBS_LITERATURE
     if "station" in joined or "in-situ" in joined or "insitu" in joined:
         return OBS_IN_SITU
     return ""
@@ -595,27 +577,13 @@ def build_canonical_attrs(context):
     attrs["geographic_coverage"] = _infer_geographic_coverage(existing, lat_stats, lon_stats, profile)
     attrs["country"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["country"])
     attrs["continent_region"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["continent_region"])
-    attrs["geospatial_lat_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lat_min"]) or _stringify_attr(
-        lat_stats["min"]
-    )
-    attrs["geospatial_lat_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lat_max"]) or _stringify_attr(
-        lat_stats["max"]
-    )
-    attrs["geospatial_lon_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lon_min"]) or _stringify_attr(
-        lon_stats["min"]
-    )
-    attrs["geospatial_lon_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lon_max"]) or _stringify_attr(
-        lon_stats["max"]
-    )
-    attrs["geospatial_vertical_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_vertical_min"]) or _stringify_attr(
-        alt_stats["min"]
-    )
-    attrs["geospatial_vertical_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_vertical_max"]) or _stringify_attr(
-        alt_stats["max"]
-    )
-    attrs["upstream_area"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["upstream_area"]) or _stringify_attr(
-        upstream_stats["first"]
-    )
+    attrs["geospatial_lat_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lat_min"]) or _stringify_attr(lat_stats["min"])
+    attrs["geospatial_lat_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lat_max"]) or _stringify_attr(lat_stats["max"])
+    attrs["geospatial_lon_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lon_min"]) or _stringify_attr(lon_stats["min"])
+    attrs["geospatial_lon_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_lon_max"]) or _stringify_attr(lon_stats["max"])
+    attrs["geospatial_vertical_min"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_vertical_min"]) or _stringify_attr(alt_stats["min"])
+    attrs["geospatial_vertical_max"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["geospatial_vertical_max"]) or _stringify_attr(alt_stats["max"])
+    attrs["upstream_area"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["upstream_area"]) or _stringify_attr(upstream_stats["first"])
 
     attrs["temporal_resolution"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["temporal_resolution"])
     attrs["time_coverage_start"] = start_text
