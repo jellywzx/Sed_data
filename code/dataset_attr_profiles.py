@@ -11,7 +11,6 @@ DEFAULT_FEATURE_TYPE = "timeSeries"
 
 OBS_IN_SITU = "In-situ station data"
 OBS_SATELLITE = "Satellite"
-OBS_LITERATURE = "Literature compilation"
 
 SOURCE_IN_SITU = "In-situ station data"
 
@@ -131,7 +130,7 @@ DATASET_PROFILES = {
     "Land2sea": {
         "data_source_name": "Land2Sea Database",
         "source_data_link": "https://doi.org/10.1029/2008GC002356",
-        "default_observation_type": OBS_LITERATURE,
+        "default_observation_type": OBS_IN_SITU,
         "default_source": "Annual average estimates from literature compilation",
         "default_comment": "Annual average sediment flux and discharge estimates compiled from literature sources.",
     },
