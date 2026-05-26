@@ -324,6 +324,29 @@ def process_yajiang():
             except Exception:
                 pass
 
+        # If not found in attrs, get from coordinates (dimension coordinates)
+        if np.isnan(lat) and 'lat' in ds.coords:
+            try:
+                lat = float(ds.coords['lat'].item())
+            except Exception:
+                pass
+        if np.isnan(lon) and 'lon' in ds.coords:
+            try:
+                lon = float(ds.coords['lon'].item())
+            except Exception:
+                pass
+        # If still not found, try data_vars with short names
+        if np.isnan(lat) and 'lat' in ds.data_vars:
+            try:
+                lat = float(ds.lat.item())
+            except Exception:
+                pass
+        if np.isnan(lon) and 'lon' in ds.data_vars:
+            try:
+                lon = float(ds.lon.item())
+            except Exception:
+                pass
+
         station_info = {
             "station_name": station_name,
             "river_name": river_name,
@@ -510,7 +533,30 @@ def process_yajiang():
                 lon = float(ds.attrs['lon'])
             except:
                 pass
-        
+
+        # If not found in attrs, get from coordinates (dimension coordinates)
+        if np.isnan(lat) and 'lat' in ds.coords:
+            try:
+                lat = float(ds.coords['lat'].item())
+            except:
+                pass
+        if np.isnan(lon) and 'lon' in ds.coords:
+            try:
+                lon = float(ds.coords['lon'].item())
+            except:
+                pass
+        # If still not found, try data_vars with short names
+        if np.isnan(lat) and 'lat' in ds.data_vars:
+            try:
+                lat = float(ds.lat.item())
+            except:
+                pass
+        if np.isnan(lon) and 'lon' in ds.data_vars:
+            try:
+                lon = float(ds.lon.item())
+            except:
+                pass
+
         # Add as variables to output dataset
         new_ds['lat'] = ((), lat)
         new_ds['lon'] = ((), lon)
