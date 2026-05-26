@@ -481,35 +481,11 @@ def process_yajiang():
         new_ds = xr.Dataset()
         new_ds['time'] = ('time', df.index)
 
-        variables = {
-            'Q': {'units': 'm3 s-1', 'long_name': 'River Discharge', 'standard_name': 'river_discharge'},
-            'SSC': {'units': 'mg L-1', 'long_name': 'Suspended Sediment Concentration', 'standard_name': 'mass_concentration_of_suspended_matter_in_water'},
-            'SSL': {'units': 'ton day-1', 'long_name': 'Suspended Sediment Load', 'standard_name': 'load_of_suspended_matter'},
-        }
-
-        for var_key, attrs in variables.items():
-            if var_key in df.columns:
-                new_ds[var_key] = ('time', df[var_key].astype(np.float32).values)
-                new_ds[var_key].attrs = {
-                    'long_name': attrs['long_name'], 'standard_name': attrs['standard_name'], 'units': attrs['units'],
-                    '_FillValue': -9999.0, 'ancillary_variables': f'{var_key}_flag',
-                    'comment': "Source: Original data. Calculated if applicable."
-                }
-                if f'{var_key}_flag' in df.columns:
-                    new_ds[f'{var_key}_flag'] = ('time', df[f'{var_key}_flag'].astype(np.byte).values)
-                    new_ds[f'{var_key}_flag'].attrs = {
-                        'long_name': f'Quality flag for {attrs["long_name"]}',
-                        '_FillValue': FILL_VALUE_INT,
-                        'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.int8),
-                        'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
-                    }
-
-
         # Coordinates and other metadata
         # Get lat/lon from global attributes or variables
         lat = np.nan
         lon = np.nan
-        
+
         # Try to get from variables first
         if 'latitude' in ds.data_vars:
             try:
@@ -521,7 +497,7 @@ def process_yajiang():
                 lon = float(ds.longitude.item())
             except:
                 pass
-        
+
         # If not found in variables, get from global attributes
         if np.isnan(lat) and 'lat' in ds.attrs:
             try:
@@ -557,11 +533,36 @@ def process_yajiang():
             except:
                 pass
 
-        # Add as variables to output dataset
-        new_ds['lat'] = ((), lat)
-        new_ds['lon'] = ((), lon)
+        # Add lat/lon as 1D grid coordinates (CDO-recognized lonlat grid)
+        new_ds['lat'] = ('lat', np.array([lat], dtype=np.float32))
+        new_ds['lon'] = ('lon', np.array([lon], dtype=np.float32))
         new_ds['lat'].attrs = {'long_name': 'station latitude', 'standard_name': 'latitude', 'units': 'degrees_north'}
         new_ds['lon'].attrs = {'long_name': 'station longitude', 'standard_name': 'longitude', 'units': 'degrees_east'}
+
+        variables = {
+            'Q': {'units': 'm3 s-1', 'long_name': 'River Discharge', 'standard_name': 'river_discharge'},
+            'SSC': {'units': 'mg L-1', 'long_name': 'Suspended Sediment Concentration', 'standard_name': 'mass_concentration_of_suspended_matter_in_water'},
+            'SSL': {'units': 'ton day-1', 'long_name': 'Suspended Sediment Load', 'standard_name': 'load_of_suspended_matter'},
+        }
+
+        for var_key, attrs in variables.items():
+            if var_key in df.columns:
+                # CDO expects data on (time, lat, lon) for a 1x1 lonlat grid
+                new_ds[var_key] = (('time', 'lat', 'lon'),
+                                   df[var_key].astype(np.float32).values[:, np.newaxis, np.newaxis])
+                new_ds[var_key].attrs = {
+                    'long_name': attrs['long_name'], 'standard_name': attrs['standard_name'], 'units': attrs['units'],
+                    '_FillValue': np.float32(-9999.0), 'ancillary_variables': f'{var_key}_flag',
+                    'comment': "Source: Original data. Calculated if applicable."
+                }
+                if f'{var_key}_flag' in df.columns:
+                    new_ds[f'{var_key}_flag'] = ('time', df[f'{var_key}_flag'].astype(np.byte).values)
+                    new_ds[f'{var_key}_flag'].attrs = {
+                        'long_name': f'Quality flag for {attrs["long_name"]}',
+                        '_FillValue': FILL_VALUE_INT,
+                        'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.int8),
+                        'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
+                    }
         altitude = ds.altitude.item() if 'altitude' in ds else FILL_VALUE_FLOAT
         new_ds['altitude'] = ((), altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT})
         new_ds['upstream_area'] = ((), FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT}) # Not available
