@@ -1,5 +1,73 @@
 #!/usr/bin/env python3
-"""Normalize canonical global attributes in-place for qc NetCDF files."""
+"""
+批量修正 qc NetCDF 文件的全局属性，使其符合标准化规则。
+
+该脚本遍历指定目录下所有 qc 子目录中的 .nc 文件，调用 normalize_nc_attrs()
+对每个文件的全局属性进行原地标准化（如补充缺失属性、修正属性值等），
+并生成 CSV 和 TXT 格式的处理报告。
+
+运行环境要求
+-------------
+- Python >= 3.8
+- 依赖包: tqdm, netCDF4 (被 normalize_nc_attrs 间接使用)
+- 同级目录下需存在 code/ 模块包（dataset_attr_profiles, global_attrs, runtime）
+- 运行前请确保当前 Python 环境已安装所需依赖：
+    pip install tqdm netCDF4
+
+用法示例
+---------
+# 处理所有数据集（默认读取脚本所在目录的 Output_r 上级目录）
+python fix_qc_global_attrs.py --all
+
+# 仅处理指定数据集（可重复使用 --dataset）
+python fix_qc_global_attrs.py --dataset SED
+
+# 指定 source root 和数据集的组合
+python fix_qc_global_attrs.py --source-root /path/to/Output_r --dataset SED
+
+# 仅预览变更，不实际修改文件
+python fix_qc_global_attrs.py --dataset SED --dry-run
+
+# 限制处理文件数 + 控制并行度
+python fix_qc_global_attrs.py --dataset SED --limit 50 --workers 8
+
+# 指定报告输出目录
+python fix_qc_global_attrs.py --dataset SED --report-dir /path/to/reports
+
+参数说明
+---------
+--source-root     Output_r 根目录路径（默认由 resolve_output_root 自动推导）
+--dataset         要处理的数据集名称（可重复）；需配合 --all 或至少一个 --dataset 使用
+--all             处理 --source-root 下所有数据集
+--workers         并行进程数，默认 32
+--limit           最多处理的文件数（过滤后），0 表示不限制
+--dry-run         仅生成报告，不修改 .nc 文件
+--report-dir      报告输出目录（默认 Output_r/scripts_basin_test/output）
+
+输出说明 & 运行阶段
+--------------------
+脚本运行时会依次打印以下信息，对应三个处理阶段：
+
+1. 启动信息（脚本刚运行时打印）
+   - Source root : 待处理的 Output_r 根目录
+   - Files       : 匹配到的 .nc 文件总数
+   - Mode        : dry-run（预览不动文件）或 apply（实际修改）
+   - Phase 1     : 开始执行全局属性标准化
+
+2. 处理进度条（Phase 1 期间动态显示）
+   - Processing  : 并行处理各 .nc 文件的实时进度条
+
+3. 报告输出（处理完成后打印）
+   - Reports written : 生成的 CSV 明细报告和 TXT 汇总报告路径
+
+输出文件说明
+-------------
+- CSV 报告：每条记录一行，包含数据集、状态、是否变更、变更的属性键、修复后仍缺失的属性等
+- TXT 汇总：统计各状态数量、高频变更属性、高频缺失属性、按数据集统计的状态分布
+- dry-run 模式下 CSV 的 status 列为 "planned"，否则为 "normalized" 或 "normalize_error"
+"""
+
+import argparse
 
 import argparse
 import csv
