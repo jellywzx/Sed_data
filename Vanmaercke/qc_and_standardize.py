@@ -342,15 +342,15 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.Source_ID = station_id
 
         # Type and resolution
-        ds.Type = "In-situ"
+        ds.observation_type = "In-situ"
 
         # Variables provided
         vars_provided = "SSL"  # Only SSL available
-        ds.Variables_Provided = vars_provided
-        ds.Number_of_data = "1"
+        ds.variables_provided = vars_provided
+        ds.number_of_observations = "1"
 
         # References
-        ds.Reference = "Vanmaercke, M., Poesen, J., Broeckx, J., & Nyssen, J. (2014). " \
+        ds.references = "Vanmaercke, M., Poesen, J., Broeckx, J., & Nyssen, J. (2014). " \
                        "Sediment yield in Africa. Earth-Science Reviews, 136, 350-368. " \
                        "https://doi.org/10.1016/j.earscirev.2014.06.004"
         ds.source_data_link = "https://doi.org/10.1016/j.earscirev.2014.06.004"

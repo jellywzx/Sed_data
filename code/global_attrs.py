@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from code.dataset_attr_profiles import get_dataset_profile
+from code.dataset_attr_profiles import DATASET_PROFILES, get_dataset_profile, normalize_dataset_name
 
 
 CONVENTIONS_VALUE = "CF-1.8, ACDD-1.3"
@@ -18,6 +18,7 @@ HISTORY_NOTE = "[fix_qc_global_attrs] canonical global attrs normalized in place
 CANONICAL_ATTR_ORDER = [
     "Conventions",
     "title",
+    "dataset_name",
     "history",
     "summary",
     "comment",
@@ -87,7 +88,7 @@ ATTR_PRIORITY_MAP = {
     "variables_provided": ["variables_provided", "Variables_Provided"],
     "data_limitations": ["data_limitations"],
     "source": ["source"],
-    "data_source_name": ["data_source_name", "Data_Source_Name", "dataset_name"],
+    "data_source_name": ["data_source_name", "Data_Source_Name"],
     "source_data_link": ["source_data_link", "source_url", "sediment_data_source", "discharge_data_source"],
     "creator_institution": ["creator_institution", "contributor_institution", "institution", "insitiution"],
     "creator_name": ["creator_name", "contributor_name"],
@@ -109,6 +110,21 @@ OPTIONAL_PASSTHROUGH = {
     "reach_id",
     "reach_length_m",
 }
+
+DATASET_NAME_ALIASES = {
+    "HYDAT": "Hydat",
+    "Hydat": "Hydat",
+    "Bayern": "Bayern",
+    "bayern": "Bayern",
+}
+
+LEGACY_GLOBAL_ATTRS_TO_REMOVE = [
+    "Data_Source_Name",
+    "type",              # -> observation_type (HYDAT, Rhine, Eurasian_River)
+    "institution",        # -> creator_institution (RiverSed)
+    "source_id",          # -> station_id (Rhine, Eurasian_River)
+    "insitiution",        # -> creator_institution (Eurasian_River, typo)
+]
 
 TIME_VAR_NAMES = ["time", "Time", "t", "datetime", "date"]
 LAT_VAR_NAMES = ["lat", "latitude", "Latitude", "LAT"]
@@ -139,6 +155,17 @@ def _stringify_attr(value):
     if text.lower() in ("none", "nan"):
         return ""
     return text
+
+
+def normalize_dataset_attr_name(name):
+    """Return the canonical dataset_name value stored in NetCDF globals."""
+    raw = str(name or "").strip()
+    return DATASET_NAME_ALIASES.get(raw, raw)
+
+
+def _has_known_dataset_profile(dataset_name):
+    normalized = normalize_dataset_name(dataset_name)
+    return normalized in DATASET_PROFILES
 
 
 def _normalize_attr_text(value):
@@ -543,6 +570,8 @@ def build_canonical_attrs(context):
     attrs = {}
     attrs["Conventions"] = CONVENTIONS_VALUE
 
+    attrs["dataset_name"] = normalize_dataset_attr_name(context["dataset_name"])
+
     title = _first_nonempty(existing, ATTR_PRIORITY_MAP["title"])
     if not title:
         title = "{0} station data".format(profile.get("data_source_name", "") or context["dataset_name"])
@@ -552,9 +581,12 @@ def build_canonical_attrs(context):
     end_text = _first_nonempty(existing, ATTR_PRIORITY_MAP["time_coverage_end"]) or _format_timestamp(time_bounds["end"])
     station_id = _first_nonempty(existing, ATTR_PRIORITY_MAP["station_id"])
 
-    data_source_name = _first_nonempty(existing, ATTR_PRIORITY_MAP["data_source_name"])
-    if not data_source_name:
-        data_source_name = _stringify_attr(profile.get("data_source_name", "")) or context["dataset_name"]
+    if _has_known_dataset_profile(context["dataset_name"]):
+        data_source_name = _stringify_attr(profile.get("data_source_name", ""))
+    else:
+        data_source_name = _first_nonempty(existing, ATTR_PRIORITY_MAP["data_source_name"])
+        if not data_source_name:
+            data_source_name = _stringify_attr(profile.get("data_source_name", "")) or attrs["dataset_name"]
 
     attrs["station_id"] = station_id
     attrs["station_name"] = _infer_station_name(existing)
@@ -643,6 +675,7 @@ def validate_canonical_attrs(attrs):
 def apply_canonical_attrs(nc_path, attrs, dry_run=False, history_note=""):
     """Apply canonical attributes to an NC file and return change details."""
     changed_keys = []
+    removed_keys = []
     target_history = ""
 
     with _open_netcdf_for_attrs(str(nc_path), "r") as ds:
@@ -653,15 +686,19 @@ def apply_canonical_attrs(nc_path, attrs, dry_run=False, history_note=""):
         for key in CANONICAL_ATTR_ORDER:
             if _stringify_attr(existing.get(key, "")) != _stringify_attr(attrs.get(key, "")):
                 changed_keys.append(key)
+        removed_keys = [key for key in LEGACY_GLOBAL_ATTRS_TO_REMOVE if key in existing]
 
     if dry_run:
         return {
-            "changed": bool(changed_keys),
+            "changed": bool(changed_keys or removed_keys),
             "changed_keys": changed_keys,
+            "removed_keys": removed_keys,
             "missing_after_fix": validate_canonical_attrs(attrs),
         }
 
     with _open_netcdf_for_attrs(str(nc_path), "a") as ds:
+        for key in removed_keys:
+            _delete_dataset_attr(ds, key)
         for key in changed_keys:
             _set_dataset_attr(ds, key, _stringify_attr(attrs.get(key, "")))
         if "history" not in changed_keys and history_note and history_note not in _stringify_attr(_read_dataset_attrs(ds).get("history", "")):
@@ -670,8 +707,9 @@ def apply_canonical_attrs(nc_path, attrs, dry_run=False, history_note=""):
                 changed_keys.append("history")
 
     return {
-        "changed": bool(changed_keys),
+        "changed": bool(changed_keys or removed_keys),
         "changed_keys": changed_keys,
+        "removed_keys": removed_keys,
         "missing_after_fix": validate_canonical_attrs(attrs),
     }
 
@@ -686,6 +724,12 @@ def normalize_nc_attrs(nc_path, dataset_name="", path_resolution="", history_not
             "path": str(nc_path),
             "dataset_name": context["dataset_name"],
             "path_resolution": context["path_resolution"],
+            "old_dataset_name": context["existing"].get("dataset_name", ""),
+            "new_dataset_name": attrs.get("dataset_name", ""),
+            "old_data_source_name": _first_nonempty(context["existing"], ATTR_PRIORITY_MAP["data_source_name"]),
+            "new_data_source_name": attrs.get("data_source_name", ""),
+            "old_source": _first_nonempty(context["existing"], ATTR_PRIORITY_MAP["source"]),
+            "new_source": attrs.get("source", ""),
         }
     )
     return result
@@ -731,3 +775,17 @@ def _set_dataset_attr(ds, key, value):
         ds.setncattr(key, value)
     else:
         ds.attrs[key] = value
+
+
+def _delete_dataset_attr(ds, key):
+    try:
+        if hasattr(ds, "delncattr"):
+            ds.delncattr(key)
+            return
+    except Exception:
+        pass
+    try:
+        if key in ds.attrs:
+            del ds.attrs[key]
+    except Exception:
+        pass

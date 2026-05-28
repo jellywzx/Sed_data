@@ -684,10 +684,6 @@ class HYBAMProcessor:
             ds.processing_level = 'Quality controlled and standardized'
 
             ds.number_of_data = str(len([d for d in data_dict['discharge'] if d != fill_value]) if data_dict['discharge'] is not None else 0)
-            # Add legacy/alternate global attribute names expected by completeness checker
-            ds.Type = 'In-situ'
-            ds.Variables_Provided = ds.variables_provided
-            ds.Reference = ds.reference
             # Location and administrative metadata (best-effort)
             ds.location_id = station_id
             ds.country = ''

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 # -*- coding: utf-8 -*-
 """
 Process Dethier (2022) river sediment dataset:
@@ -617,18 +618,18 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
 
     ds_out.attrs.update({
         "title": raw_attrs.get("title", "Harmonized Global River Discharge and Sediment"),
-        "Data_Source_Name": raw_attrs.get("Data_Source_Name", "Dethier Dataset"),
+        "data_source_name": raw_attrs.get("data_source_name", "Dethier Dataset"),
         "station_name": raw_attrs.get("station_name", station_id),
         "river_name": raw_attrs.get("river_name", river_name),
         "Source_ID": raw_attrs.get("site_no", station_id),
-        "Type": raw_attrs.get("Type", "Satellite station"),
-        "Temporal_Resolution": raw_attrs.get("Temporal_Resolution", "monthly"),
-        "Temporal_Span": f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
-        "Geographic_Coverage": raw_attrs.get(
-            "Geographic_Coverage",
+        "observation_type": raw_attrs.get("observation_type", "Satellite station"),
+        "temporal_resolution": raw_attrs.get("temporal_resolution", "monthly"),
+        "temporal_span": f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+        "geographic_coverage": raw_attrs.get(
+            "geographic_coverage",
             f"River reach near ({lat:.4f}N, {lon:.4f}E)"
         ),
-        "Variables_Provided": "Q, SSC, SSL",
+        "variables_provided": "Q, SSC, SSL",
         "Reference1": "Dethier, E. N., et al. (2022), Science, DOI:10.1126/science.abn7980",
         "summary": "This dataset provides monthly river discharge and sediment data, processed and QC-filtered.",
         "creator_name": "Zhongwang Wei",
@@ -702,11 +703,11 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
         "river_name": ds_out.attrs["river_name"],
         "longitude": float(lon) if not np.isnan(lon) else np.nan,
         "latitude": float(lat) if not np.isnan(lat) else np.nan,
-        "Data Source Name": ds_out.attrs["Data_Source_Name"],
-        "Type": ds_out.attrs["Type"],
-        "Temporal Resolution": ds_out.attrs["Temporal_Resolution"],
-        "Temporal Span": ds_out.attrs["Temporal_Span"],
-        "Variables Provided": ds_out.attrs["Variables_Provided"],
+        "Data Source Name": ds_out.attrs["data_source_name"],
+        "observation_type": ds_out.attrs["observation_type"],
+        "Temporal Resolution": ds_out.attrs["temporal_resolution"],
+        "Temporal Span": ds_out.attrs["temporal_span"],
+        "Variables Provided": ds_out.attrs["variables_provided"],
         "Reference/DOI": "10.1126/science.abn7980",
     }
     summary.update(stats_q)

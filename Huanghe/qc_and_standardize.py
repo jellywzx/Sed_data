@@ -357,14 +357,14 @@ def write_standardized_file(
         ds.river_name_chinese = river_name_chinese
         ds.Source_ID = station_id
 
-        ds.Type = "in-situ"
+        ds.observation_type = "in-situ"
         ds.featureType = "timeSeries"
         ds.observation_type = observation_type
 
-        ds.Variables_Provided = "SSC"
-        ds.Number_of_data = str(len(time_vals_out))
+        ds.variables_provided = "SSC"
+        ds.number_of_observations = str(len(time_vals_out))
 
-        ds.Reference = (
+        ds.references = (
             "Zhang Yaonan, Kang jianfang, Liu chun. (2021). Data on Sediment Observation in the "
             "Yellow River Basin from 2015 to 2019. National Cryosphere Desert Data Center. "
             "https://doi.org/10.12072/ncdc.YRiver.db0054.2021"

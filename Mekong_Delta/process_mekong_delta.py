@@ -419,14 +419,14 @@ def create_netcdf_file(filepath, df, station_meta):
         ds.creator_email = "weizhw6@mail.sysu.edu.cn"
         ds.creator_institution = "Sun Yat-sen University, China"
         ds.history = f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using process_mekong_delta.py."
-        ds.Type = "In-situ station data"
+        ds.observation_type = "In-situ station data"
         ds.temporal_resolution = "daily"
         ds.temporal_span = f"{df['time'].min().strftime('%Y-%m-%d')} to {df['time'].max().strftime('%Y-%m-%d')}"
         ds.geographic_coverage = "Mekong River Delta, Vietnam"
         ds.time_coverage_start = df['time'].min().strftime('%Y-%m-%d')
         ds.time_coverage_end = df['time'].max().strftime('%Y-%m-%d')
-        ds.Variables_Provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
-        ds.Number_of_data = str(len(df))
+        ds.variables_provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
+        ds.number_of_observations = str(len(df))
         
         # === DATA VARIABLES ===
         fill_value = FILL_VALUE_FLOAT

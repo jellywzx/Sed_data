@@ -409,13 +409,13 @@ def process_single_station(args):
         # Global attributes
         ds.attrs = {
             'title': 'Harmonized Global River Discharge and Sediment',
-            'Data_Source_Name': 'USGS NWIS',
+            'data_source_name': 'USGS NWIS',
             'station_name': station_info['station_nm'],
             'Source_ID': station_id,
-            'Type': 'In-situ station data',
-            'Temporal_Resolution': 'irregular_daily_overlap',
-            'Temporal_Span': f'{start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}',
-            'Reference': 'https://waterdata.usgs.gov/nwis',
+            'observation_type': 'In-situ station data',
+            'temporal_resolution': 'irregular_daily_overlap',
+            'temporal_span': f'{start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}',
+            'references': 'https://waterdata.usgs.gov/nwis',
             'creator_name': 'Zhongwang Wei',
             'creator_email': 'weizhw6@mail.sysu.edu.cn',
             'creator_institution': 'Sun Yat-sen University, China',

@@ -806,7 +806,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
         ds.station_name = str(int(r_id))
         ds.reach_id = str(int(r_id))
         ds.source = 'Satellite station'
-        ds.Type = 'Satellite'
+        ds.observation_type = 'Satellite'
         if pd.notna(reach_level):
             ds.reach_level = int(reach_level)
         if basin_code_l1:
