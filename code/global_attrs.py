@@ -50,7 +50,7 @@ CANONICAL_ATTR_ORDER = [
     "source",
     "data_source_name",
     "source_data_link",
-    "references",
+    "reference",
     "creator_institution",
     "creator_name",
     "creator_email",
@@ -96,8 +96,8 @@ ATTR_PRIORITY_MAP = {
 }
 
 REFERENCE_KEYS = [
-    "references",
     "reference",
+    "references",
     "Reference",
     "Reference1",
     "reference1",
@@ -124,6 +124,18 @@ LEGACY_GLOBAL_ATTRS_TO_REMOVE = [
     "institution",        # -> creator_institution (RiverSed)
     "source_id",          # -> station_id (Rhine, Eurasian_River)
     "insitiution",        # -> creator_institution (Eurasian_River, typo)
+    "references",
+    "Reference",
+    "Reference1",
+    "reference1",
+    "reference2",
+    "Source_ID",            # -> station_id
+    "Station_ID",           # -> station_id
+    "location_id",          # -> station_id
+    "data_period_start",    # -> time_coverage_start
+    "data_period_end",      # -> time_coverage_end
+    "measurement_period",   # -> temporal_span
+    "source_url",           # -> source_data_link
 ]
 
 TIME_VAR_NAMES = ["time", "Time", "t", "datetime", "date"]
@@ -634,7 +646,7 @@ def build_canonical_attrs(context):
     )
     attrs["data_source_name"] = data_source_name
     attrs["source_data_link"] = _infer_source_data_link(existing, profile)
-    attrs["references"] = _merge_references(existing)
+    attrs["reference"] = _merge_references(existing)
     attrs["creator_institution"] = _first_nonempty(existing, ATTR_PRIORITY_MAP["creator_institution"]) or _stringify_attr(
         profile.get("creator_institution", "")
     )
