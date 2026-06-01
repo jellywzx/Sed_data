@@ -64,6 +64,20 @@ OUTPUT_DIR = os.fspath(
 )
 METADATA_FILE = os.path.join(SOURCE_DIR, "ALL_METADATA.csv")
 
+# ISO 3166-1 alpha-2 country code mapping for EUSEDcollab (all European stations)
+EUSED_COUNTRY_MAP = {
+    "BE": {"country": "Belgium", "continent_region": "Europe", "iso_a3": "BEL"},
+    "CZ": {"country": "Czech Republic", "continent_region": "Europe", "iso_a3": "CZE"},
+    "DK": {"country": "Denmark", "continent_region": "Europe", "iso_a3": "DNK"},
+    "ES": {"country": "Spain", "continent_region": "Europe", "iso_a3": "ESP"},
+    "FR": {"country": "France", "continent_region": "Europe", "iso_a3": "FRA"},
+    "GR": {"country": "Greece", "continent_region": "Europe", "iso_a3": "GRC"},
+    "IT": {"country": "Italy", "continent_region": "Europe", "iso_a3": "ITA"},
+    "PL": {"country": "Poland", "continent_region": "Europe", "iso_a3": "POL"},
+    "PT": {"country": "Portugal", "continent_region": "Europe", "iso_a3": "PRT"},
+    "SI": {"country": "Slovenia", "continent_region": "Europe", "iso_a3": "SVN"},
+}
+
 
 def _default_worker_count():
     try:
@@ -993,6 +1007,13 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         ds.geospatial_lon_min = float(metadata['longitude'])
         ds.geospatial_lon_max = float(metadata['longitude'])
         ds.geographic_coverage = f"{metadata['country']}, {metadata['stream_type']} stream"
+
+        # Geographic metadata
+        country_code = metadata.get('country', '')
+        country_info = EUSED_COUNTRY_MAP.get(country_code, {})
+        ds.country = country_info.get('country', '')
+        ds.continent_region = country_info.get('continent_region', '')
+        ds.iso_a3 = country_info.get('iso_a3', '')
 
         # Variables
         ds.variables_provided = 'altitude, upstream_area, Q, SSC, SSL'

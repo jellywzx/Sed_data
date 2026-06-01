@@ -70,23 +70,23 @@ from code.units import (
 )
 
 STATION_INFO = {
-    "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430},
-    "15900000":   {"lon": -59.59945, "lat": -4.389167, "alt": None},
-    "10064000":   {"lon": -77.54837, "lat": -4.47023,  "alt": 200},
-    "50800000":   {"lon": 15.31667,  "lat": -4.26667,  "alt": 270},
-    "14710000":   {"lon": -61.12361, "lat": 1.821389,  "alt": None},
-    "40800000":   {"lon": -63.6,     "lat": 8.14,      "alt": 8},
-    "15860000":   {"lon": -60.02528, "lat": -4.897222, "alt": None},
-    "10080900":   {"lon": -76.98917, "lat": -0.4411111,"alt": 330},
-    "17730000":   {"lon": -57.58333, "lat": -4.283333, "alt": None},
-    "10073500":   {"lon": -73.87119, "lat": -10.60762, "alt": 195},
-    "2604100121": {"lon": -54.43333, "lat": 4.983333,  "alt": None},
-    "14100000":   {"lon": -60.60944, "lat": -3.308333, "alt": 20},
-    "17050001":   {"lon": -55.51111, "lat": -1.947222, "alt": None},
-    "15400000":   {"lon": -63.92028, "lat": -8.736667, "alt": None},
-    "15275100":   {"lon": -67.53496, "lat": -14.44091, "alt": 216},
-    "2604500124": {"lon": -51.88334, "lat": 3.816667,  "alt": None},
-    "14420000":   {"lon": -64.82889, "lat": -0.4819444,"alt": None}
+    "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430, "country": "Bolivia", "continent_region": "South America", "iso_a3": "BOL"},
+    "15900000":   {"lon": -59.59945, "lat": -4.389167, "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "10064000":   {"lon": -77.54837, "lat": -4.47023,  "alt": 200, "country": "Peru", "continent_region": "South America", "iso_a3": "PER"},
+    "50800000":   {"lon": 15.31667,  "lat": -4.26667,  "alt": 270, "country": "Republic of the Congo", "continent_region": "Africa", "iso_a3": "COG"},
+    "14710000":   {"lon": -61.12361, "lat": 1.821389,  "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "40800000":   {"lon": -63.6,     "lat": 8.14,      "alt": 8, "country": "Venezuela", "continent_region": "South America", "iso_a3": "VEN"},
+    "15860000":   {"lon": -60.02528, "lat": -4.897222, "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "10080900":   {"lon": -76.98917, "lat": -0.4411111,"alt": 330, "country": "Ecuador", "continent_region": "South America", "iso_a3": "ECU"},
+    "17730000":   {"lon": -57.58333, "lat": -4.283333, "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "10073500":   {"lon": -73.87119, "lat": -10.60762, "alt": 195, "country": "Peru", "continent_region": "South America", "iso_a3": "PER"},
+    "2604100121": {"lon": -54.43333, "lat": 4.983333,  "alt": None, "country": "Suriname", "continent_region": "South America", "iso_a3": "SUR"},
+    "14100000":   {"lon": -60.60944, "lat": -3.308333, "alt": 20, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "17050001":   {"lon": -55.51111, "lat": -1.947222, "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "15400000":   {"lon": -63.92028, "lat": -8.736667, "alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
+    "15275100":   {"lon": -67.53496, "lat": -14.44091, "alt": 216, "country": "Bolivia", "continent_region": "South America", "iso_a3": "BOL"},
+    "2604500124": {"lon": -51.88334, "lat": 3.816667,  "alt": None, "country": "French Guiana", "continent_region": "South America", "iso_a3": "GUF"},
+    "14420000":   {"lon": -64.82889, "lat": -0.4819444,"alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
 }
 
 
@@ -391,7 +391,8 @@ class HYBAMProcessor:
         }
 
     def write_cf18_netcdf(self, station_id, station_name, river_name, latitude, longitude,
-                         altitude, upstream_area, data_dict, output_file):
+                         altitude, upstream_area, data_dict, output_file,
+                         country="", continent_region="", iso_a3=""):
         """Write CF-1.8 compliant NetCDF file with quality flags.
 
         CF-1.8 Requirements:
@@ -684,14 +685,11 @@ class HYBAMProcessor:
             ds.processing_level = 'Quality controlled and standardized'
 
             ds.number_of_data = str(len([d for d in data_dict['discharge'] if d != fill_value]) if data_dict['discharge'] is not None else 0)
-            # Add legacy/alternate global attribute names expected by completeness checker
-            ds.Type = 'In-situ'
-            ds.Variables_Provided = ds.variables_provided
-            ds.Reference = ds.reference
             # Location and administrative metadata (best-effort)
             ds.location_id = station_id
-            ds.country = ''
-            ds.continent_region = ''
+            ds.country = country
+            ds.continent_region = continent_region
+            ds.iso_a3 = iso_a3''
 
     def process_station(self, station_dir):
         """Process a single station through the complete pipeline."""
@@ -746,17 +744,24 @@ class HYBAMProcessor:
             latitude = info["lat"]
             longitude = info["lon"]
             altitude = info["alt"]
+            country = info.get("country", "")
+            continent_region = info.get("continent_region", "")
+            iso_a3 = info.get("iso_a3", "")
         else:
             latitude = FILL_VALUE_FLOAT
             longitude = FILL_VALUE_FLOAT
             altitude = FILL_VALUE_FLOAT
+            country = ""
+            continent_region = ""
+            iso_a3 = ""
 
         # Write CF-1.8 compliant NetCDF
         output_file = self.output_r_dir / f'HYBAM_{station_id}.nc'
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         self.write_cf18_netcdf(station_id, station_name, river_name, latitude, longitude,
-                              altitude, upstream_area, data, output_file)
+                              altitude, upstream_area, data, output_file,
+                              country=country, continent_region=continent_region, iso_a3=iso_a3)
 
         return {
             'station_id': station_id,

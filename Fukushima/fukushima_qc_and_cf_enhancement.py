@@ -700,8 +700,8 @@ def create_netcdf_cf18(
     dataset.time_zone = OUTPUT_TIME_ZONE
     dataset.time_zone_abbreviation = OUTPUT_TIME_ZONE_ABBREVIATION
     dataset.utc_offset = OUTPUT_UTC_OFFSET
-    dataset.Temporal_Resolution = 'daily'
-    dataset.Variables_Provided = 'Q, SSC, SSL'
+    dataset.temporal_resolution = 'daily'
+    dataset.variables_provided = 'Q, SSC, SSL'
     
     # References and provenance
     dataset.references = 'DOI: 10.34355/CRiED.U.Tsukuba.00147'

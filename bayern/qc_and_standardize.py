@@ -520,9 +520,9 @@ def process_station(input_file, output_dir):
             ds.summary = f'Daily time series of river discharge, suspended sediment concentration, and sediment load for {river_name} at {station_name}, Bavaria, Germany. Data from Bayerisches Landesamt für Umwelt (Bavarian Environment Agency) monitoring network.'
             ds.source = 'In-situ station data'
             ds.data_source_name = 'Bayern State Environmental Agency (LfU) River Monitoring Network'
-            ds.Type = 'In-situ'
-            ds.Temporal_Resolution = 'daily'
-            ds.Temporal_Span = f'{dates[0].strftime("%Y-%m-%d")} to {dates[-1].strftime("%Y-%m-%d")}'
+            ds.observation_type = 'In-situ'
+            ds.temporal_resolution = 'daily'
+            ds.temporal_span = f'{dates[0].strftime("%Y-%m-%d")} to {dates[-1].strftime("%Y-%m-%d")}'
 
             # Determine which variables are provided
             vars_provided = []
@@ -534,9 +534,9 @@ def process_station(input_file, output_dir):
                 vars_provided.append('SSL')
             vars_provided_str = ', '.join(vars_provided) if vars_provided else 'none'
 
-            ds.Variables_Provided = vars_provided_str
-            ds.Geographic_Coverage = 'Bavaria, Germany'
-            ds.Reference = 'Data from Bayerisches Landesamt für Umwelt (LfU). Available at: https://www.gkd.bayern.de/en/rivers/discharge and https://www.gkd.bayern.de/en/rivers/suspended-sediment'
+            ds.variables_provided = vars_provided_str
+            ds.geographic_coverage = 'Bavaria, Germany'
+            ds.references = 'Data from Bayerisches Landesamt für Umwelt (LfU). Available at: https://www.gkd.bayern.de/en/rivers/discharge and https://www.gkd.bayern.de/en/rivers/suspended-sediment'
             ds.source_data_link = 'https://www.gkd.bayern.de/en/'
 
             # Creator information

@@ -160,8 +160,15 @@ def _normalize_one(item):
             "path_resolution": path_resolution,
             "changed": bool(result.get("changed")),
             "changed_keys": result.get("changed_keys", []),
+            "removed_keys": result.get("removed_keys", []),
             "missing_after_fix": result.get("missing_after_fix", []),
             "profile_data_source_name": profile.get("data_source_name", ""),
+            "new_dataset_name": result.get("new_dataset_name", ""),
+            "new_data_source_name": result.get("new_data_source_name", ""),
+            "old_dataset_name": result.get("old_dataset_name", ""),
+            "old_data_source_name": result.get("old_data_source_name", ""),
+            "old_source": result.get("old_source", ""),
+            "new_source": result.get("new_source", ""),
             "error": "",
         }
     except Exception as exc:
@@ -172,8 +179,15 @@ def _normalize_one(item):
             "path_resolution": path_resolution,
             "changed": False,
             "changed_keys": [],
+            "removed_keys": [],
             "missing_after_fix": [],
             "profile_data_source_name": "",
+            "new_dataset_name": "",
+            "new_data_source_name": "",
+            "old_dataset_name": "",
+            "old_data_source_name": "",
+            "old_source": "",
+            "new_source": "",
             "error": str(exc),
         }
 
@@ -187,8 +201,15 @@ def _write_report_csv(report_path, rows):
         "path",
         "changed",
         "changed_keys",
+        "removed_keys",
         "missing_after_fix",
         "profile_data_source_name",
+        "old_dataset_name",
+        "new_dataset_name",
+        "old_data_source_name",
+        "new_data_source_name",
+        "old_source",
+        "new_source",
         "error",
     ]
     with open(str(report_path), "w", newline="", encoding="utf-8") as handle:
@@ -203,8 +224,15 @@ def _write_report_csv(report_path, rows):
                     "path": row.get("path", ""),
                     "changed": int(bool(row.get("changed"))),
                     "changed_keys": "|".join(row.get("changed_keys", [])),
+                    "removed_keys": "|".join(row.get("removed_keys", [])),
                     "missing_after_fix": "|".join(row.get("missing_after_fix", [])),
                     "profile_data_source_name": row.get("profile_data_source_name", ""),
+                    "old_dataset_name": row.get("old_dataset_name", ""),
+                    "new_dataset_name": row.get("new_dataset_name", ""),
+                    "old_data_source_name": row.get("old_data_source_name", ""),
+                    "new_data_source_name": row.get("new_data_source_name", ""),
+                    "old_source": row.get("old_source", ""),
+                    "new_source": row.get("new_source", ""),
                     "error": row.get("error", ""),
                 }
             )
@@ -214,16 +242,25 @@ def _write_summary_txt(summary_path, rows, dry_run, source_root):
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     status_counter = Counter()
     changed_key_counter = Counter()
+    removed_key_counter = Counter()
     missing_key_counter = Counter()
     dataset_counter = defaultdict(Counter)
+    dataset_name_values = defaultdict(set)
+    data_source_name_values = defaultdict(set)
 
     for row in rows:
         status_counter[row.get("status", "")] += 1
         dataset_counter[row.get("dataset", "")][row.get("status", "")] += 1
         for key in row.get("changed_keys", []):
             changed_key_counter[key] += 1
+        for key in row.get("removed_keys", []):
+            removed_key_counter[key] += 1
         for key in row.get("missing_after_fix", []):
             missing_key_counter[key] += 1
+        if row.get("new_dataset_name", ""):
+            dataset_name_values[row.get("dataset", "")].add(row.get("new_dataset_name", ""))
+        if row.get("new_data_source_name", ""):
+            data_source_name_values[row.get("dataset", "")].add(row.get("new_data_source_name", ""))
 
     with open(str(summary_path), "w", encoding="utf-8") as handle:
         handle.write("fix_qc_global_attrs summary\n")
@@ -238,9 +275,23 @@ def _write_summary_txt(summary_path, rows, dry_run, source_root):
         for key, count in changed_key_counter.most_common():
             handle.write("  {0:<30s} {1}\n".format(key, count))
 
+        handle.write("\nremoved key counts\n")
+        for key, count in removed_key_counter.most_common():
+            handle.write("  {0:<30s} {1}\n".format(key, count))
+
         handle.write("\nmissing-after-fix key counts\n")
         for key, count in missing_key_counter.most_common():
             handle.write("  {0:<30s} {1}\n".format(key, count))
+
+        handle.write("\nper-dataset canonical names\n")
+        for dataset_name in sorted(dataset_name_values):
+            handle.write(
+                "  [{0}] dataset_name={1} data_source_name={2}\n".format(
+                    dataset_name,
+                    " | ".join(sorted(dataset_name_values[dataset_name])),
+                    " | ".join(sorted(data_source_name_values.get(dataset_name, []))),
+                )
+            )
 
         handle.write("\nper-dataset status counts\n")
         for dataset_name in sorted(dataset_counter):

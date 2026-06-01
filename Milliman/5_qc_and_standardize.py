@@ -356,7 +356,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ds.Source_ID = location_id
 
         # Type and resolution
-        ds.Type = "In-situ"
+        ds.observation_type = "In-situ"
 
         # Variables provided
         vars_provided = []
@@ -367,11 +367,11 @@ def standardize_netcdf_file(input_file, output_dir):
         if not np.isnan(tss_val) and tss_val != -9999.0:
             vars_provided.append("SSL")
         vars_provided_str = ", ".join(vars_provided) if vars_provided else "none"
-        ds.Variables_Provided = vars_provided_str
-        ds.Number_of_data = "1"
+        ds.variables_provided = vars_provided_str
+        ds.number_of_observations = "1"
 
         # References
-        ds.Reference = "Milliman, J.D., and Farnsworth, K.L. (2011). River Discharge to the Coastal Ocean: " \
+        ds.references = "Milliman, J.D., and Farnsworth, K.L. (2011). River Discharge to the Coastal Ocean: " \
                        "A Global Synthesis. Cambridge University Press, 392 pp.; " \
                        "Dethier, E. N., Renshaw, C. E., & Magilligan, F. J. (2022). Rapid changes to global " \
                        "river suspended sediment flux by humans. Science, 376(6600), 1447-1452."
