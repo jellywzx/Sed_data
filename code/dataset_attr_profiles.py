@@ -26,6 +26,9 @@ DEFAULT_PROFILE = {
     "default_summary": "",
     "default_comment": "",
     "default_geographic_coverage": "",
+    "default_country": "",
+    "default_continent_region": "",
+    "default_iso_a3": "",
     "default_processing_level": DEFAULT_PROCESSING_LEVEL,
     "default_feature_type": DEFAULT_FEATURE_TYPE,
 }
@@ -38,6 +41,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Upper Indus River Basin, Northern Pakistan and Western Himalayas",
+    "default_iso_a3": "PAK",
+    "default_continent_region": "Asia, South Asia",
+    "default_country": "Pakistan",
     },
     "Chao_Phraya_River": {
         "data_source_name": "Chao_Phraya_River Dataset",
@@ -45,6 +51,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Chao Phraya River Basin, Thailand",
+    "default_iso_a3": "THA",
+    "default_continent_region": "Asia, Southeast Asia",
+    "default_country": "Thailand",
     },
     "Dethier": {
         "data_source_name": "Dethier glacier-fed rivers dataset",
@@ -65,6 +74,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Eurasian Arctic river basins",
+    "default_iso_a3": "RUS",
+    "default_continent_region": "Europe, Eastern Europe",
+    "default_country": "Russia",
     },
     "Fukushima": {
         "data_source_name": "Fukushima Niida River Dataset",
@@ -72,6 +84,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Niida River Basin, Fukushima Prefecture, Japan",
+    "default_iso_a3": "JPN",
+    "default_continent_region": "Asia, East Asia",
+    "default_country": "Japan",
     },
     "GFQA_v2": {
         "data_source_name": "Global Flow and Water Quality Archive v2",
@@ -98,6 +113,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "High Mountain Asia",
+        "default_country": "China",
+        "default_continent_region": "Asia, East Asia",
+        "default_iso_a3": "CHN",
         "default_comment": "Mean annual climatology derived from source observations.",
     },
     "HYBAM": {
@@ -112,6 +130,9 @@ DATASET_PROFILES = {
         "source_data_link": "https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html",
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
+    "default_country": "Canada",
+    "default_continent_region": "North America",
+    "default_iso_a3": "CAN",
     },
     "Huanghe": {
         "data_source_name": "Yellow River Sediment Bulletin Dataset",
@@ -119,6 +140,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Yellow River Basin, China",
+    "default_iso_a3": "CHN",
+    "default_continent_region": "Asia, East Asia",
+    "default_country": "China",
         "default_comment": "Annual average SSC observations; discharge and sediment load are not provided in the source dataset.",
     },
     "Hydat": {
@@ -126,6 +150,9 @@ DATASET_PROFILES = {
         "source_data_link": "https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html",
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
+    "default_country": "Canada",
+    "default_continent_region": "North America",
+    "default_iso_a3": "CAN",
     },
     "Mekong_Delta": {
         "data_source_name": "Mekong Delta (Darby et al., 2020)",
@@ -133,6 +160,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Mekong River Delta, Vietnam",
+    "default_iso_a3": "VNM",
+    "default_continent_region": "Asia, Southeast Asia",
+    "default_country": "Vietnam",
     },
     "Milliman": {
         "data_source_name": "Milliman & Farnsworth Global River Sediment Database",
@@ -146,6 +176,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Irrawaddy and Salween Rivers, Myanmar",
+    "default_iso_a3": "MMR",
+    "default_continent_region": "Asia, Southeast Asia",
+    "default_country": "Myanmar",
     },
     "NERC": {
         "data_source_name": "NERC Hampshire Avon Dataset",
@@ -153,6 +186,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Hampshire Avon Basin, Southern England, UK",
+    "default_iso_a3": "GBR",
+    "default_continent_region": "Europe, Western Europe",
+    "default_country": "United Kingdom",
     },
     "Rhine": {
         "data_source_name": "Rhine Dataset",
@@ -160,6 +196,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Rhine River Basin",
+        "default_country": "Germany",
+        "default_continent_region": "Europe",
+        "default_iso_a3": "DEU",
     },
     "RiverSed": {
         "data_source_name": "RiverSed / Aquasat (satellite-derived TSS)",
@@ -167,6 +206,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_SATELLITE,
         "default_source": "Satellite-derived TSS from Aquasat/RiverSed database",
         "default_comment": "TSS values derived from Landsat satellite imagery.",
+    "default_country": "United States",
+    "default_continent_region": "North America",
+    "default_iso_a3": "USA",
     },
     "Robotham": {
         "data_source_name": "Robotham et al. (2022)",
@@ -174,6 +216,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Littlestock Brook, England",
+    "default_iso_a3": "GBR",
+    "default_continent_region": "Europe, Western Europe",
+    "default_country": "United Kingdom",
     },
     "Shashi_Jianli": {
         "data_source_name": "Shashi_Jianli Dataset",
@@ -181,12 +226,18 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Yangtze River Basin, China",
+    "default_iso_a3": "CHN",
+    "default_continent_region": "Asia, East Asia",
+    "default_country": "China",
     },
     "USGS": {
         "data_source_name": "USGS NWIS",
         "source_data_link": "https://waterdata.usgs.gov/nwis",
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
+    "default_country": "United States",
+    "default_continent_region": "North America",
+    "default_iso_a3": "USA",
     },
     "Vanmaercke": {
         "data_source_name": "Vanmaercke et al. (2014) African Sediment Yield Database",
@@ -200,6 +251,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Yarlung Tsangpo River Basin, China",
+    "default_iso_a3": "CHN",
+    "default_continent_region": "Asia, East Asia",
+    "default_country": "China",
     },
     "bayern": {
         "data_source_name": "Bayern State Environmental Agency (LfU) River Monitoring Network",
@@ -207,6 +261,9 @@ DATASET_PROFILES = {
         "default_observation_type": OBS_IN_SITU,
         "default_source": SOURCE_IN_SITU,
         "default_geographic_coverage": "Bavaria, Germany",
+    "default_country": "Germany",
+    "default_continent_region": "Europe, Central Europe",
+    "default_iso_a3": "DEU",
     },
 }
 

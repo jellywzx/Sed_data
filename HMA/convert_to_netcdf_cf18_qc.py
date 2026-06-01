@@ -307,6 +307,12 @@ def extract_source_id(station_name):
     return None
 
 
+STATION_COUNTRY = {
+    "S12": ("Pakistan", "Asia, South Asia", "PAK"),
+    "S13": ("Pakistan", "Asia, South Asia", "PAK"),
+}
+
+
 def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     """
     Create a CF-1.8 compliant NetCDF file for a single station with QC
@@ -557,6 +563,16 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     nc.geospatial_vertical_min = -9999.0
     nc.geospatial_vertical_max = -9999.0
     nc.geographic_coverage = f"{basin_name}, High Mountain Asia"
+
+    # Geographic metadata
+    if source_id in STATION_COUNTRY:
+        nc.country = STATION_COUNTRY[source_id][0]
+        nc.continent_region = STATION_COUNTRY[source_id][1]
+        nc.iso_a3 = STATION_COUNTRY[source_id][2]
+    else:
+        nc.country = "China"
+        nc.continent_region = "Asia, East Asia"
+        nc.iso_a3 = "CHN"
 
     # Time coverage
     nc.time_coverage_start = f"{start_year}-01-01"

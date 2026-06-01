@@ -53,6 +53,7 @@ from code.qc import (
     compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
 )
+from code.global_attrs import COUNTRY_METADATA
 from code.runtime import resolve_output_root, resolve_source_root
 from code.units import convert_ssl_units_if_needed
 
@@ -444,6 +445,13 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     # --------------------------
     ds.altitude = altitude
     ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
+
+    # Geographic metadata
+    country_name = str(station_row.get('Country Name', '')).strip()
+    country_meta = COUNTRY_METADATA.get(country_name, {})
+    ds.country = country_name
+    ds.continent_region = country_meta.get('continent_region', '')
+    ds.iso_a3 = country_meta.get('iso_a3', '')
 
     ds.Conventions = 'CF-1.8'
     ds.title = f'GFQA Daily Observed Sediment and Discharge Data for Station {station_id}'
