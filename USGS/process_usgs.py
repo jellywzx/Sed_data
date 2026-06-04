@@ -21,7 +21,10 @@ from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
-from code.plot import plot_ssc_q_diagnostic
+try:
+    from code.plot import plot_ssc_q_diagnostic
+except Exception:
+    plot_ssc_q_diagnostic = None
 from code.qc import (
     apply_quality_flag,
     build_ssc_q_envelope,
@@ -55,7 +58,9 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None, station_name=None):
     SSC = np.atleast_1d(out["SSC"].values).reshape(-1)
 
     # ---- SSL derived from Q * SSC (ton/day)
-    SSL = Q * SSC * 0.0864
+    SSL = np.full(Q.shape, np.nan, dtype=float)
+    valid_ssl = np.isfinite(Q) & np.isfinite(SSC) & (Q >= 0) & (SSC >= 0)
+    SSL[valid_ssl] = Q[valid_ssl] * SSC[valid_ssl] * 0.0864
 
     # ---- Build kwargs and filter by tool signature (avoid unexpected keyword errors)
     qc_kwargs = dict(
@@ -324,7 +329,14 @@ def process_single_station(args):
             return {'status': 'skipped', 'station_id': station_id, 'reason': 'all overlapping values invalid'}
 
         # Compute SSL (ton/day)
-        df['SSL'] = df['Q'] * df['SSC'] * 0.0864
+        valid_ssl = (
+            np.isfinite(df["Q"])
+            & np.isfinite(df["SSC"])
+            & (df["Q"] >= 0)
+            & (df["SSC"] >= 0)
+        )
+        df["SSL"] = np.nan
+        df.loc[valid_ssl, "SSL"] = df.loc[valid_ssl, "Q"] * df.loc[valid_ssl, "SSC"] * 0.0864
 
         # --------------------------------------------------
         # Apply unified QC (tool.py)

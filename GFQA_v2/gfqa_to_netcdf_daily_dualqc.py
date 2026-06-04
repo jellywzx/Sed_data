@@ -43,7 +43,10 @@ from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
-from code.plot import plot_ssc_q_diagnostic
+try:
+    from code.plot import plot_ssc_q_diagnostic
+except Exception:
+    plot_ssc_q_diagnostic = None
 from code.qc import (
     apply_hydro_qc_with_provenance,
     apply_quality_flag,
@@ -82,10 +85,10 @@ def clean_value(value):
     try:
         val = float(str(value).replace(',', '.'))
         if np.isnan(val) or val < 0:
-            return -9999.0
+            return np.nan
         return val
     except Exception:
-        return -9999.0
+        return np.nan
 
 def log_station_qc(station_id, station_name, n_samples,
                    skipped_log_iqr, skipped_ssc_q,
@@ -239,8 +242,8 @@ def parse_lat_lon(station_row):
 # ==========================================================
 def calculate_sediment_load(q, ssc):
     """计算每日泥沙通量 (ton/day)"""
-    if q == -9999.0 or ssc == -9999.0:
-        return -9999.0
+    if pd.isna(q) or pd.isna(ssc) or q < 0 or ssc < 0:
+        return np.nan
     return q * ssc * 0.0864
 
 def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, output_dir):
@@ -338,9 +341,9 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     ssl_var.long_name = 'suspended sediment load'
     ssl_var.coordinates = "latitude longitude altitude"
 
-    q_var[:] = discharge
-    ssc_var[:] = ssc
-    ssl_var[:] = ssl
+    q_var[:] = np.where(np.isfinite(discharge), discharge, -9999.0)
+    ssc_var[:] = np.where(np.isfinite(ssc), ssc, -9999.0)
+    ssl_var[:] = np.where(np.isfinite(ssl), ssl, -9999.0)
 
     # --------------------------
     # flags: final
@@ -510,12 +513,19 @@ def process_one_station(args):
         if merged.empty:
             return None, None, f"Skipped {station_id}: no same-day data"
 
-        merged['SSL'] = merged['Clean_Value_Q'] * merged['Clean_Value_SSC'] * 0.0864
+        Q_arr = merged["Clean_Value_Q"].to_numpy(dtype=float)
+        SSC_arr = merged["Clean_Value_SSC"].to_numpy(dtype=float)
+        SSL_arr = np.full(len(merged), np.nan, dtype=float)
+        valid_ssl = (
+            np.isfinite(Q_arr)
+            & np.isfinite(SSC_arr)
+            & (Q_arr >= 0)
+            & (SSC_arr >= 0)
+        )
+        SSL_arr[valid_ssl] = Q_arr[valid_ssl] * SSC_arr[valid_ssl] * 0.0864
+        merged["SSL"] = SSL_arr
 
-        time_arr = pd.to_datetime(merged['Date']).values
-        Q_arr = merged['Clean_Value_Q'].to_numpy(dtype=float)
-        SSC_arr = merged['Clean_Value_SSC'].to_numpy(dtype=float)
-        SSL_arr = merged['SSL'].to_numpy(dtype=float)
+        time_arr = pd.to_datetime(merged["Date"]).values
 
         qc = apply_hydro_qc_with_provenance(
             time=time_arr,
@@ -576,7 +586,7 @@ def process_one_station(args):
 
         ssc_q_bounds = qc.get("ssc_q_bounds", None)
 
-        if ssc_q_bounds is not None:
+        if ssc_q_bounds is not None and plot_ssc_q_diagnostic is not None:
             plot_dir = Path(output_dir) / "diagnostic"
             plot_dir.mkdir(exist_ok=True)
 
