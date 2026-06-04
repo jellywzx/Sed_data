@@ -340,7 +340,29 @@ def standardize_netcdf_file(input_file, output_dir):
                                "3=Bad (e.g., negative), 9=Missing in source."
         ssl_flag_var[:] = [ssl_flag]
 
-        # Global attributes - CF-1.8 and ACDD-1.3 compliant
+        # --- Step-level QC provenance flags ---
+        def _add_step_flag(name, val, fvals, fmean, lname):
+            v = ds.createVariable(name, "b", ("time",), fill_value=FILL_VALUE_INT)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray([val], dtype=np.int8)
+
+        _add_step_flag('Q_flag_qc1_physical', q_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge')
+        _add_step_flag('Q_flag_qc2_log_iqr', q_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge')
+        _add_step_flag('SSC_flag_qc1_physical', ssc_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration')
+        _add_step_flag('SSC_flag_qc2_log_iqr', ssc_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration')
+        _add_step_flag('SSC_flag_qc3_ssc_q', ssc_qc3, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration')
+        _add_step_flag('SSL_flag_qc1_physical', ssl_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load')
+        _add_step_flag('SSL_flag_qc2_log_iqr', ssl_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load')
+        _add_step_flag('SSL_flag_qc3_from_ssc_q', ssl_qc3, [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load')
+
+        Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+        SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+        SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+
         ds.Conventions = "CF-1.8, ACDD-1.3"
         ds.title = "Harmonized Global River Discharge and Sediment"
         ds.summary = f"Long-term average discharge and suspended sediment data for {river_name} " \

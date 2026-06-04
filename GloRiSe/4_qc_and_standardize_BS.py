@@ -180,10 +180,36 @@ def apply_tool_qc(discharge, ssc, ssl, return_envelope=True):
     ssl_flag[inherited] = 2
     qc_report["SSL_inherited_suspect"] = int(np.sum(inherited))
 
+    # --- Step-level QC provenance arrays ---
+    q_flag_qc1   = np.array([apply_quality_flag(v, "Q") for v in discharge], dtype=np.int8)
+    ssc_flag_qc1 = np.array([apply_quality_flag(v, "SSC") for v in ssc], dtype=np.int8)
+    ssl_flag_qc1 = np.array([apply_quality_flag(v, "SSL") for v in ssl], dtype=np.int8)
+
+    q_flag_qc2 = np.full(n, np.int8(8), dtype=np.int8)
+    ssc_flag_qc2 = np.full(n, np.int8(8), dtype=np.int8)
+    ssl_flag_qc2 = ssl_flag_qc1.copy()
+    if lower is not None:
+        ssl_flag_qc2[outlier] = 2
+
+    ssc_flag_qc3 = np.full(n, np.int8(8), dtype=np.int8)
+    if ssc_q_bounds is not None:
+        for i in range(n):
+            bad, _ = check_ssc_q_consistency(
+                Q=discharge[i], SSC=ssc[i],
+                Q_flag=q_flag[i], SSC_flag=ssc_flag[i],
+                ssc_q_bounds=ssc_q_bounds
+            )
+            if bad:
+                ssc_flag_qc3[i] = 2
+        ssc_flag_qc3[(ssc_flag_qc1 == 0) & (ssc_flag_qc3 == 8)] = 0
+
+    ssl_flag_qc3 = np.full(n, np.int8(8), dtype=np.int8)
+    ssl_flag_qc3[(ssl_flag_qc1 == 0) & (ssc_flag_qc3 != 2)] = 0
+
     if return_envelope:
-        return q_flag, ssc_flag, ssl_flag, ssc_q_bounds, qc_report
+        return q_flag, ssc_flag, ssl_flag, ssc_q_bounds, qc_report,                q_flag_qc1, q_flag_qc2,                ssc_flag_qc1, ssc_flag_qc2, ssc_flag_qc3,                ssl_flag_qc1, ssl_flag_qc2, ssl_flag_qc3
     else:
-        return q_flag, ssc_flag, ssl_flag, qc_report
+        return q_flag, ssc_flag, ssl_flag, qc_report,                q_flag_qc1, q_flag_qc2,                ssc_flag_qc1, ssc_flag_qc2, ssc_flag_qc3,                ssl_flag_qc1, ssl_flag_qc2, ssl_flag_qc3
 
 
 def get_valid_time_range(discharge, ssc, ssl, time_values):

@@ -199,7 +199,7 @@ def process_one_file(input_path):
             return False
 
         # 质量控制：仅 apply_quality_flag（calculate_ssc 已在变量统一时用于推导 SSC）
-        q_flag, ssc_flag, ssl_flag = apply_qc_flags_only(Q, SSC, SSL)
+        q_flag, ssc_flag, ssl_flag, q_qc1, ssc_qc1, ssl_qc1 = apply_qc_flags_only(Q, SSC, SSL)
 
         lat = _get_coord(ds_in, 'lat') if 'lat' in ds_in.variables else _get_coord(ds_in, 'latitude')
         lon = _get_coord(ds_in, 'lon') if 'lon' in ds_in.variables else _get_coord(ds_in, 'longitude')
@@ -265,7 +265,7 @@ def process_one_file(input_path):
         Q = np.array([_mean_valid(Q)], dtype=np.float32)
         SSC = np.array([_mean_valid(SSC)], dtype=np.float32)
         SSL = np.array([_mean_valid(SSL)], dtype=np.float32)
-        q_flag, ssc_flag, ssl_flag = apply_qc_flags_only(Q, SSC, SSL)
+        q_flag, ssc_flag, ssl_flag, q_qc1, ssc_qc1, ssl_qc1 = apply_qc_flags_only(Q, SSC, SSL)
 
         dim_list = ["time"]
         n = 1
@@ -362,6 +362,37 @@ def process_one_file(input_path):
         ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
         ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         ssl_flag_var[:] = ssl_flag
+
+        # --- Step-level QC provenance flags ---
+        def _add_step_flag(nm, values, flag_values, flag_meanings, long_name):
+            v = ds_out.createVariable(nm, 'b', (dim_list[0],), fill_value=FILL_VALUE_INT)
+            v.long_name = long_name
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(flag_values, dtype=np.int8)
+            v.flag_meanings = flag_meanings
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray(values, dtype=np.int8)
+
+        _add_step_flag('Q_flag_qc1_physical', q_qc1,
+            [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge')
+        _add_step_flag('SSC_flag_qc1_physical', ssc_qc1,
+            [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration')
+        _add_step_flag('SSL_flag_qc1_physical', ssl_qc1,
+            [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load')
+        _add_step_flag('Q_flag_qc2_log_iqr', np.full(n, np.int8(8), dtype=np.int8),
+            [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge')
+        _add_step_flag('SSC_flag_qc2_log_iqr', np.full(n, np.int8(8), dtype=np.int8),
+            [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration')
+        _add_step_flag('SSL_flag_qc2_log_iqr', np.full(n, np.int8(8), dtype=np.int8),
+            [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load')
+        _add_step_flag('SSC_flag_qc3_ssc_q', np.full(n, np.int8(8), dtype=np.int8),
+            [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration')
+        _add_step_flag('SSL_flag_qc3_from_ssc_q', np.full(n, np.int8(8), dtype=np.int8),
+            [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load')
+
+        q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+        ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+        ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
         # 若原文件有 Sand/Silt/Clay 等，复制到输出（保持兼容）
         for vname in ('Sand_perc', 'Silt_perc', 'Clay_perc'):
