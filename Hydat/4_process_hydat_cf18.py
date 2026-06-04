@@ -431,6 +431,53 @@ class HYDATQualityControl:
                     var_SSL_flag.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                     var_SSL_flag[:] = SSL_flag
 
+                    # --- Step-level QC provenance flags ---
+                    def _add_step_flag(name, arr, *, flag_values, flag_meanings, long_name):
+                        if arr is None:
+                            return
+                        v = ds_out.createVariable(name, 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+                        v.long_name = long_name
+                        v.standard_name = 'status_flag'
+                        v.flag_values = np.array(flag_values, dtype=np.int8)
+                        v.flag_meanings = flag_meanings
+                        v.missing_value = np.int8(FILL_VALUE_INT)
+                        v[:] = np.asarray(arr, dtype=np.int8)
+
+                    # Q steps: qc1, qc2
+                    _add_step_flag('Q_flag_qc1_physical', qc.get('Q_flag_qc1_physical'),
+                        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                        long_name='QC1 physical flag for river discharge')
+                    _add_step_flag('Q_flag_qc2_log_iqr', qc.get('Q_flag_qc2_log_iqr'),
+                        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                        long_name='QC2 log-IQR flag for river discharge')
+
+                    # SSC steps: qc1, qc2, qc3
+                    _add_step_flag('SSC_flag_qc1_physical', qc.get('SSC_flag_qc1_physical'),
+                        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                        long_name='QC1 physical flag for suspended sediment concentration')
+                    _add_step_flag('SSC_flag_qc2_log_iqr', qc.get('SSC_flag_qc2_log_iqr'),
+                        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                        long_name='QC2 log-IQR flag for suspended sediment concentration')
+                    _add_step_flag('SSC_flag_qc3_ssc_q', qc.get('SSC_flag_qc3_ssc_q'),
+                        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                        long_name='QC3 SSC-Q consistency flag for suspended sediment concentration')
+
+                    # SSL steps: qc1, qc2, qc3
+                    _add_step_flag('SSL_flag_qc1_physical', qc.get('SSL_flag_qc1_physical'),
+                        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                        long_name='QC1 physical flag for suspended sediment load')
+                    _add_step_flag('SSL_flag_qc2_log_iqr', qc.get('SSL_flag_qc2_log_iqr'),
+                        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                        long_name='QC2 log-IQR flag for suspended sediment load')
+                    _add_step_flag('SSL_flag_qc3_from_ssc_q', qc.get('SSL_flag_qc3_from_ssc_q'),
+                        flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+                        long_name='QC3 propagation flag for suspended sediment load')
+
+                    # Update ancillary_variables to include step flags
+                    var_Q.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+                    var_SSC.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+                    var_SSL.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+
                     # 设置全局属性
                     ds_out.Conventions = 'CF-1.8, ACDD-1.3'
                     ds_out.title = 'Harmonized Global River Discharge and Sediment'

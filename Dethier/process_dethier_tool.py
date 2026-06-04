@@ -579,6 +579,14 @@ def process_single_netcdf(nc_path: str, output_dir: str) -> dict | None:
             "ancillary_variables": f"{var_name}_flag",
         })
 
+    # Update ancillary_variables to include step flags that exist
+    if "Q_flag_qc1_physical" in df_final.columns:
+        ds_out["Q"].attrs["ancillary_variables"] += " Q_flag_qc1_physical Q_flag_qc2_log_iqr"
+    if "SSC_flag_qc1_physical" in df_final.columns:
+        ds_out["SSC"].attrs["ancillary_variables"] += " SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q"
+    if "SSL_flag_qc1_physical" in df_final.columns:
+        ds_out["SSL"].attrs["ancillary_variables"] += " SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q"
+
     # Flag 变量（CF-1.8 样式）
     flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
     flag_values = np.array([FLAG_GOOD, FLAG_EST, FLAG_SUSPECT, FLAG_BAD, FLAG_MISS], dtype=np.int8)

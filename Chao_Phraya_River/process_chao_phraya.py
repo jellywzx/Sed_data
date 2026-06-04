@@ -223,7 +223,7 @@ def apply_station_level_qc(station_df):
 
 
 
-def create_netcdf_file(station_id, event_id, meta, data, output_dir):
+def create_netcdf_file(station_id, event_id, meta, data, output_dir, qc_steps=None):
     """Creates a CF-1.8 compliant NetCDF file for a station."""
     filename = f"{DATASET_NAME.replace(' ', '_')}_{station_id.replace('.', '_')}.nc"
     filepath = os.path.join(output_dir, filename)
@@ -327,6 +327,55 @@ def create_netcdf_file(station_id, event_id, meta, data, output_dir):
         create_variable('SSL', 'suspended_sediment_load', 'Suspended Sediment Load', 'ton day-1',
                         f"Calculated from Mt/a. Formula: SSL * {MT_TO_TON} / {DAYS_PER_YEAR}",
                         data['SSL'], data['SSL_flag'])
+
+        # --- Step-level QC provenance flags ---
+        def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
+            if values is None or len(values) == 0:
+                return
+            v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
+            v.long_name = long_name
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(flag_values, dtype=np.int8)
+            v.flag_meanings = flag_meanings
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray(values, dtype=np.int8)
+            return v
+
+        if qc_steps:
+            # Q steps: qc1, qc2
+            _add_step_flag('Q_flag_qc1_physical', qc_steps.get('Q_qc1'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for river discharge')
+            _add_step_flag('Q_flag_qc2_log_iqr', qc_steps.get('Q_qc2'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for river discharge')
+
+            # SSC steps: qc1, qc2, qc3
+            _add_step_flag('SSC_flag_qc1_physical', qc_steps.get('SSC_qc1'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for suspended sediment concentration')
+            _add_step_flag('SSC_flag_qc2_log_iqr', qc_steps.get('SSC_qc2'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for suspended sediment concentration')
+            _add_step_flag('SSC_flag_qc3_ssc_q', qc_steps.get('SSC_qc3'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC3 SSC-Q consistency flag for suspended sediment concentration')
+
+            # SSL steps: qc1, qc2, qc3
+            _add_step_flag('SSL_flag_qc1_physical', qc_steps.get('SSL_qc1'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for suspended sediment load')
+            _add_step_flag('SSL_flag_qc2_log_iqr', qc_steps.get('SSL_qc2'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for suspended sediment load')
+            _add_step_flag('SSL_flag_qc3_from_ssc_q', qc_steps.get('SSL_qc3_prop'),
+                flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+                long_name='QC3 propagation flag for suspended sediment load')
+
+            # Update ancillary_variables to include step flags
+            ds.variables['Q'].ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+            ds.variables['SSC'].ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+            ds.variables['SSL'].ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
     print(f"  -> Saved: {filepath}")
 
@@ -504,7 +553,7 @@ def main():
                  print(f"  Skipping {meta['station_id']}: No data in range.")
                  continue
 
-            create_netcdf_file(meta['station_id'], event, meta, station_data, OUTPUT_DIR)
+            create_netcdf_file(meta['station_id'], event, meta, station_data, OUTPUT_DIR, qc_steps=station_data.attrs.get('qc_steps', {}))
             
             # -------------------------
             # Build stations_info row for CSV summaries

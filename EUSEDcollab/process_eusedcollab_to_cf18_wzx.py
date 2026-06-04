@@ -439,6 +439,37 @@ def qc_with_toolpy(
     out["SSC_flag"] = SSC_flag.astype(np.int8)
     out["SSL_flag"] = SSL_flag.astype(np.int8)
 
+    # --- Save step-level QC provenance arrays ---
+    # QC1 physical: the initial flags before any QC2/QC3 modifications
+    # (recomputed from the same apply_quality_flag logic)
+    out["Q_flag_qc1_physical"]   = np.array([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+    out["SSC_flag_qc1_physical"] = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+    out["SSL_flag_qc1_physical"] = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+
+    # QC2 log-IQR: start from QC1 pass (0), mark QC2-applied points
+    q_qc2   = out["Q_flag_qc1_physical"].copy()
+    ssc_qc2 = out["SSC_flag_qc1_physical"].copy()
+    ssl_qc2 = out["SSL_flag_qc1_physical"].copy()
+
+    # QC2 for SSC
+    if ssc_lb is not None:
+        bad_ssc_qc2 = np.isfinite(SSC) & (SSC > 0) & ((SSC < ssc_lb) | (SSC > ssc_ub))
+        ssc_qc2 = np.where(bad_ssc_qc2 & (ssc_qc2 == 0), np.int8(2), ssc_qc2)
+    out["SSC_flag_qc2_log_iqr"] = ssc_qc2
+
+    # QC2 for SSL
+    if ssl_lb is not None:
+        bad_ssl_qc2 = np.isfinite(SSL) & (SSL > 0) & ((SSL < ssl_lb) | (SSL > ssl_ub))
+        ssl_qc2 = np.where(bad_ssl_qc2 & (ssl_qc2 == 0), np.int8(2), ssl_qc2)
+    out["SSL_flag_qc2_log_iqr"] = ssl_qc2
+
+    # Q has no independently computed QC2 in this function, mark as not_checked (8)
+    out["Q_flag_qc2_log_iqr"] = np.full(len(out), np.int8(8), dtype=np.int8)
+
+    # QC3 SSC-Q and SSL propagation: will be filled below after envelope check
+    out["SSC_flag_qc3_ssc_q"] = np.full(len(out), np.int8(8), dtype=np.int8)
+    out["SSL_flag_qc3_from_ssc_q"] = np.full(len(out), np.int8(8), dtype=np.int8)
+
     # build SSC–Q envelope (may return None if not enough samples)
     ssc_q_bounds = build_ssc_q_envelope(
         Q_m3s=out["Q"].to_numpy(dtype=float),
@@ -466,8 +497,20 @@ def qc_with_toolpy(
             )
             # resid could be None
             resid_arr[i] = np.nan if resid is None else float(resid)
+            if inconsistent:
+                out.at[out.index[i], "SSC_flag_qc3_ssc_q"] = np.int8(2)
+        # If QC3 was applied, mark non-suspect as pass (0) where QC1 was pass
+        out["SSC_flag_qc3_ssc_q"] = np.where(
+            (out["SSC_flag_qc1_physical"].values == 0) & (out["SSC_flag_qc3_ssc_q"].values == 8),
+            np.int8(0), out["SSC_flag_qc3_ssc_q"].values
+        )
 
     out["ssc_q_resid"] = resid_arr
+    # Flag3 SSL propagation: mark as not_propagated (0) where QC1 pass, else keep 8
+    out["SSL_flag_qc3_from_ssc_q"] = np.where(
+        out["SSL_flag_qc1_physical"].values == 0,
+        np.int8(0), out["SSL_flag_qc3_from_ssc_q"].values
+    )
     # ----------------------------
     # 5) diagnostic plot
     # ----------------------------
@@ -832,7 +875,7 @@ def process_station(station_id, country):
 
     # Create NetCDF file
     output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
-    write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file)
+    write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=df)
     # ---- Print QC result summary (station-level) ----
     def _repr_val_and_flag(val_arr, flag_arr):
         v = np.asarray(val_arr, dtype=float)
@@ -907,7 +950,7 @@ def process_station(station_id, country):
     return station_info
 
 
-def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
+def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=None):
     """
     Write CF-1.8 compliant NetCDF file
     """
@@ -1053,6 +1096,51 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         ssl_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         ssl_flag_var[:] = ssl_flag
+
+        # --- Step-level QC provenance flags ---
+        def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
+            if values is None:
+                return
+            v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
+            v.long_name = long_name
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(flag_values, dtype=np.int8)
+            v.flag_meanings = flag_meanings
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray(values, dtype=np.int8)
+
+        if step_flags:
+            _add_step_flag('Q_flag_qc1_physical', step_flags.get('Q_flag_qc1_physical'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for river discharge')
+            _add_step_flag('Q_flag_qc2_log_iqr', step_flags.get('Q_flag_qc2_log_iqr'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for river discharge')
+
+            _add_step_flag('SSC_flag_qc1_physical', step_flags.get('SSC_flag_qc1_physical'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for suspended sediment concentration')
+            _add_step_flag('SSC_flag_qc2_log_iqr', step_flags.get('SSC_flag_qc2_log_iqr'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for suspended sediment concentration')
+            _add_step_flag('SSC_flag_qc3_ssc_q', step_flags.get('SSC_flag_qc3_ssc_q'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC3 SSC-Q consistency flag for suspended sediment concentration')
+
+            _add_step_flag('SSL_flag_qc1_physical', step_flags.get('SSL_flag_qc1_physical'),
+                flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+                long_name='QC1 physical flag for suspended sediment load')
+            _add_step_flag('SSL_flag_qc2_log_iqr', step_flags.get('SSL_flag_qc2_log_iqr'),
+                flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+                long_name='QC2 log-IQR flag for suspended sediment load')
+            _add_step_flag('SSL_flag_qc3_from_ssc_q', step_flags.get('SSL_flag_qc3_from_ssc_q'),
+                flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+                long_name='QC3 propagation flag for suspended sediment load')
+
+            # Update ancillary_variables to include step flags
+            q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+            ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+            ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
         # =================================================================
         # Global Attributes

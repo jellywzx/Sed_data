@@ -641,6 +641,41 @@ def create_netcdf_cf18(
     SSL_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source. Inherits flags from Q and SSC.'
     SSL_flag_var[:] = data['SSL_flag'].values
     
+    # --- Step-level QC provenance flags ---
+    # Note: The ancillary_variables already reference these names; we just need to create them.
+    # QC1: map from Q_qc1_physical-style names to Q_flag_qc1_physical-style NC names
+    _QC1_COL_MAP = {
+        'Q_flag_qc1_physical': ('Q_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
+        'SSC_flag_qc1_physical': ('SSC_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
+        'SSL_flag_qc1_physical': ('SSL_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
+    }
+    # QC2/QC3: the prov dict keys already match the NC names (e.g. Q_flag_qc2_log_iqr)
+    _QC23_SPECS = [
+        ('Q_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
+        ('SSC_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
+        ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
+        ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
+        ('SSL_flag_qc3_from_ssc_q', [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+    ]
+    for nc_name, (col_name, fvals, fmean, lname) in _QC1_COL_MAP.items():
+        if col_name in data.columns:
+            v = dataset.createVariable(nc_name, 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = data[col_name].values.astype(np.int8)
+    for nc_name, fvals, fmean, lname in _QC23_SPECS:
+        if nc_name in data.columns:
+            v = dataset.createVariable(nc_name, 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = data[nc_name].values.astype(np.int8)
+    
     # Global attributes - CF-1.8 and ACDD-1.3 compliant
     dataset.Conventions = 'CF-1.8, ACDD-1.3'
     dataset.title = 'Harmonized Global River Discharge and Sediment'
