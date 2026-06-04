@@ -2,12 +2,37 @@
 """
 Top-level dataset runner for the sediment processing repository.
 
+Usage
+-----
+  # List all available datasets and their stages
+  python run_pipeline.py --list
+
+  # Run one or more specific datasets
+  python run_pipeline.py USGS
+  python run_pipeline.py USGS GSED HYBAM
+
+  # Run all datasets in manifest order
+  python run_pipeline.py --all
+
+  # Dry-run: print commands without executing them
+  python run_pipeline.py --all --dry-run
+
+  # Include optional post-run stages (validation, summarization, etc.)
+  python run_pipeline.py USGS --include-optional
+
+  # Override default output directory
+  python run_pipeline.py USGS --output-root /path/to/custom_output
+
+  # Use a specific Python interpreter for stage scripts
+  python run_pipeline.py --all --python /usr/bin/python3
+
 Features
 --------
 - Lists canonical stage order for each dataset
 - Runs one dataset or all datasets from a single entry point
 - Supports dry-run mode for reproducible planning
 - Allows overriding the output root via SEDIMENT_OUTPUT_ROOT / --output-root
+  or the --output-root flag
 """
 
 import argparse
