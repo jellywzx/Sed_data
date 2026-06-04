@@ -8,9 +8,9 @@ into CF-1.8 compliant NetCDF files with quality control flags and comprehensive 
 Data Processing Steps:
 1. Read original CSV data (Q_SSL and METADATA files)
 2. Convert units:
-   - Q: m³/day → m³/s (÷ 86400)
-   - SSC: kg/m³ → mg/L (× 1,000,000)
-   - SSL: kg/day → ton/day (÷ 1000)
+   - Q: m³/day, m³/month, m³/event, m³/timestep → m³/s
+   - SSC: kg/m³ → mg/L (× 1,000); g/m³ → mg/L (× 1)
+   - SSL: kg/day, kg/month, kg/event, kg/timestep → ton/day
 3. Apply quality control checks and create quality flags
 4. Trim time series to valid data range
 5. Write CF-1.8 compliant NetCDF files
@@ -122,52 +122,51 @@ def detect_and_convert_columns(df):
         SSL -> ton/day
     Handles: daily, monthly, instantaneous, event-based data
     """
-
     df = df.copy()
 
-    if 'date' in df.columns:
-        days_in_month = df['date'].dt.days_in_month
-    else:
-        days_in_month = None
+    days_in_month = df['date'].dt.days_in_month if 'date' in df.columns else None
+    duration_days = _event_duration_days(df)
+    timestep_seconds = _timestep_seconds(df)
 
     # ---- Q ----
-    q_col = next((c for c in df.columns if c.lower().startswith('q') and '(' in c.lower()), None)
+    q_col = _select_q_column(df)
 
     if q_col:
         col = q_col.lower()
+        values = pd.to_numeric(df[q_col], errors='coerce')
 
         if 'event' in col:
-            df['Q_event'] = pd.to_numeric(df[q_col], errors='coerce')
+            df['Q'] = values / (duration_days * 86400.0)
 
         elif 'm-1' in col and days_in_month is not None:
-            df['Q'] = pd.to_numeric(df[q_col], errors='coerce') / (days_in_month * 86400.0)
+            df['Q'] = values / (days_in_month * 86400.0)
 
         elif 'd-1' in col:
-            df['Q'] = pd.to_numeric(df[q_col], errors='coerce') / 86400.0
+            df['Q'] = values / 86400.0
 
-        elif 's-1' in col or 'ts-1' in col or '/s' in col:
-            df['Q'] = pd.to_numeric(df[q_col], errors='coerce')
+        elif 'ts-1' in col:
+            df['Q'] = values / timestep_seconds
+
+        elif 's-1' in col or '/s' in col:
+            df['Q'] = values
 
         else:
-            df['Q'] = pd.to_numeric(df[q_col], errors='coerce')
+            df['Q'] = values
     else:
         df['Q'] = np.nan
 
     # ---- SSC ----
-    ssc_col = next((c for c in df.columns if 'ssc' in c.lower() or 'turbidity' in c.lower()), None)
+    ssc_col = _select_ssc_column(df)
 
     if ssc_col:
         col = ssc_col.lower()
+        values = pd.to_numeric(df[ssc_col], errors='coerce')
 
         if 'kg' in col and 'm-3' in col:
-            df['SSC'] = pd.to_numeric(df[ssc_col], errors='coerce') * 1e6
+            df['SSC'] = values * 1e3
 
         elif 'g' in col and 'm-3' in col:
-            df['SSC'] = pd.to_numeric(df[ssc_col], errors='coerce') * 1e3
-
-        elif 'turbidity' in col:
-            df['SSC'] = pd.to_numeric(df[ssc_col], errors='coerce')
-            df['SSC_flag'] = FLAG_ESTIMATED
+            df['SSC'] = values
 
         else:
             df['SSC'] = np.nan
@@ -175,21 +174,29 @@ def detect_and_convert_columns(df):
         df['SSC'] = np.nan
 
     # ---- SSL ----
-    ssl_col = next((c for c in df.columns if 'ssl' in c.lower()), None)
+    ssl_col = _select_ssl_column(df)
 
     if ssl_col:
         col = ssl_col.lower()
+        values = pd.to_numeric(df[ssl_col], errors='coerce')
+
         if 'kg' in col and 'm-1' in col and days_in_month is not None:
-                    df['SSL'] = pd.to_numeric(df[ssl_col], errors='coerce') / days_in_month / 1000.0
+            df['SSL'] = values / days_in_month / 1000.0
 
         elif 'kg' in col and 'd-1' in col:
-            df['SSL'] = pd.to_numeric(df[ssl_col], errors='coerce') / 1000.0
+            df['SSL'] = values / 1000.0
 
         elif 'kg' in col and 'event' in col:
-            df['SSL_event'] = pd.to_numeric(df[ssl_col], errors='coerce')
+            df['SSL'] = values / duration_days / 1000.0
 
-        elif ('t' in col or 'ton' in col) and 'event' in col:
-            df['SSL_event'] = pd.to_numeric(df[ssl_col], errors='coerce')
+        elif ('event' in col and ('t ' in col or '(t' in col or 'ton' in col)):
+            df['SSL'] = values / duration_days
+
+        elif 'kg' in col and 'ts-1' in col:
+            df['SSL'] = values * 86400.0 / timestep_seconds / 1000.0
+
+        elif ('ts-1' in col and ('t ' in col or '(t' in col or 'ton' in col)):
+            df['SSL'] = values * 86400.0 / timestep_seconds
 
         else:
             df['SSL'] = np.nan
@@ -199,6 +206,98 @@ def detect_and_convert_columns(df):
 
     return df
 
+
+
+def _select_q_column(df):
+    q_cols = [c for c in df.columns if c.lower().startswith('q') and '(' in c.lower()]
+    return _first_by_priority(q_cols, [
+        lambda c: 'm3 s-1' in c.lower() or 'm3/s' in c.lower() or '/s' in c.lower(),
+        lambda c: 'm3 ts-1' in c.lower(),
+        lambda c: 'm3 event-1' in c.lower(),
+        lambda c: 'm3 d-1' in c.lower(),
+        lambda c: 'm3 m-1' in c.lower(),
+    ])
+
+
+
+def _select_ssc_column(df):
+    ssc_cols = [c for c in df.columns if 'ssc' in c.lower()]
+    return _first_by_priority(ssc_cols, [
+        lambda c: 'g' in c.lower() and 'm-3' in c.lower(),
+        lambda c: 'kg' in c.lower() and 'm-3' in c.lower(),
+    ])
+
+
+
+def _select_ssl_column(df):
+    ssl_cols = [c for c in df.columns if 'ssl' in c.lower()]
+    return _first_by_priority(ssl_cols, [
+        lambda c: 'kg' in c.lower() and 'ts-1' in c.lower(),
+        lambda c: 'ts-1' in c.lower() and ('t ' in c.lower() or '(t' in c.lower() or 'ton' in c.lower()),
+        lambda c: 'kg' in c.lower() and 'event' in c.lower(),
+        lambda c: 'event' in c.lower() and ('t ' in c.lower() or '(t' in c.lower() or 'ton' in c.lower()),
+        lambda c: 'kg' in c.lower() and 'd-1' in c.lower(),
+        lambda c: 'kg' in c.lower() and 'm-1' in c.lower(),
+    ])
+
+
+
+def _first_by_priority(columns, predicates):
+    for predicate in predicates:
+        for col in columns:
+            if predicate(col):
+                return col
+    return columns[0] if columns else None
+
+
+
+def _event_duration_days(df):
+    if 'Start date (DD/MM/YYYY)' in df.columns and 'End date (DD/MM/YYYY)' in df.columns:
+        start = pd.to_datetime(df['Start date (DD/MM/YYYY)'], errors='coerce', dayfirst=True)
+        end = pd.to_datetime(df['End date (DD/MM/YYYY)'], errors='coerce', dayfirst=True)
+    elif 'Start date' in df.columns and 'End date' in df.columns:
+        start = pd.to_datetime(df['Start date'], errors='coerce')
+        end = pd.to_datetime(df['End date'], errors='coerce')
+    else:
+        return pd.Series(1.0, index=df.index, dtype=float)
+
+    duration = (end - start).dt.total_seconds() / 86400.0
+    return duration.where(duration > 0).fillna(1.0)
+
+
+
+def _timestep_seconds(df):
+    interval_col = next((c for c in df.columns if 'time_interval' in c.lower()), None)
+    if interval_col:
+        seconds = pd.to_timedelta(df[interval_col], errors='coerce').dt.total_seconds()
+        return seconds.where(seconds > 0)
+
+    duration_col = next((c for c in df.columns if 'sampling duration' in c.lower() and '(d)' in c.lower()), None)
+    if duration_col:
+        seconds = pd.to_numeric(df[duration_col], errors='coerce') * 86400.0
+        return seconds.where(seconds > 0)
+
+    if 'date' not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    times = pd.to_datetime(df['date'], errors='coerce')
+    group_col = next((c for c in df.columns if c.lower() == 'event_index'), None)
+    if group_col:
+        grouped = times.groupby(df[group_col])
+        prev_delta = grouped.diff().dt.total_seconds()
+        next_delta = (grouped.shift(-1) - times).dt.total_seconds()
+        seconds = prev_delta.where(prev_delta > 0).fillna(next_delta.where(next_delta > 0))
+        group_median = seconds.groupby(df[group_col]).transform(lambda s: s[s > 0].median())
+        seconds = seconds.fillna(group_median)
+    else:
+        prev_delta = times.diff().dt.total_seconds()
+        next_delta = (times.shift(-1) - times).dt.total_seconds()
+        seconds = prev_delta.where(prev_delta > 0).fillna(next_delta.where(next_delta > 0))
+
+    valid = seconds[seconds > 0]
+    if len(valid) > 0:
+        seconds = seconds.fillna(float(valid.median()))
+    return seconds.where(seconds > 0)
 
 
 def parse_date_flexible(date_str):
@@ -308,7 +407,7 @@ def qc_with_toolpy(
     SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
     SSL_flag = np.array([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
 
-    # Optional: preset estimated flags (e.g. turbidity-derived SSC)
+    # Optional: preset estimated flags supplied by the caller.
     if flag_estimated_mask:
         for var, mask in flag_estimated_mask.items():
             mask = np.asarray(mask, dtype=bool)
@@ -581,75 +680,52 @@ def read_station_data(station_id, country):
     df = detect_and_convert_columns(df)
 
     # ----------------------------------------------------
-    # 3) EVENT DATA HANDLING (IF EVENT COLUMNS FOUND)
+    # 3) Conservative derivation with SSL = Q * SSC * 0.0864
     # ----------------------------------------------------
-    if 'Q_event' in df.columns or 'SSL_event' in df.columns:
-
-        print(f"  Event-data detected → converting to daily values")
-
-        # Event start/end date detection
-        if 'Start date (DD/MM/YYYY)' in df.columns and 'End date (DD/MM/YYYY)' in df.columns:
-            df['start_date'] = pd.to_datetime(df['Start date (DD/MM/YYYY)'], errors='coerce')
-            df['end_date']   = pd.to_datetime(df['End date (DD/MM/YYYY)'], errors='coerce')
-        else:
-            df['start_date'] = df['date']
-            df['end_date']   = df['date']
-
-        df['duration_days'] = (df['end_date'] - df['start_date']).dt.total_seconds() / 86400.0
-        df['duration_days'] = df['duration_days'].replace(0, np.nan).fillna(1.0)
-
-        # Q_event → m³/event → m³/s
-        if 'Q_event' in df.columns:
-            df['Q'] = df['Q_event'] / (df['duration_days'] * 86400.0)
-
-        # SSL_event → ton/event → ton/day
-        if 'SSL_event' in df.columns:
-            df['SSL'] = df['SSL_event'] / df['duration_days']
-            # kg/event case: convert kg → ton
-            if df['SSL'].max() > 100:  # heuristic: large numbers mean kg not ton
-                df['SSL'] = df['SSL'] / 1000.0
-
-
-    # ----------------------------------------------------
-    # NEW STEP: Fill missing Q / SSC / SSL using SSL = Q * SSC * 0.0864
-    # ----------------------------------------------------
-    # ----------------------------------------------------
-    # NEW STEP: Fill missing Q / SSC / SSL using SSL = Q * SSC * 0.0864
-    # ----------------------------------------------------
-    df['Q'] = pd.to_numeric(df['Q'], errors='coerce')
-    df['SSC'] = pd.to_numeric(df['SSC'], errors='coerce')
-    df['SSL'] = pd.to_numeric(df['SSL'], errors='coerce')
+    for col in ['Q', 'SSC', 'SSL']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
     factor = 0.0864
+    q_derived = np.zeros(len(df), dtype=bool)
+    ssc_derived = np.zeros(len(df), dtype=bool)
+    ssl_derived = np.zeros(len(df), dtype=bool)
 
-    # 记录哪些点是“派生得到的”
-    derived_mask = np.zeros(len(df), dtype=bool)
+    valid_q = df['Q'].notna() & (df['Q'] > 0)
+    valid_ssc = df['SSC'].notna() & (df['SSC'] > 0)
+    valid_ssl = df['SSL'].notna() & (df['SSL'] > 0)
 
-    # Case 1: SSL missing → compute from Q and SSC
-    mask = df['SSL'].isna() & df['Q'].notna() & df['SSC'].notna()
+    # SSL missing -> derive ton/day from Q (m3/s) and SSC (mg/L).
+    mask = df['SSL'].isna() & valid_q & valid_ssc
     df.loc[mask, 'SSL'] = df.loc[mask, 'Q'] * df.loc[mask, 'SSC'] * factor
-    derived_mask |= mask.to_numpy()
+    ssl_derived |= mask.to_numpy()
 
-    # Case 2: SSC missing → compute from Q and SSL
-    mask = df['SSC'].isna() & df['Q'].notna() & df['SSL'].notna()
+    valid_ssl = df['SSL'].notna() & (df['SSL'] > 0)
+
+    # SSC missing -> derive mg/L only when Q is positive.
+    mask = df['SSC'].isna() & valid_q & valid_ssl
     df.loc[mask, 'SSC'] = df.loc[mask, 'SSL'] / (df.loc[mask, 'Q'] * factor)
-    derived_mask |= mask.to_numpy()
+    ssc_derived |= mask.to_numpy()
 
-    # Case 3: Q missing → compute from SSC and SSL
-    mask = df['Q'].isna() & df['SSC'].notna() & df['SSL'].notna()
+    valid_ssc = df['SSC'].notna() & (df['SSC'] > 0)
+
+    # Q missing -> derive m3/s only when SSC is positive.
+    mask = df['Q'].isna() & valid_ssc & valid_ssl
     df.loc[mask, 'Q'] = df.loc[mask, 'SSL'] / (df.loc[mask, 'SSC'] * factor)
-    derived_mask |= mask.to_numpy()
+    q_derived |= mask.to_numpy()
 
+    for col in ['Q', 'SSC', 'SSL']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
     # ----------------------------------------------------
     # 4) Replace NaN with Fill Value
     # ----------------------------------------------------
     for col in ['Q', 'SSC', 'SSL']:
-        if col in df.columns:
-            df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(FILL_VALUE)
+        df[col] = df[col].fillna(FILL_VALUE)
 
-    df["derived"] = derived_mask
-    return df[['date', 'Q', 'SSC', 'SSL', 'derived']]
+    df['Q_derived'] = q_derived
+    df['SSC_derived'] = ssc_derived
+    df['SSL_derived'] = ssl_derived
+    return df[['date', 'Q', 'SSC', 'SSL', 'Q_derived', 'SSC_derived', 'SSL_derived']]
 
 
 
@@ -685,12 +761,11 @@ def process_station(station_id, country):
     # ------------------------------------------
     # QC using tool.py
     # ------------------------------------------
-    # 如果你想把 turbidity-derived SSC 标为 estimated(1)，可以传 mask：
-    # estimated_mask = {"SSC": (df.get("SSC_flag", 0) == FLAG_ESTIMATED)}  # 你目前 detect_and_convert_columns 有写 SSC_flag=FLAG_ESTIMATED
+    # Mark only values derived from the Q/SSC/SSL identity as estimated.
     estimated_mask = {
-        "Q": df["derived"].values,
-        "SSC": df["derived"].values,
-        "SSL": df["derived"].values,
+        "Q": df.get("Q_derived", pd.Series(False, index=df.index)).values,
+        "SSC": df.get("SSC_derived", pd.Series(False, index=df.index)).values,
+        "SSL": df.get("SSL_derived", pd.Series(False, index=df.index)).values,
     }
 
 
@@ -921,9 +996,9 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
 
         # Set comment based on data type
         if metadata.get('data_type', '').lower().startswith('event'):
-            q_var.comment = 'Source: Original data provided by EUSEDcollab. Event data converted to daily rates: Q (m³/event) divided by event duration (days) and 86400 s/day.'
+            q_var.comment = 'Source: Original data provided by EUSEDcollab. Event and timestep discharge volumes standardized to m3 s-1 using event duration or timestep length.'
         else:
-            q_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from m³/day to m³/s (÷ 86400).'
+            q_var.comment = 'Source: Original data provided by EUSEDcollab. Daily and monthly discharge volumes standardized to m3 s-1.'
         q_var[:] = q_data
 
         # Q flag
@@ -944,7 +1019,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         ssc_var.ancillary_variables = 'SSC_flag'
 
         # Comment is same for both event and daily data (concentration doesn't need temporal conversion)
-        ssc_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/m³ to mg/L (× 1,000,000).'
+        ssc_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/m3 to mg/L (*1000) or g/m3 to mg/L (*1); turbidity is not treated as SSC.'
         ssc_var[:] = ssc_data
 
         # SSC flag
@@ -965,9 +1040,9 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
 
         # Set comment based on data type
         if metadata.get('data_type', '').lower().startswith('event'):
-            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Event data converted to daily rates: SSL (kg/event) divided by event duration (days) and 1000 kg/ton.'
+            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Event and timestep sediment loads standardized to ton day-1 using event duration or timestep length.'
         else:
-            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/day to ton/day (÷ 1000).'
+            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Daily and monthly sediment loads standardized to ton day-1.'
         ssl_var[:] = ssl_data
 
         # SSL flag
@@ -992,6 +1067,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
         ds.station_name = metadata['station_name']
         ds.river_name = ''  # Not available
         ds.Source_ID = f'EUSED_{metadata["catchment_id"]}'
+        ds.station_id = f'EUSED_{metadata["catchment_id"]}'
 
         # Temporal information
         start_date = df['date'].min()
@@ -1046,13 +1122,12 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file):
 
         # Add data-type specific conversion notes
         if metadata.get('data_type', '').lower().startswith('event'):
-            history_text += "Event data converted to daily: used event start date as record date, "
-            history_text += "converted event totals to daily rates by dividing by event duration. "
-            history_text += "Unit conversions: Q (m³/event → m³/s), SSC (kg/m³ → mg/L, ×1,000,000), SSL (kg/event → ton/day). "
+            history_text += "Event/timestep data converted to daily rates: used event duration or timestep length where available. "
+            history_text += "Unit conversions: Q (m3/event or m3/timestep -> m3/s), SSC (kg/m3 -> mg/L, *1000; g/m3 -> mg/L, *1), SSL (kg/event or kg/timestep -> ton/day). "
         else:
-            history_text += "Unit conversions: Q (m³/day → m³/s, ÷86400), SSC (kg/m³ → mg/L, ×1,000,000), SSL (kg/day → ton/day, ÷1000). "
+            history_text += "Unit conversions: Q (m3/day or m3/month -> m3/s), SSC (kg/m3 -> mg/L, *1000; g/m3 -> mg/L, *1), SSL (kg/day or kg/month -> ton/day). "
 
-        history_text += "Script: process_eusedcollab_to_cf18.py"
+        history_text += "Script: process_eusedcollab_to_cf18_wzx.py"
         ds.history = history_text
 
         ds.comment = f'Data type: {metadata["data_type"]}. Stream type: {metadata["stream_type"]}. Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing.'

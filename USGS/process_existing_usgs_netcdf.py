@@ -53,11 +53,17 @@ def process_existing_usgs_netcdf():
         df = df.reindex(date_index)
 
         # Correct SSL calculation
-        if 'discharge' in df and 'ssc' in df:
-            df['SSL'] = df['discharge'] * df['ssc'] * 0.0864
+        if "discharge" in df and "ssc" in df:
+            valid_ssl = (
+                np.isfinite(df["discharge"])
+                & np.isfinite(df["ssc"])
+                & (df["discharge"] >= 0)
+                & (df["ssc"] >= 0)
+            )
+            df["SSL"] = np.nan
+            df.loc[valid_ssl, "SSL"] = df.loc[valid_ssl, "discharge"] * df.loc[valid_ssl, "ssc"] * 0.0864
         else:
-            df['SSL'] = np.nan
-
+            df["SSL"] = np.nan
         # QC Flags
         q_thresholds = {'negative': 0, 'zero': 0, 'extreme': 50000}
         ssc_thresholds = {'negative': 0, 'extreme': 3000}

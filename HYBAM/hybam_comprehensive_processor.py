@@ -8,7 +8,7 @@ PROCESSING WORKFLOW:
 1. Data Merging: Combine discharge and SSC data on common time axis
 2. Unit Verification: Confirm units are m³/s and mg/L respectively
 3. QC Checks: Physical consistency checks with quality flagging
-4. Derived Variables: Calculate SSL = Q × SSC × 86.4 (ton/day)
+4. Derived Variables: Calculate SSL = Q x SSC x 0.0864 (ton/day)
 5. CF-1.8 Standardization: Create compliant NetCDF files with:
    - Unlimited time dimension
    - Coordinate variables (time, lat, lon)
@@ -24,8 +24,8 @@ QUALITY FLAGS:
   9 - missing_data: No measurement available
 
 UNIT CONVERSIONS:
-  SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4
-  where 86.4 = 86400 s/day × 1000 L/m³ × 10⁻⁶ ton/mg
+  SSL (ton/day) = Q (m3/s) x SSC (mg/L) x 0.0864
+  where 0.0864 = 86400 s/day x 1000 L/m3 / 1e9 mg/ton
 
 REFERENCE:
   ORE-HYBAM: Hydrologie et Géochimie du Bassin Amazonien
@@ -55,7 +55,6 @@ from code.output import (
     generate_csv_summary as generate_csv_summary_tool,
     generate_qc_results_csv as generate_qc_results_csv_tool,
 )
-from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
     apply_quality_flag,
     apply_hydro_qc_with_provenance,
@@ -108,6 +107,29 @@ class HYBAMProcessor:
         self.output_dir = Path(output_dir)
         self.output_r_dir = Path(output_r_dir)
         self.station_metadata = {}
+
+    @staticmethod
+    def _to_float_array(values, fill_value=None):
+        """Return float data with source fill values converted to NaN."""
+        if np.ma.isMaskedArray(values):
+            values = np.ma.filled(values, np.nan)
+        arr = np.asarray(values, dtype=float)
+
+        fill_candidates = [FILL_VALUE_FLOAT]
+        if fill_value is not None:
+            fill_candidates.append(fill_value)
+        for candidate in fill_candidates:
+            try:
+                fill = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            arr[np.isclose(arr, fill, rtol=1e-5, atol=1e-5)] = np.nan
+        return arr
+
+    @staticmethod
+    def _to_netcdf_values(values, fill_value):
+        arr = np.asarray(values, dtype=float)
+        return np.where(np.isfinite(arr), arr, fill_value)
 
     def find_station_dirs(self):
         """Find all station directories in source."""
@@ -183,7 +205,7 @@ class HYBAMProcessor:
         with nc.Dataset(nc_file, 'r') as ds:
             # Read time (unix seconds)
             time_var = ds.variables['Date']
-            time_seconds = time_var[:]
+            time_seconds = self._to_float_array(time_var[:])
 
             # Find data variable (skip metadata variables)
             data_varname = None
@@ -196,8 +218,8 @@ class HYBAMProcessor:
                 return None, None, None, None, None, None
 
             # Read data values
-            data_values = ds.variables[data_varname][:]
             fill_value = getattr(ds.variables[data_varname], '_FillValue', FILL_VALUE_FLOAT)
+            data_values = self._to_float_array(ds.variables[data_varname][:], fill_value)
 
             # Read quality information
             origine = ds.variables.get('_Origine', [None] * len(time_seconds))[:]
@@ -259,7 +281,7 @@ class HYBAMProcessor:
                 result['discharge_quality'] = discharge_quality[q_start:q_end+1] if discharge_quality is not None else None
 
                 # Map SSC to discharge time axis
-                ssc_mapped = np.full(len(result['time']), FILL_VALUE_FLOAT, dtype='f4')
+                ssc_mapped = np.full(len(result['time']), np.nan, dtype='f4')
                 for i, q_time in enumerate(result['time']):
                     # Find closest SSC time
                     idx = np.argmin(np.abs(ssc_time - q_time))
@@ -296,6 +318,8 @@ class HYBAMProcessor:
         def _as_1d(x):
             if x is None:
                 return None
+            if np.ma.isMaskedArray(x):
+                x = np.ma.filled(x, np.nan)
             arr = np.asarray(x)
             if arr.ndim == 0:
                 arr = arr.reshape(1)
@@ -311,9 +335,9 @@ class HYBAMProcessor:
                 return None
             a = _as_1d(arr)
             if a.size == n:
-                return a
+                return a.astype(float, copy=False)
             if a.size > n:
-                return a[:n]
+                return a[:n].astype(float, copy=False)
             # pad
             out = np.full(n, fill, dtype=float)
             out[:a.size] = a.astype(float)
@@ -334,7 +358,17 @@ class HYBAMProcessor:
         # (kg/s -> ton/day) = 86400/1000 = 86.4 ; 但 mg/L -> kg/m3 还有 1e-3，合起来就是 0.0864
         SSL = np.full(n, np.nan, dtype=float)
         if Q is not None and SSC is not None:
-            m = np.isfinite(Q) & np.isfinite(SSC)
+            q_ok = (
+                np.isfinite(Q)
+                & ~np.isclose(Q, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5)
+                & (Q >= 0)
+            )
+            ssc_ok = (
+                np.isfinite(SSC)
+                & ~np.isclose(SSC, FILL_VALUE_FLOAT, rtol=1e-5, atol=1e-5)
+                & (SSC >= 0)
+            )
+            m = q_ok & ssc_ok
             SSL[m] = Q[m] * SSC[m] * 0.0864
 
         qc = apply_hydro_qc_with_provenance(
@@ -474,7 +508,7 @@ class HYBAMProcessor:
                 Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
                 Q_var.comment = 'Source: Original data from ORE-HYBAM monitoring network.'
                 Q_var.missing_value = fill_value
-                Q_var[:] = data_dict['discharge']
+                Q_var[:] = self._to_netcdf_values(data_dict['discharge'], fill_value)
 
                 # Q Quality Flag
                 Q_flag_var = ds.createVariable('Q_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
@@ -518,7 +552,7 @@ class HYBAMProcessor:
                 SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
                 SSC_var.comment = 'Source: Original data from ORE-HYBAM monitoring network.'
                 SSC_var.missing_value = fill_value
-                SSC_var[:] = data_dict['ssc']
+                SSC_var[:] = self._to_netcdf_values(data_dict['ssc'], fill_value)
 
                 # SSC Quality Flag
                 SSC_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
@@ -570,9 +604,9 @@ class HYBAMProcessor:
                 SSL_var.units = 'ton day-1'
                 SSL_var.coordinates = 'time lat lon'
                 SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
-                SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4'
+                SSL_var.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m3/s) x SSC (mg/L) x 0.0864'
                 SSL_var.missing_value = fill_value
-                SSL_var[:] = data_dict['SSL']
+                SSL_var[:] = self._to_netcdf_values(data_dict['SSL'], fill_value)
 
                 # SSL Quality Flag
                 SSL_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
@@ -689,7 +723,7 @@ class HYBAMProcessor:
             ds.location_id = station_id
             ds.country = country
             ds.continent_region = continent_region
-            ds.iso_a3 = iso_a3''
+            ds.iso_a3 = iso_a3
 
     def process_station(self, station_dir):
         """Process a single station through the complete pipeline."""
