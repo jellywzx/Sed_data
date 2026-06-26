@@ -421,7 +421,7 @@ def process_single_station(args):
             ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
             ('SSL_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
             ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
-            ('SSL_flag_qc3_from_ssc_q', [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+            ('SSL_flag_qc3_from_ssc_q', [0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
         ]
         for sname, sflag_vals, sflag_mean, slong_name in _STEP_FLAG_SPECS:
             if sname in df.columns:

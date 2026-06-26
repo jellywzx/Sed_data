@@ -309,8 +309,8 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
         qc_report.update({"SSC_qc3_pass":c["pass"], "SSC_qc3_suspect":c["suspect"], "SSC_qc3_not_checked":c["not_checked"], "SSC_qc3_missing":c["missing"]})
 
     if "SSL_flag_qc3_from_ssc_q" in qc:
-        # 你们约定：0 not_propagated, 1 propagated, 8 not_checked, 9 missing（如果你代码里是这个）
-        c = _count_step(qc["SSL_flag_qc3_from_ssc_q"], {"not_propagated":0, "propagated":1, "not_checked":8, "missing":9})
+        # Shared QC convention: 0 not_propagated, 2 propagated/suspect, 8 not_checked, 9 missing.
+        c = _count_step(qc["SSL_flag_qc3_from_ssc_q"], {"not_propagated":0, "propagated":2, "not_checked":8, "missing":9})
         qc_report.update({"SSL_qc3_not_propagated":c["not_propagated"], "SSL_qc3_propagated":c["propagated"], "SSL_qc3_not_checked":c["not_checked"], "SSL_qc3_missing":c["missing"]})
 
     return qc, qc_report

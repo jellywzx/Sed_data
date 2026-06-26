@@ -346,13 +346,13 @@ def build_qc_results_summary_row(qc_df, station_name, source_id, river_name, lon
         "SSC_qc3_missing": {9, int(FILL_VALUE_INT)}
     }))
 
-    # SSL_qc3 propagation：这里默认 0=not_propagated, 1=propagated, 2=not_checked, 9=missing
+    # SSL_qc3 propagation: 0=not_propagated, 2=propagated/suspect, 8=not_checked, 9=missing
     col = "SSL_qc3_propagation"
     step = qc_df[col].to_numpy() if col in qc_df.columns else None
     row.update(_count_step(step, {
         "SSL_qc3_not_propagated": {0},
-        "SSL_qc3_propagated": {1},
-        "SSL_qc3_not_checked": {2},
+        "SSL_qc3_propagated": {2},
+        "SSL_qc3_not_checked": {8},
         "SSL_qc3_missing": {9, int(FILL_VALUE_INT)}
     }))
 
@@ -655,7 +655,7 @@ def create_netcdf_cf18(
         ('SSC_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
         ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
         ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
-        ('SSL_flag_qc3_from_ssc_q', [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+        ('SSL_flag_qc3_from_ssc_q', [0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
     ]
     for nc_name, (col_name, fvals, fmean, lname) in _QC1_COL_MAP.items():
         if col_name in data.columns:

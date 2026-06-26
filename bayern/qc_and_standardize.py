@@ -531,7 +531,7 @@ def process_station(input_file, output_dir):
                 flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
                 long_name='QC2 log-IQR flag for suspended sediment load')
             _add_step_flag("SSL_flag_qc3_propagation", SSL_qc3,
-                flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+                flag_values=[0, 2, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
                 long_name='QC3 propagation flag for suspended sediment load')
 
             # Global attributes (CF-1.8 and ACDD-1.3 compliant)

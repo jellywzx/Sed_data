@@ -429,7 +429,7 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
         flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
         long_name='QC2 log-IQR flag for suspended sediment load')
     _add_step_flag('SSL_flag_qc3_from_ssc_q', qc_step.get('SSL_flag_qc3_from_ssc_q'),
-        flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+        flag_values=[0, 2, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
         long_name='QC3 propagation flag for suspended sediment load')
 
     # Update ancillary_variables to include step flags
