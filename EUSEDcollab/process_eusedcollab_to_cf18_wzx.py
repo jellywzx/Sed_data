@@ -87,9 +87,27 @@ def _default_worker_count():
     return max(1, cpu_count - 1)
 
 
-# Built-in runtime parameters. Edit these constants directly when needed.
-RUN_IN_PARALLEL = True
-N_WORKERS = _default_worker_count()
+def _env_bool(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        print(f"Warning: ignoring invalid {name}={raw_value!r}; using {default}")
+        return default
+
+
+# Built-in runtime parameters. Environment variables allow safer reruns on HPC nodes.
+RUN_IN_PARALLEL = _env_bool("EUSED_RUN_IN_PARALLEL", True)
+N_WORKERS = _env_int("EUSED_N_WORKERS", _default_worker_count())
 QC_IQR_K = 1.5
 QC_MIN_SAMPLES_ENVELOPE = 5
 WRITE_DIAGNOSTIC_PLOTS = True
@@ -97,6 +115,13 @@ DIAGNOSTIC_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
 DIAGNOSTIC_PLOT_DIR = os.path.join(OUTPUT_DIR, "diagnostic_plots")
 
 FILL_VALUE = -9999.0
+SSC_Q_SSL_RATIO_TARGETS = (
+    1.0 / 86400.0,
+    86400.0,
+    1.0 / 1000.0,
+    1000.0,
+)
+SSC_Q_SSL_RATIO_TOLERANCE_LOG10 = 0.08
 # =============================================================================
 # QC flag definitions (consistent with tool.py)
 # =============================================================================
@@ -159,13 +184,13 @@ def detect_and_convert_columns(df):
     ssc_col = _select_ssc_column(df)
 
     if ssc_col:
-        col = ssc_col.lower()
+        col = _normalize_unit_text(ssc_col)
         values = pd.to_numeric(df[ssc_col], errors='coerce')
 
-        if 'kg' in col and 'm-3' in col:
+        if _column_has_unit(col, "kg", "m-3"):
             df['SSC'] = values * 1e3
 
-        elif 'g' in col and 'm-3' in col:
+        elif _column_has_unit(col, "g", "m-3"):
             df['SSC'] = values
 
         else:
@@ -223,9 +248,32 @@ def _select_q_column(df):
 def _select_ssc_column(df):
     ssc_cols = [c for c in df.columns if 'ssc' in c.lower()]
     return _first_by_priority(ssc_cols, [
-        lambda c: 'g' in c.lower() and 'm-3' in c.lower(),
-        lambda c: 'kg' in c.lower() and 'm-3' in c.lower(),
+        lambda c: _column_has_unit(c, "g", "m-3"),
+        lambda c: _column_has_unit(c, "kg", "m-3"),
     ])
+
+
+def _normalize_unit_text(text):
+    text = str(text).lower()
+    replacements = {
+        "³": "3",
+        "⁻": "-",
+        "−": "-",
+        "/": " ",
+        "(": " ",
+        ")": " ",
+        "_": " ",
+        "^": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return " ".join(text.split())
+
+
+def _column_has_unit(column_name, mass_unit, volume_unit):
+    text = _normalize_unit_text(column_name)
+    tokens = set(text.replace("-", " -").split())
+    return mass_unit in tokens and volume_unit in text
 
 
 
@@ -298,6 +346,61 @@ def _timestep_seconds(df):
     if len(valid) > 0:
         seconds = seconds.fillna(float(valid.median()))
     return seconds.where(seconds > 0)
+
+
+def _finite_positive(series):
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return values.notna() & (values > 0)
+
+
+def _station_median_q_ssc_ssl_ratio(df):
+    valid = _finite_positive(df["Q"]) & _finite_positive(df["SSC"]) & _finite_positive(df["SSL"])
+    if int(valid.sum()) < 5:
+        return np.nan
+    expected = 0.0864 * df.loc[valid, "Q"].astype(float) * df.loc[valid, "SSC"].astype(float)
+    ratio = df.loc[valid, "SSL"].astype(float) / expected
+    ratio = ratio.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(ratio) < 5:
+        return np.nan
+    return float(np.nanmedian(ratio))
+
+
+def _is_close_on_log10(value, target, tolerance=SSC_Q_SSL_RATIO_TOLERANCE_LOG10):
+    if not np.isfinite(value) or value <= 0 or target <= 0:
+        return False
+    return abs(np.log10(float(value)) - np.log10(float(target))) <= float(tolerance)
+
+
+def _detect_ssc_seconds_mismatch(df):
+    ratio = _station_median_q_ssc_ssl_ratio(df)
+    return _is_close_on_log10(ratio, 1.0 / 86400.0), ratio
+
+
+def _fixed_ratio_mismatch_mask(Q, SSC, SSL):
+    Q = np.asarray(Q, dtype=float)
+    SSC = np.asarray(SSC, dtype=float)
+    SSL = np.asarray(SSL, dtype=float)
+    expected = 0.0864 * Q * SSC
+    ratio = np.full(len(Q), np.nan, dtype=float)
+    valid = (
+        np.isfinite(Q)
+        & np.isfinite(SSC)
+        & np.isfinite(SSL)
+        & (Q > 0)
+        & (SSC > 0)
+        & (SSL > 0)
+        & np.isfinite(expected)
+        & (expected > 0)
+    )
+    ratio[valid] = SSL[valid] / expected[valid]
+
+    mask = np.zeros(len(Q), dtype=bool)
+    for target in SSC_Q_SSL_RATIO_TARGETS:
+        log_delta = np.full(len(Q), np.nan, dtype=float)
+        positive = valid & (ratio > 0)
+        log_delta[positive] = np.abs(np.log10(ratio[positive]) - np.log10(target))
+        mask |= positive & (log_delta <= SSC_Q_SSL_RATIO_TOLERANCE_LOG10)
+    return mask
 
 
 def parse_date_flexible(date_str):
@@ -417,6 +520,18 @@ def qc_with_toolpy(
                 Q_flag = np.where(mask & (Q_flag == 0), np.int8(1), Q_flag)
             if var == "SSL":
                 SSL_flag = np.where(mask & (SSL_flag == 0), np.int8(1), SSL_flag)
+
+    fixed_ratio_mismatch = _fixed_ratio_mismatch_mask(Q, SSC, SSL)
+    SSC_flag = np.where(
+        fixed_ratio_mismatch & np.isin(SSC_flag, [FLAG_GOOD, FLAG_ESTIMATED]),
+        FLAG_SUSPECT,
+        SSC_flag,
+    )
+    SSL_flag = np.where(
+        fixed_ratio_mismatch & np.isin(SSL_flag, [FLAG_GOOD, FLAG_ESTIMATED]),
+        FLAG_SUSPECT,
+        SSL_flag,
+    )
 
     # ----------------------------
     # 2) log-IQR outlier screening (suspect=2)
@@ -732,6 +847,18 @@ def read_station_data(station_id, country):
     q_derived = np.zeros(len(df), dtype=bool)
     ssc_derived = np.zeros(len(df), dtype=bool)
     ssl_derived = np.zeros(len(df), dtype=bool)
+
+    seconds_mismatch, station_ratio = _detect_ssc_seconds_mismatch(df)
+    if seconds_mismatch:
+        ssc_fix_mask = _finite_positive(df["SSC"])
+        df.loc[ssc_fix_mask, "SSC"] = df.loc[ssc_fix_mask, "SSC"] / 86400.0
+        ssc_derived |= ssc_fix_mask.to_numpy()
+        print(
+            "  Corrected station-level SSC/Q/SSL seconds mismatch "
+            "(median SSL/(0.0864*Q*SSC)={:.6g}); divided SSC by 86400".format(
+                station_ratio
+            )
+        )
 
     valid_q = df['Q'].notna() & (df['Q'] > 0)
     valid_ssc = df['SSC'].notna() & (df['SSC'] > 0)
@@ -1109,7 +1236,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
             v.missing_value = np.int8(FILL_VALUE_INT)
             v[:] = np.asarray(values, dtype=np.int8)
 
-        if step_flags:
+        if step_flags is not None:
             _add_step_flag('Q_flag_qc1_physical', step_flags.get('Q_flag_qc1_physical'),
                 flag_values=[0, 3, 9], flag_meanings='pass bad missing',
                 long_name='QC1 physical flag for river discharge')
