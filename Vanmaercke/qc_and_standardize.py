@@ -355,9 +355,9 @@ def standardize_netcdf_file(input_file, output_dir):
         _add_step_flag('SSL_flag_qc2_log_iqr', ssl_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load')
         _add_step_flag('SSL_flag_qc3_from_ssc_q', ssl_qc3, [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load')
 
-        Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
-        SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
-        SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+        q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+        ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+        ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
         ds.Conventions = "CF-1.8, ACDD-1.3"
         ds.title = "Harmonized Global River Discharge and Sediment"

@@ -548,6 +548,18 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
         v.missing_value = np.int8(FILL_VALUE_INT)
         v[:] = np.asarray(np.atleast_1d(val), dtype=np.int8)
 
+    # Initialize step-level QC flags:
+    # For climatology (single value per station), physical QC mirrors the main flag,
+    # while statistical/propagation flags are set to FILL_VALUE_INT (not_checked).
+    q_qc1   = np.int8(Q_flag)
+    q_qc2   = np.int8(FILL_VALUE_INT)
+    ssc_qc1 = np.int8(SSC_flag)
+    ssc_qc2 = np.int8(FILL_VALUE_INT)
+    ssc_qc3 = np.int8(FILL_VALUE_INT)
+    ssl_qc1 = np.int8(SSL_flag)
+    ssl_qc2 = np.int8(FILL_VALUE_INT)
+    ssl_qc3 = np.int8(FILL_VALUE_INT)
+
     _add_step_flag('Q_flag_qc1_physical', q_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge')
     _add_step_flag('Q_flag_qc2_log_iqr', q_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge')
     _add_step_flag('SSC_flag_qc1_physical', ssc_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration')

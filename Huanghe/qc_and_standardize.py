@@ -256,6 +256,9 @@ def write_standardized_file(
     summary,
     ssc_comment,
     global_comment,
+    ssc_flag_qc1=None,
+    ssc_flag_qc2=None,
+    ssc_flag_qc3=None,
 ):
     """Write one standardized NetCDF file."""
 
@@ -345,6 +348,12 @@ def write_standardized_file(
         ssc_flag_var[:] = np.asarray(ssc_flag_out, dtype=np.int8)
 
         # --- Step-level QC provenance flags ---
+        if ssc_flag_qc1 is None:
+            ssc_flag_qc1 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
+        if ssc_flag_qc2 is None:
+            ssc_flag_qc2 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
+        if ssc_flag_qc3 is None:
+            ssc_flag_qc3 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
         def _add_step_flag(name, values, fvals, fmean, lname):
             v = ds.createVariable(name, "b", ("time",), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
             v.long_name = lname
@@ -696,6 +705,9 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             f"Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
             f"Note: Discharge and sediment load data are NOT available in the original dataset."
         ),
+        ssc_flag_qc1=ssc_flag_qc1,
+        ssc_flag_qc2=ssc_flag_qc2,
+        ssc_flag_qc3=ssc_flag_qc3,
     )
 
     # Write climatology file
@@ -742,6 +754,9 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             + "Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
             + "Note: Discharge and sediment load data are NOT available in the original dataset."
         ),
+        ssc_flag_qc1=clim_flag_vals,
+        ssc_flag_qc2=clim_flag_vals,
+        ssc_flag_qc3=clim_flag_vals,
     )
 
     # Build station summaries

@@ -341,6 +341,18 @@ def standardize_netcdf_file(input_file, output_dir):
         ssl_flag_var[:] = [ssl_flag]
 
         # --- Step-level QC provenance flags ---
+        # Initialize step-level QC flags from physical QC results
+        # For single-value climatology, physical QC mirrors the main flag,
+        # while statistical/propagation flags are set to FILL_VALUE_INT (not_checked).
+        q_qc1 = np.int8(q_flag)
+        q_qc2 = np.int8(FILL_VALUE_INT)
+        ssc_qc1 = np.int8(ssc_flag)
+        ssc_qc2 = np.int8(FILL_VALUE_INT)
+        ssc_qc3 = np.int8(FILL_VALUE_INT)
+        ssl_qc1 = np.int8(ssl_flag)
+        ssl_qc2 = np.int8(FILL_VALUE_INT)
+        ssl_qc3 = np.int8(FILL_VALUE_INT)
+
         def _add_step_flag(name, val, fvals, fmean, lname):
             v = ds.createVariable(name, "b", ("time",), fill_value=FILL_VALUE_INT)
             v.long_name = lname
@@ -359,9 +371,9 @@ def standardize_netcdf_file(input_file, output_dir):
         _add_step_flag('SSL_flag_qc2_log_iqr', ssl_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load')
         _add_step_flag('SSL_flag_qc3_from_ssc_q', ssl_qc3, [0, 1, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load')
 
-        Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
-        SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
-        SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+        q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+        ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+        ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
         ds.Conventions = "CF-1.8, ACDD-1.3"
         ds.title = "Harmonized Global River Discharge and Sediment"
