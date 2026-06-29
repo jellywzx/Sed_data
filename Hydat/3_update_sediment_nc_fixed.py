@@ -110,24 +110,23 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
                     discharge[idx[0]] = val
 
         # Calculate missing values if possible
-        # If sediment_load and discharge exist but ssc is missing, calculate ssc
-        # Formula: sediment_load = discharge × ssc × 86.4
-        # Therefore: ssc = sediment_load / (discharge × 86.4)
+        # If sediment_load and discharge exist but ssc is missing, calculate ssc.
+        # Formula: sediment_load (ton day-1) = discharge (m3 s-1) * ssc (mg L-1) * 0.0864.
+        # Therefore: ssc = sediment_load / (discharge * 0.0864).
         for i in range(n_time):
             if (ssc[i] == fill_value and
                 sediment_load[i] != fill_value and
                 discharge[i] != fill_value and
                 discharge[i] > 0):
-                # sediment_load is in ton/day, discharge in m3/s
-                # ssc = (sediment_load * 1000 kg) / (discharge * 86400 s/day) * 1000 mg/kg / 1000 L/m3
-                # ssc = sediment_load * 1000 / (discharge * 86.4)
+                # sediment_load is in ton day-1 and discharge is in m3 s-1.
+                # This expression is equivalent to sediment_load / (discharge * 0.0864).
                 ssc[i] = (sediment_load[i] * 1000.0) / (discharge[i] * 86.4)
 
-            # If ssc and discharge exist but sediment_load is missing, calculate it
+            # If ssc and discharge exist but sediment_load is missing, calculate it.
             elif (sediment_load[i] == fill_value and
                   ssc[i] != fill_value and
                   discharge[i] != fill_value):
-                # sediment_load = discharge × ssc × 86.4 / 1000
+                # sediment_load (ton day-1) = discharge (m3 s-1) * ssc (mg L-1) * 0.0864.
                 sediment_load[i] = discharge[i] * ssc[i] * 86.4 / 1000.0
 
         # Get global attributes from original file
@@ -221,7 +220,7 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
         var_load.long_name = 'suspended sediment load'
         var_load.units = 'ton day-1'
         var_load.coordinates = 'time latitude longitude'
-        var_load.comment = 'Calculated as: sediment_load = discharge × ssc × 86.4'
+        var_load.comment = 'Calculated as: sediment_load (ton day-1) = discharge (m3 s-1) * ssc (mg L-1) * 0.0864.'
         var_load[:] = sediment_load
 
         # Global attributes
@@ -243,6 +242,7 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
     return True
 
 
+
 def main():
     base_dir = Path('./')
     sediment_dir = base_dir / 'sediment'
@@ -258,31 +258,32 @@ def main():
         dis_file = discharge_dir / f'HYDAT_{station_id}.nc'
         out_file = output_dir / f'HYDAT_{station_id}_SEDIMENT.nc'
         if dis_file.exists():
-            tasks.append((sed_file, dis_file, out_file))  # ✅ 三个参数
+            tasks.append((sed_file, dis_file, out_file))
         else:
-            print(f"Warning: Discharge file not found for {station_id}, skipping...")
+            print(f"Warning: discharge file not found for {station_id}")
 
-    print(f"Found {len(tasks)} files to process")
-    print("=" * 70)
+    print(f"Found {len(tasks)} matched sediment-discharge file pairs")
 
-    success = 0
-    fail = 0
+    # 并行处理所有站点
+    max_workers = min(16, len(tasks))  # 视你的机器/磁盘性能调整，16比较安全
+    success_count = 0
 
-    with ProcessPoolExecutor() as executor:
-        futures = {executor.submit(update_sediment_file, s, d, o): s for s, d, o in tasks}  # ✅ 传入 output_file
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(update_sediment_file, sed_file, dis_file, out_file): (sed_file, dis_file, out_file)
+            for sed_file, dis_file, out_file in tasks
+        }
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing", unit="file"):
-            sed_file = futures[future]
+        for future in tqdm(as_completed(future_to_task), total=len(future_to_task), desc="Processing stations"):
+            sed_file, dis_file, out_file = future_to_task[future]
             try:
-                future.result()
-                success += 1
+                result = future.result()
+                if result:
+                    success_count += 1
             except Exception as e:
-                print(f"  ✗ Error processing {sed_file.name}: {str(e)}")
-                fail += 1
+                print(f"✗ Error processing {sed_file.name}: {e}")
 
-    print("=" * 70)
-    print(f"Success: {success}")
-    print(f"Failed:  {fail}")
+    print(f"\nUpdated {success_count}/{len(tasks)} files successfully")
 
 
 if __name__ == '__main__':
