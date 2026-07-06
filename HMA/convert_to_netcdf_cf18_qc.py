@@ -20,7 +20,15 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, SCRIPT_ROOT)
-from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.constants import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    FLAG_BAD,
+    FLAG_ESTIMATED,
+    FLAG_GOOD,
+    FLAG_MISSING,
+    FLAG_SUSPECT,
+)
 from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
     apply_quality_flag,
@@ -95,21 +103,9 @@ def convert_Qs_to_SSL(Qs_Mt_yr):
 
 def calculate_SSC(SSL_ton_day, Q_m3_s):
     """
-    Calculate SSC from sediment load and discharge
+    Calculate SSC from sediment load and discharge.
 
-    Formula: SSC(mg/L) = SSL(ton/day) / (Q(m³/s) × 86.4)
-
-    Derivation:
-    - SSL = Q × SSC × conversion_factor
-    - Q (m³/s) × SSC (mg/L) × 86400 s/day × 1000 L/m³ × 10⁻⁶ ton/mg = SSL (ton/day)
-    - Therefore: conversion_factor = 86.4
-
-    Args:
-        SSL_ton_day: Sediment load in ton/day
-        Q_m3_s: Discharge in m³/s
-
-    Returns:
-        float: SSC in mg/L or -9999.0 if missing/invalid
+    Formula: SSC (mg/L) = SSL (ton/day) / (Q (m3/s) * 0.0864)
     """
     if SSL_ton_day == -9999.0 or Q_m3_s == -9999.0 or Q_m3_s == 0:
         return -9999.0
@@ -157,6 +153,43 @@ def parse_value_with_uncertainty(value_str):
         return float(match.group(1))
     return np.nan
 
+
+
+def propagate_derived_scalar_flag(derived_value, derived_flag, input_flags, input_values):
+    """
+    Apply derived-value flag propagation for scalar climatology records.
+    """
+    input_flags = [int(flag) for flag in input_flags]
+
+    def _missing(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return True
+        return (
+            (not np.isfinite(value))
+            or value == -9999.0
+            or np.isclose(value, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5)
+        )
+
+    if any(flag == int(FLAG_BAD) for flag in input_flags):
+        return np.int8(FLAG_BAD)
+
+    if (
+        _missing(derived_value)
+        or int(derived_flag) == int(FLAG_MISSING)
+        or any(flag == int(FLAG_MISSING) for flag in input_flags)
+        or any(_missing(value) for value in input_values)
+    ):
+        return np.int8(FLAG_MISSING)
+
+    if any(flag == int(FLAG_SUSPECT) for flag in input_flags):
+        return np.int8(FLAG_SUSPECT)
+
+    if int(derived_flag) in (int(FLAG_GOOD), int(FLAG_ESTIMATED)):
+        return np.int8(FLAG_ESTIMATED)
+
+    return np.int8(derived_flag)
 
 def apply_hma_climatology_qc(
     Q,
@@ -412,6 +445,16 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
         output_dir=output_dir
     )
 
+    # SSC is derived from Q and SSL in this HMA workflow.
+    # Therefore, valid derived SSC is estimated unless an input flag is worse.
+    if SSC != -9999.0:
+        SSC_flag = propagate_derived_scalar_flag(
+            derived_value=SSC,
+            derived_flag=SSC_flag,
+            input_flags=[Q_flag, SSL_flag],
+            input_values=[Q, SSL],
+        )
+
     # Create NetCDF file
     nc = Dataset(filepath, 'w', format='NETCDF4')
 
@@ -496,7 +539,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     SSC_var.coordinates = 'time lat lon'
     SSC_var.ancillary_variables = 'SSC_flag'
     if SSC != -9999.0:
-        SSC_comment = f"Source: Calculated. Formula: SSC (mg/L) = SSL (ton/day) / (Q (m³/s) × 86.4), where 86.4 = 86400 s/day × 1000 L/m³ × 10⁻⁶ ton/mg. Represents mean annual value over period {period_str}."
+        SSC_comment = f"Source: Calculated. Formula: SSC (mg/L) = SSL (ton/day) / (Q (m³/s) × 0.0864), where 0.0864 = 86400 s/day × 1000 L/m³ / 10⁹ mg/ton. Represents mean annual value over period {period_str}."
     else:
         SSC_comment = "Source: Could not be calculated due to missing Q or SSL data."
     SSC_var.comment = SSC_comment
