@@ -476,7 +476,15 @@ def apply_gsed_qc_with_tool(ssc):
         "n_good": int(n_good),
     }
 
-    return ssc_qc, ssc_flag, qc_stats
+    # --- Step-level provenance arrays ---
+    ssc_flag_qc1 = np.array([apply_quality_flag(v, "SSC") for v in ssc], dtype=np.int8)
+    ssc_flag_qc2 = ssc_flag_qc1.copy()
+    if lower is not None:
+        outlier = ((ssc_qc < lower) | (ssc_qc > upper)) & (ssc_flag_qc2 == 0)
+        ssc_flag_qc2[outlier] = FLAG_SUSPECT
+    ssc_flag_qc3 = np.full(n, np.int8(8), dtype=np.int8)
+
+    return ssc_qc, ssc_flag, qc_stats, ssc_flag_qc1, ssc_flag_qc2, ssc_flag_qc3
 
 
 def find_data_period(ssc_data, flags):
@@ -582,7 +590,7 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
     basin_code_l4 = reach_meta.get('basin_code_l4')
 
     # Apply QC and get flags
-    ssc_qc, flags, qc_stats = apply_gsed_qc_with_tool(ssc_data)
+    ssc_qc, flags, qc_stats, ssc_qc1, ssc_qc2, ssc_qc3 = apply_gsed_qc_with_tool(ssc_data)
 
     print(
         f"Reach {r_id} QC summary:\n"
@@ -611,6 +619,9 @@ def create_netcdf(r_id, ssc_data, time_array, reach_meta, output_dir):
     ssc_subset = ssc_qc[start_idx:end_idx]
     flags_subset = flags[start_idx:end_idx]
     time_subset = time_array[start_idx:end_idx]
+    ssc_qc1_subset = ssc_qc1[start_idx:end_idx]
+    ssc_qc2_subset = ssc_qc2[start_idx:end_idx]
+    ssc_qc3_subset = ssc_qc3[start_idx:end_idx]
     n_times = len(time_subset)
 
     # Calculate statistics for CSV

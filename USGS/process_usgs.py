@@ -412,6 +412,32 @@ def process_single_station(args):
                 'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
             }
 
+        # --- Step-level QC provenance flags ---
+        _STEP_FLAG_SPECS = [
+            ('Q_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
+            ('Q_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
+            ('SSC_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
+            ('SSC_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
+            ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
+            ('SSL_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
+            ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
+            ('SSL_flag_qc3_from_ssc_q', [0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+        ]
+        for sname, sflag_vals, sflag_mean, slong_name in _STEP_FLAG_SPECS:
+            if sname in df.columns:
+                ds[sname] = ('time', df[sname].values.astype(np.int8))
+                ds[sname].attrs = {
+                    'long_name': slong_name,
+                    'standard_name': 'status_flag',
+                    '_FillValue': FILL_VALUE_INT,
+                    'flag_values': np.array(sflag_vals, dtype=np.int8),
+                    'flag_meanings': sflag_mean,
+                }
+                # Append to ancillary_variables if this step flag belongs to a data variable
+                parent = sname.split('_flag_')[0]
+                if parent in variables:
+                    ds[parent].attrs['ancillary_variables'] += ' ' + sname
+
         # Coordinates
         ds['lat'] = ((), station_info['dec_lat_va'])
         ds['lon'] = ((), station_info['dec_long_va'])

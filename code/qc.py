@@ -278,6 +278,100 @@ def propagate_ssc_q_inconsistency_to_ssl(
     return SSL_flag
 
 
+def propagate_input_flags_to_derived_ssl(
+    Q,
+    SSC,
+    SSL,
+    Q_flag,
+    SSC_flag,
+    SSL_flag,
+    ssl_is_derived_from_q_ssc,
+    SSL_step_flag=None,
+):
+    """Propagate suspect input flags to SSL derived from Q and SSC."""
+    if not ssl_is_derived_from_q_ssc:
+        return SSL_flag, SSL_step_flag
+
+    Qv = _as_float_array(Q)
+    SSCv = _as_float_array(SSC)
+    SSLv = _as_float_array(SSL)
+    Qf = np.asarray(Q_flag, dtype=np.int8)
+    SSCf = np.asarray(SSC_flag, dtype=np.int8)
+    SSLf = np.asarray(SSL_flag, dtype=np.int8).copy()
+
+    step = None
+    if SSL_step_flag is not None:
+        step = np.asarray(SSL_step_flag, dtype=np.int8).copy()
+
+    ssl_present = (
+        np.isfinite(SSLv)
+        & ~np.isclose(SSLv, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5)
+        & (SSLf != FILL_VALUE_INT)
+    )
+    input_suspect = (Qf == FLAG_SUSPECT) | (SSCf == FLAG_SUSPECT)
+    propagate = ssl_present & input_suspect & np.isin(SSLf, [FLAG_GOOD, FLAG_ESTIMATED])
+
+    SSLf[propagate] = FLAG_SUSPECT
+    if step is not None:
+        step[propagate] = FLAG_SUSPECT
+
+    return SSLf, step
+
+
+
+def _is_missing_numeric(value, fill_value_float=FILL_VALUE_FLOAT):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return True
+    return (
+        (not np.isfinite(value))
+        or np.isclose(value, float(fill_value_float), rtol=1e-5, atol=1e-5)
+    )
+
+
+def propagate_derived_flag_from_inputs(
+    derived_value,
+    derived_flag,
+    input_flags,
+    input_values,
+    *,
+    estimated_flag=FLAG_ESTIMATED,
+    suspect_flag=FLAG_SUSPECT,
+    bad_flag=FLAG_BAD,
+    missing_flag=FLAG_MISSING,
+    good_flag=FLAG_GOOD,
+):
+    """
+    Propagate QC flags to a derived Q/SSC/SSL value.
+
+    Priority:
+    1. any bad input -> derived flag = bad
+    2. any missing input or missing derived value -> derived flag = missing
+    3. any suspect input -> derived flag = suspect
+    4. otherwise a valid derived value -> derived flag = estimated
+    """
+    input_flags = [int(flag) for flag in input_flags]
+
+    if any(flag == int(bad_flag) for flag in input_flags):
+        return np.int8(bad_flag)
+
+    if (
+        _is_missing_numeric(derived_value)
+        or int(derived_flag) == int(missing_flag)
+        or any(flag == int(missing_flag) for flag in input_flags)
+        or any(_is_missing_numeric(value) for value in input_values)
+    ):
+        return np.int8(missing_flag)
+
+    if any(flag == int(suspect_flag) for flag in input_flags):
+        return np.int8(suspect_flag)
+
+    if int(derived_flag) in (int(good_flag), int(estimated_flag)):
+        return np.int8(estimated_flag)
+
+    return np.int8(derived_flag)
+
 def apply_hydro_qc_with_provenance(
     time,
     Q,
@@ -287,6 +381,9 @@ def apply_hydro_qc_with_provenance(
     Q_is_independent=True,
     SSC_is_independent=True,
     SSL_is_independent=False,
+    Q_derived_mask=None,
+    SSC_derived_mask=None,
+    SSL_derived_mask=None,
     ssl_is_derived_from_q_ssc=True,
     qc2_k=1.5,
     qc2_min_samples=5,
@@ -329,6 +426,57 @@ def apply_hydro_qc_with_provenance(
         k=qc2_k,
         min_samples=qc2_min_samples,
     )
+
+    # Propagate flags for variables derived during harmonization.
+    q_derived_mask = (
+        np.full(n, not bool(Q_is_independent), dtype=bool)
+        if Q_derived_mask is None
+        else np.asarray(Q_derived_mask, dtype=bool)
+    )
+    ssc_derived_mask = (
+        np.full(n, not bool(SSC_is_independent), dtype=bool)
+        if SSC_derived_mask is None
+        else np.asarray(SSC_derived_mask, dtype=bool)
+    )
+    ssl_default_derived = (not bool(SSL_is_independent)) and bool(ssl_is_derived_from_q_ssc)
+    ssl_derived_mask = (
+        np.full(n, ssl_default_derived, dtype=bool)
+        if SSL_derived_mask is None
+        else np.asarray(SSL_derived_mask, dtype=bool)
+    )
+
+    for mask_name, mask_value in (
+        ("Q_derived_mask", q_derived_mask),
+        ("SSC_derived_mask", ssc_derived_mask),
+        ("SSL_derived_mask", ssl_derived_mask),
+    ):
+        if mask_value.shape[0] != n:
+            raise ValueError(f"{mask_name} length mismatch: expected {n}, got {mask_value.shape[0]}")
+
+    for i in np.where(q_derived_mask)[0]:
+        Q_flag[i] = propagate_derived_flag_from_inputs(
+            derived_value=Qv[i],
+            derived_flag=Q_flag[i],
+            input_flags=[SSC_flag[i], SSL_flag[i]],
+            input_values=[SSCv[i], SSLv[i]],
+        )
+
+    for i in np.where(ssc_derived_mask)[0]:
+        SSC_flag[i] = propagate_derived_flag_from_inputs(
+            derived_value=SSCv[i],
+            derived_flag=SSC_flag[i],
+            input_flags=[Q_flag[i], SSL_flag[i]],
+            input_values=[Qv[i], SSLv[i]],
+        )
+
+    for i in np.where(ssl_derived_mask)[0]:
+        SSL_flag[i] = propagate_derived_flag_from_inputs(
+            derived_value=SSLv[i],
+            derived_flag=SSL_flag[i],
+            input_flags=[Q_flag[i], SSC_flag[i]],
+            input_values=[Qv[i], SSCv[i]],
+        )
+
 
     SSC_flag_qc3_ssc_q = np.full(n, FLAG_NOT_CHECKED, dtype=np.int8)
     SSL_flag_qc3_from_ssc_q = np.full(n, FLAG_NOT_CHECKED, dtype=np.int8)
@@ -382,6 +530,17 @@ def apply_hydro_qc_with_provenance(
                 if (prev_ssl_flag in (FLAG_GOOD, FLAG_ESTIMATED) and SSL_flag[i] == FLAG_SUSPECT)
                 else FLAG_GOOD
             )
+
+    SSL_flag, SSL_flag_qc3_from_ssc_q = propagate_input_flags_to_derived_ssl(
+        Q=Qv,
+        SSC=SSCv,
+        SSL=SSLv,
+        Q_flag=Q_flag,
+        SSC_flag=SSC_flag,
+        SSL_flag=SSL_flag,
+        ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
+        SSL_step_flag=SSL_flag_qc3_from_ssc_q,
+    )
 
     valid_time = (
         (Q_flag != FILL_VALUE_INT)

@@ -309,8 +309,8 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
         qc_report.update({"SSC_qc3_pass":c["pass"], "SSC_qc3_suspect":c["suspect"], "SSC_qc3_not_checked":c["not_checked"], "SSC_qc3_missing":c["missing"]})
 
     if "SSL_flag_qc3_from_ssc_q" in qc:
-        # 你们约定：0 not_propagated, 1 propagated, 8 not_checked, 9 missing（如果你代码里是这个）
-        c = _count_step(qc["SSL_flag_qc3_from_ssc_q"], {"not_propagated":0, "propagated":1, "not_checked":8, "missing":9})
+        # Shared QC convention: 0 not_propagated, 2 propagated/suspect, 8 not_checked, 9 missing.
+        c = _count_step(qc["SSL_flag_qc3_from_ssc_q"], {"not_propagated":0, "propagated":2, "not_checked":8, "missing":9})
         qc_report.update({"SSL_qc3_not_propagated":c["not_propagated"], "SSL_qc3_propagated":c["propagated"], "SSL_qc3_not_checked":c["not_checked"], "SSL_qc3_missing":c["missing"]})
 
     return qc, qc_report
@@ -495,19 +495,33 @@ def create_netcdf(df, station_info, output_path, history_log):
         qc3_ssl_mean = "not_propagated propagated not_checked missing"
 
         # 只要 df 里存在这些列，就写进 NetCDF
+        written_step_flags = []
         for col in df.columns:
             if col == "Q_flag_qc1_physical":
                 _add_step_flag(col, df[col].values, "QC1 physical check flag for discharge", qc1_vals, qc1_mean)
+                written_step_flags.append(col)
             elif col == "SSC_flag_qc1_physical":
                 _add_step_flag(col, df[col].values, "QC1 physical check flag for SSC", qc1_vals, qc1_mean)
+                written_step_flags.append(col)
             elif col == "SSL_flag_qc1_physical":
                 _add_step_flag(col, df[col].values, "QC1 physical check flag for SSL", qc1_vals, qc1_mean)
+                written_step_flags.append(col)
             elif col.endswith("flag_qc2_log_iqr"):
                 _add_step_flag(col, df[col].values, f"QC2 log-IQR flag: {col}", qc2_vals, qc2_mean)
+                written_step_flags.append(col)
             elif col.endswith("flag_qc3_ssc_q"):
                 _add_step_flag(col, df[col].values, "QC3 SSC–Q consistency flag", qc3_vals, qc3_mean)
+                written_step_flags.append(col)
             elif col.endswith("flag_qc3_from_ssc_q"):
                 _add_step_flag(col, df[col].values, "QC3 SSL propagation from SSC–Q", qc3_ssl_vals, qc3_ssl_mean)
+                written_step_flags.append(col)
+
+        # Update ancillary_variables to include step flags
+        for var_name in ['Q', 'SSC', 'SSL']:
+            step_for_var = [s for s in written_step_flags if s.startswith(var_name)]
+            if step_for_var:
+                current = ds.variables[var_name].ancillary_variables
+                ds.variables[var_name].ancillary_variables = current + ' ' + ' '.join(step_for_var)
 
 def generate_summary_csv(station_summaries, output_dir):
     """Generates a summary CSV for all processed stations."""

@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-SCRIPT = Path(__file__).resolve().parent / "process_eusedcollab_to_cf18_wzx.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "EUSEDcollab" / "process_eusedcollab_to_cf18_wzx.py"
 SOURCE_DIR = Path("/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/EUSEDcollab")
 
 
@@ -204,7 +204,7 @@ def test_real_source_timestep_records_are_standardized():
     assert np.nanmax(id10["SSL"].replace(mod.FILL_VALUE, np.nan)) < 10000.0
 
 
-def test_real_source_id20_extreme_values_are_not_silently_reinterpreted():
+def test_real_source_id20_seconds_mismatch_is_corrected():
     if not SOURCE_DIR.exists():
         return
     old_source = mod.SOURCE_DIR
@@ -214,7 +214,12 @@ def test_real_source_id20_extreme_values_are_not_silently_reinterpreted():
     finally:
         mod.SOURCE_DIR = old_source
     ssc = out["SSC"].replace(mod.FILL_VALUE, np.nan)
-    assert_close(np.nanmax(ssc), 56178000.0)
+    q = out["Q"].replace(mod.FILL_VALUE, np.nan)
+    ssl = out["SSL"].replace(mod.FILL_VALUE, np.nan)
+    ratio = ssl / (0.0864 * q * ssc)
+    assert_close(np.nanmax(ssc), 56178000.0 / 86400.0, rel=1e-6)
+    assert_close(np.nanmedian(ratio.replace([np.inf, -np.inf], np.nan).dropna()), 1.0, rel=1e-5)
+    assert bool(out["SSC_derived"].any())
 
 
 def main():

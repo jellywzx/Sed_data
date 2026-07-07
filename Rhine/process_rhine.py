@@ -278,7 +278,7 @@ def apply_tool_qc(
 
         # SSL qc3: 0 not_propagated, 1 propagated, 8 not_checked, 9 missing
         "SSL_qc3_not_propagated": _cnt(ssl_qc3, 0),
-        "SSL_qc3_propagated":     _cnt(ssl_qc3, 1),
+        "SSL_qc3_propagated":     _cnt(ssl_qc3, 2),
         "SSL_qc3_not_checked":    _cnt(ssl_qc3, 8),
         "SSL_qc3_missing":        _cnt(ssl_qc3, 9),
     })
@@ -619,7 +619,7 @@ def process_rhine_data(output_path, source_path):
             if 'SSL_flag_qc3_from_ssc_q' in merged.columns:
                 _add_step_flag(
                     'SSL_flag_qc3_from_ssc_q', merged['SSL_flag_qc3_from_ssc_q'].fillna(9).values,
-                    flag_values=[0, 1, 8, 9],
+                    flag_values=[0, 2, 8, 9],
                     flag_meanings='not_propagated propagated not_checked missing',
                     long_name='QC3 propagated inconsistency flag for suspended sediment load',
                 )

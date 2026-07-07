@@ -535,7 +535,7 @@ def main():
             q_var.units = 'm3 s-1'
             q_var.long_name = 'River Discharge'
             q_var.standard_name = 'river_discharge'
-            q_var.ancillary_variables = 'Q_flag'
+            q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
             q_var[:,0,0] = df['Q'].fillna(-9999.0).values
 
             q_flag_var = nc.createVariable('Q_flag', 'b', ('time', 'lat', 'lon'),fill_value=FILL_VALUE_INT)
@@ -548,7 +548,7 @@ def main():
             ssc_var.units = 'mg L-1'
             ssc_var.long_name = 'Suspended Sediment Concentration'
             ssc_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
-            ssc_var.ancillary_variables = 'SSC_flag'
+            ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q_envelope'
             ssc_var[:,0,0] = df['SSC'].fillna(FILL_VALUE_FLOAT).values
 
             ssc_flag_var = nc.createVariable('SSC_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
@@ -561,7 +561,7 @@ def main():
             ssl_var.units = 'ton day-1'
             ssl_var.long_name = 'Suspended Sediment Load'
             ssl_var.standard_name = 'suspended_sediment_load'
-            ssl_var.ancillary_variables = 'SSL_flag'
+            ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_propagated_from_ssc_q'
             ssl_var[:,0,0] = df['SSL'].fillna(FILL_VALUE_FLOAT).values
 
             ssl_flag_var = nc.createVariable('SSL_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
@@ -569,29 +569,27 @@ def main():
             ssl_flag_var.flag_values = [0, 1, 2, 3, 9]
             ssl_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
             ssl_flag_var[:,0,0] = df['SSL_flag'].values
-            # ---------- Step/provenance flags (optional but recommended) ----------
-            def _write_step_flag(varname):
+            # --- Step-level QC provenance flags ---
+            _STEP_FLAG_SPECS = {
+                'Q_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
+                'Q_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
+                'Q_flag_qc3_ssc_q_envelope':     ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q enrichment flag for river discharge'),
+                'SSC_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
+                'SSC_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
+                'SSC_flag_qc3_ssc_q_envelope':     ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
+                'SSL_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
+                'SSL_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
+                'SSL_flag_qc3_propagated_from_ssc_q': ([0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+            }
+            for varname, (fvals, fmean, lname) in _STEP_FLAG_SPECS.items():
                 if varname in df.columns:
                     v = nc.createVariable(varname, 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
-                    v.long_name = f"Provenance step flag: {varname}"
-                    v.flag_values = [0, 1, 2, 3, 9]
-                    v.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
+                    v.long_name = lname
+                    v.standard_name = 'status_flag'
+                    v.flag_values = fvals
+                    v.flag_meanings = fmean
+                    v.missing_value = FILL_VALUE_INT
                     v[:, 0, 0] = df[varname].fillna(9).astype(np.int8).values
-
-            # Q steps
-            _write_step_flag("Q_flag_qc1_physical")
-            _write_step_flag("Q_flag_qc2_log_iqr")
-            _write_step_flag("Q_flag_qc3_ssc_q_envelope")
-
-            # SSC steps
-            _write_step_flag("SSC_flag_qc1_physical")
-            _write_step_flag("SSC_flag_qc2_log_iqr")
-            _write_step_flag("SSC_flag_qc3_ssc_q_envelope")
-
-            # SSL steps
-            _write_step_flag("SSL_flag_qc1_physical")
-            _write_step_flag("SSL_flag_qc2_log_iqr")
-            _write_step_flag("SSL_flag_qc3_propagated_from_ssc_q")
 
         print(f"  - Created {nc_filename}")
 

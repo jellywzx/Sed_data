@@ -169,8 +169,8 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
     qc2_map   = {"pass":0, "suspect":2, "not_checked":8, "missing":9}
     # qc3 SSC-Q: 0 pass,2 suspect,8 not_checked,9 missing
     qc3_map   = {"pass":0, "suspect":2, "not_checked":8, "missing":9}
-    # qc3 SSL propagate: 0 not_propagated,1 propagated,8 not_checked,9 missing
-    ssl3_map  = {"not_propagated":0, "propagated":1, "not_checked":8, "missing":9}
+    # qc3 SSL propagate: 0 not_propagated,2 propagated/suspect,8 not_checked,9 missing
+    ssl3_map  = {"not_propagated":0, "propagated":2, "not_checked":8, "missing":9}
 
     qf   = _cnt(qc["Q_flag"],   final_map)
     sscf = _cnt(qc["SSC_flag"], final_map)

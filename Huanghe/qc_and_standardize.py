@@ -256,6 +256,9 @@ def write_standardized_file(
     summary,
     ssc_comment,
     global_comment,
+    ssc_flag_qc1=None,
+    ssc_flag_qc2=None,
+    ssc_flag_qc3=None,
 ):
     """Write one standardized NetCDF file."""
 
@@ -343,6 +346,29 @@ def write_standardized_file(
             "3=Bad (e.g., negative), 9=Missing in source."
         )
         ssc_flag_var[:] = np.asarray(ssc_flag_out, dtype=np.int8)
+
+        # --- Step-level QC provenance flags ---
+        if ssc_flag_qc1 is None:
+            ssc_flag_qc1 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
+        if ssc_flag_qc2 is None:
+            ssc_flag_qc2 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
+        if ssc_flag_qc3 is None:
+            ssc_flag_qc3 = np.full(len(time_vals_out), np.int8(8), dtype=np.int8)
+        def _add_step_flag(name, values, fvals, fmean, lname):
+            v = ds.createVariable(name, "b", ("time",), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = np.asarray(values, dtype=np.int8)
+
+        _add_step_flag('SSC_flag_qc1_physical', np.asarray(ssc_flag_qc1, dtype=np.int8), [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration')
+        _add_step_flag('SSC_flag_qc2_log_iqr', np.asarray(ssc_flag_qc2, dtype=np.int8), [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration')
+        _add_step_flag('SSC_flag_qc3_ssc_q', np.asarray(ssc_flag_qc3, dtype=np.int8), [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration')
+
+        ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+
 
         # Global attributes
         ds.Conventions = "CF-1.8, ACDD-1.3"
@@ -486,6 +512,7 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
 
     # QC checks
     SSC_flag = np.array([apply_quality_flag(v, "SSC") for v in ssc_vals], dtype=np.int8)
+    lower, upper = None, None
 
     valid_ssc = ssc_vals[(SSC_flag == 0) & np.isfinite(ssc_vals) & (ssc_vals > 0)]
 
@@ -505,6 +532,16 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
                 ):
                     SSC_flag[i] = np.int8(2)
 
+
+    # --- Step-level QC provenance arrays ---
+    ssc_flag_qc1 = np.array([apply_quality_flag(v, "SSC") for v in ssc_vals], dtype=np.int8)
+    ssc_flag_qc2 = ssc_flag_qc1.copy()
+    if lower is not None:
+        for ii, vv in enumerate(ssc_vals):
+            if (ssc_flag_qc2[ii] == 0 and np.isfinite(vv) and vv > 0
+                    and (vv < lower or vv > upper)):
+                ssc_flag_qc2[ii] = np.int8(2)
+    ssc_flag_qc3 = np.full(len(SSC_flag), np.int8(8), dtype=np.int8)
     # QC summary for annual sequence
     n_total = len(SSC_flag)
     n_good = int(np.sum(SSC_flag == 0))
@@ -668,6 +705,9 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             f"Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
             f"Note: Discharge and sediment load data are NOT available in the original dataset."
         ),
+        ssc_flag_qc1=ssc_flag_qc1,
+        ssc_flag_qc2=ssc_flag_qc2,
+        ssc_flag_qc3=ssc_flag_qc3,
     )
 
     # Write climatology file
@@ -714,6 +754,9 @@ def standardize_netcdf_file(input_file, output_dir_ann, output_dir_clim, climato
             + "Quality flags indicate data reliability: 0=good, 1=estimated, 2=suspect, 3=bad, 9=missing. "
             + "Note: Discharge and sediment load data are NOT available in the original dataset."
         ),
+        ssc_flag_qc1=clim_flag_vals,
+        ssc_flag_qc2=clim_flag_vals,
+        ssc_flag_qc3=clim_flag_vals,
     )
 
     # Build station summaries

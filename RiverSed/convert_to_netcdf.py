@@ -1240,6 +1240,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         Q_var.long_name = 'river discharge'
         Q_var.units = 'm3 s-1'
         Q_var.coordinates = 'time latitude longitude'
+        Q_var.ancillary_variables = 'Q_flag'
         Q_var.comment = 'Discharge data not available - all values set to missing'
         # Set all discharge to fill value (NaN equivalent)
         Q_var[:] = -9999.0
@@ -1256,6 +1257,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         SSC_var.long_name = 'suspended sediment concentration'
         SSC_var.units = 'mg L-1'
         SSC_var.coordinates = 'time latitude longitude'
+        SSC_var.ancillary_variables = 'SSC_flag'
         SSC_var.comment = 'SSC from satellite observations (Aquasat/RiverSed database)'
         SSC_var[:] = daily_df['tss'].fillna(-9999.0).values
 
@@ -1273,6 +1275,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         SSL_var.long_name = 'suspended sediment load'
         SSL_var.units = 'ton day-1'
         SSL_var.coordinates = 'time latitude longitude'
+        SSL_var.ancillary_variables = 'SSL_flag'
         SSL_var.comment = 'Cannot be calculated without discharge data - all values set to missing'
         # Set all sediment load to fill value
         SSL_var[:] = -9999.0
@@ -1286,6 +1289,9 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
         # =============================
         # Step / provenance flags (SSC)
         # =============================
+        # Update ancillary_variables to include step flags for SSC
+        if 'SSC_flag_qc1_physical' in daily_df.columns:
+            SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
         def _add_step_flag(name, values, flag_values, flag_meanings, long_name):
             v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
             v.long_name = long_name

@@ -96,7 +96,7 @@ PIPELINES = {
     "GSED": {
         "summary": "Global sediment dataset",
         "stages": [
-            {"script": "GSED/process_gsed_cf18.py", "description": "Canonical end-to-end processor"},
+            {"script": "GSED/1_process_gsed_cf18.py", "description": "Canonical end-to-end processor"},
             {"script": "GSED/validate_gsed_data.py", "description": "Post-run validator", "optional": True},
         ],
     },

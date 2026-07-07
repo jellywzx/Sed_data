@@ -390,6 +390,53 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
     else:
         yield_var[0] = -9999.0
 
+    # --- Step-level QC provenance flags ---
+    def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
+        if values is None or len(values) == 0:
+            return
+        v = nc.createVariable(name, 'i1', ('time',), fill_value=FILL_VALUE_INT)
+        v.long_name = long_name
+        v.standard_name = 'status_flag'
+        v.flag_values = np.array(flag_values, dtype=np.int8)
+        v.flag_meanings = flag_meanings
+        v.missing_value = np.int8(FILL_VALUE_INT)
+        v[:] = np.asarray(values, dtype=np.int8)
+
+    # Q steps: qc1, qc2
+    _add_step_flag('Q_flag_qc1_physical', qc_step.get('Q_flag_qc1_physical'),
+        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+        long_name='QC1 physical flag for river discharge')
+    _add_step_flag('Q_flag_qc2_log_iqr', qc_step.get('Q_flag_qc2_log_iqr'),
+        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+        long_name='QC2 log-IQR flag for river discharge')
+
+    # SSC steps: qc1, qc2, qc3
+    _add_step_flag('SSC_flag_qc1_physical', qc_step.get('SSC_flag_qc1_physical'),
+        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+        long_name='QC1 physical flag for suspended sediment concentration')
+    _add_step_flag('SSC_flag_qc2_log_iqr', qc_step.get('SSC_flag_qc2_log_iqr'),
+        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+        long_name='QC2 log-IQR flag for suspended sediment concentration')
+    _add_step_flag('SSC_flag_qc3_ssc_q', qc_step.get('SSC_flag_qc3_ssc_q'),
+        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+        long_name='QC3 SSC-Q consistency flag for suspended sediment concentration')
+
+    # SSL steps: qc1, qc2, qc3
+    _add_step_flag('SSL_flag_qc1_physical', qc_step.get('SSL_flag_qc1_physical'),
+        flag_values=[0, 3, 9], flag_meanings='pass bad missing',
+        long_name='QC1 physical flag for suspended sediment load')
+    _add_step_flag('SSL_flag_qc2_log_iqr', qc_step.get('SSL_flag_qc2_log_iqr'),
+        flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
+        long_name='QC2 log-IQR flag for suspended sediment load')
+    _add_step_flag('SSL_flag_qc3_from_ssc_q', qc_step.get('SSL_flag_qc3_from_ssc_q'),
+        flag_values=[0, 2, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+        long_name='QC3 propagation flag for suspended sediment load')
+
+    # Update ancillary_variables to include step flags
+    Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
+    SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+    SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+
     # ========== GLOBAL ATTRIBUTES (CF-1.8 and ACDD-1.3) ==========
 
     # Conventions

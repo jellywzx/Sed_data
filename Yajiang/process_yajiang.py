@@ -563,6 +563,33 @@ def process_yajiang():
                         'flag_values': np.array([0, 1, 2, 3, 9], dtype=np.int8),
                         'flag_meanings': 'good_data estimated_data suspect_data bad_data missing_data',
                     }
+
+        # --- Step-level QC provenance flags ---
+        _STEP_FLAG_SPECS = [
+            ('Q_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
+            ('Q_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
+            ('SSC_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
+            ('SSC_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
+            ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
+            ('SSL_flag_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
+            ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
+            ('SSL_flag_qc3_from_ssc_q', [0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+        ]
+        for sname, sflag_vals, sflag_mean, slong_name in _STEP_FLAG_SPECS:
+            if sname in df.columns:
+                # match the (time, lat, lon) structure
+                new_ds[sname] = (('time', 'lat', 'lon'),
+                                 df[sname].values.astype(np.int8)[:, np.newaxis, np.newaxis])
+                new_ds[sname].attrs = {
+                    'long_name': slong_name,
+                    'standard_name': 'status_flag',
+                    '_FillValue': FILL_VALUE_INT,
+                    'flag_values': np.array(sflag_vals, dtype=np.int8),
+                    'flag_meanings': sflag_mean,
+                }
+                parent = sname.split('_flag_')[0]
+                if parent in variables and f'{parent}_flag' in df.columns:
+                    new_ds[parent].attrs['ancillary_variables'] += ' ' + sname
         altitude = ds.altitude.item() if 'altitude' in ds else FILL_VALUE_FLOAT
         new_ds['altitude'] = ((), altitude if np.isfinite(altitude) else FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT})
         new_ds['upstream_area'] = ((), FILL_VALUE_FLOAT, {'_FillValue': FILL_VALUE_FLOAT}) # Not available

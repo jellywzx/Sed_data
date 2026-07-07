@@ -346,13 +346,13 @@ def build_qc_results_summary_row(qc_df, station_name, source_id, river_name, lon
         "SSC_qc3_missing": {9, int(FILL_VALUE_INT)}
     }))
 
-    # SSL_qc3 propagation：这里默认 0=not_propagated, 1=propagated, 2=not_checked, 9=missing
+    # SSL_qc3 propagation: 0=not_propagated, 2=propagated/suspect, 8=not_checked, 9=missing
     col = "SSL_qc3_propagation"
     step = qc_df[col].to_numpy() if col in qc_df.columns else None
     row.update(_count_step(step, {
         "SSL_qc3_not_propagated": {0},
-        "SSL_qc3_propagated": {1},
-        "SSL_qc3_not_checked": {2},
+        "SSL_qc3_propagated": {2},
+        "SSL_qc3_not_checked": {8},
         "SSL_qc3_missing": {9, int(FILL_VALUE_INT)}
     }))
 
@@ -640,6 +640,41 @@ def create_netcdf_cf18(
     SSL_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
     SSL_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source. Inherits flags from Q and SSC.'
     SSL_flag_var[:] = data['SSL_flag'].values
+    
+    # --- Step-level QC provenance flags ---
+    # Note: The ancillary_variables already reference these names; we just need to create them.
+    # QC1: map from Q_qc1_physical-style names to Q_flag_qc1_physical-style NC names
+    _QC1_COL_MAP = {
+        'Q_flag_qc1_physical': ('Q_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
+        'SSC_flag_qc1_physical': ('SSC_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
+        'SSL_flag_qc1_physical': ('SSL_qc1_physical', [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
+    }
+    # QC2/QC3: the prov dict keys already match the NC names (e.g. Q_flag_qc2_log_iqr)
+    _QC23_SPECS = [
+        ('Q_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
+        ('SSC_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
+        ('SSL_flag_qc2_log_iqr', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
+        ('SSC_flag_qc3_ssc_q', [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
+        ('SSL_flag_qc3_from_ssc_q', [0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+    ]
+    for nc_name, (col_name, fvals, fmean, lname) in _QC1_COL_MAP.items():
+        if col_name in data.columns:
+            v = dataset.createVariable(nc_name, 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = data[col_name].values.astype(np.int8)
+    for nc_name, fvals, fmean, lname in _QC23_SPECS:
+        if nc_name in data.columns:
+            v = dataset.createVariable(nc_name, 'i1', ('time',), fill_value=FILL_VALUE_INT, zlib=True, complevel=4)
+            v.long_name = lname
+            v.standard_name = 'status_flag'
+            v.flag_values = np.array(fvals, dtype=np.int8)
+            v.flag_meanings = fmean
+            v.missing_value = np.int8(FILL_VALUE_INT)
+            v[:] = data[nc_name].values.astype(np.int8)
     
     # Global attributes - CF-1.8 and ACDD-1.3 compliant
     dataset.Conventions = 'CF-1.8, ACDD-1.3'
