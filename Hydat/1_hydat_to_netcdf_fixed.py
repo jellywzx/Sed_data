@@ -12,6 +12,14 @@ import numpy as np
 from datetime import datetime
 import os
 import sys
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.runtime import resolve_output_root, resolve_source_root
+from pathlib import Path
+
+
 
 class FixedHydatConverter:
     def __init__(self, mdb_path, output_path):
@@ -189,20 +197,13 @@ class FixedHydatConverter:
         print(f"File size: {os.path.getsize(self.output_path) / 1024 / 1024:.2f} MB")
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python hydat_to_netcdf_fixed.py <path_to_hydat.mdb> [output.nc]")
-        print("\n修复版本 - 正确处理字符串数据")
-        print("This script converts a HYDAT database (Hydat.mdb) to NetCDF format.")
-        print("Requires: mdbtools to be installed on the system")
-        print("\n示例:")
-        print("  python hydat_to_netcdf_fixed.py Hydat.mdb hydat_fixed.nc")
-        sys.exit(1)
-    
-    mdb_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else "hydat_fixed.nc"
-    
+    mdb_path = os.fspath(resolve_source_root(start=__file__) / "Hydat" / "Hydat.mdb")
+    output_dir = os.fspath(resolve_output_root(start=__file__, create=True) / "daily" / "HYDAT")
+    output_path = os.path.join(output_dir, "hydat.nc")
+
     if not os.path.exists(mdb_path):
         print(f"Error: File not found: {mdb_path}")
+        print("Make sure Hydat.mdb exists under the Source/ directory.")
         sys.exit(1)
     
     converter = FixedHydatConverter(mdb_path, output_path)
@@ -220,7 +221,7 @@ def main():
     print("\n" + "="*80)
     print("请验证输出文件:")
     print("="*80)
-    print(f"python diagnose_stations.py {output_path}")
+    print(f"  {output_path}")
     print("="*80)
 
 if __name__ == "__main__":

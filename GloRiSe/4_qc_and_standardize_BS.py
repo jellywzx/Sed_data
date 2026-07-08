@@ -296,7 +296,7 @@ def standardize_station_file(input_file):
         if start_idx is None:
             print(f"  ✗ Skipped: No valid data")
             ds_in.close()
-            return None
+            return None, None
 
         # Trim arrays
         time = time_in[start_idx:end_idx]
@@ -305,7 +305,7 @@ def standardize_station_file(input_file):
         ssl = ssl_in[start_idx:end_idx]
         
         # Apply QC checks
-        q_flag, ssc_flag, ssl_flag, ssc_q_bounds,qc_report = apply_tool_qc(
+        q_flag, ssc_flag, ssl_flag, ssc_q_bounds, qc_report, *_ = apply_tool_qc(
             discharge,
             ssc,
             ssl,
@@ -389,7 +389,7 @@ def standardize_station_file(input_file):
         if not all_dates:
             print(f"  ✗ Skipped: No valid dates")
             ds_in.close()
-            return None
+            return None, None
 
         temporal_start = min(all_dates)
         temporal_end = max([d for d in [q_end, ssc_end, ssl_end] if d is not None])
@@ -591,7 +591,7 @@ def standardize_station_file(input_file):
     except Exception as e:
         print(f"  ✗ Error: {e}")
         ds_in.close()
-        return None
+        return None, None
 
 
 def main():
