@@ -105,8 +105,8 @@ PIPELINES = {
         "stages": [
             {"script": "GloRiSe/1_generate_netcdf_SS.py", "description": "Generate SS intermediate NetCDF"},
             {"script": "GloRiSe/2_qc_and_standardize_glorise.py", "description": "QC + standardize SS"},
-            {"script": "GloRiSe/3_generate_nc_BS.py", "description": "Generate BS intermediate NetCDF"},
-            {"script": "GloRiSe/4_qc_and_standardize_BS.py", "description": "QC + standardize BS"},
+            # {"script": "GloRiSe/3_generate_nc_BS.py", "description": "Generate BS intermediate NetCDF"},
+            # {"script": "GloRiSe/4_qc_and_standardize_BS.py", "description": "QC + standardize BS"},
         ],
     },
     "HMA": {
@@ -132,16 +132,10 @@ PIPELINES = {
     "Hydat": {
         "summary": "HYDAT four-stage pipeline",
         "stages": [
-            {"script": "Hydat/1_hydat_to_netcdf_fixed.py", "description": "Convert HYDAT MDB to discharge NetCDF"},
+            # {"script": "Hydat/1_hydat_to_netcdf_fixed.py", "description": "Convert HYDAT MDB to discharge NetCDF"},
             {"script": "Hydat/2_extract_sediment_data_prallel.py", "description": "Extract sediment data by station"},
             {"script": "Hydat/3_update_sediment_nc_fixed.py", "description": "Merge/update sediment NetCDF"},
             {"script": "Hydat/4_process_hydat_cf18.py", "description": "QC + CF standardization"},
-        ],
-    },
-    "Land2sea": {
-        "summary": "Land2Sea model output conversion",
-        "stages": [
-            {"script": "Land2sea/convert_land2sea_to_netcdf.py", "description": "Convert + CF NetCDF"},
         ],
     },
     "Mekong_Delta": {
@@ -296,8 +290,12 @@ def run_stage(script_path, python_executable, env, dry_run):
     cmd = [python_executable, str(script_path)]
     if dry_run:
         print("DRY RUN:", " ".join(cmd))
-        return
-    subprocess.run(cmd, cwd=str(SCRIPT_ROOT), env=env, check=True)
+        return True
+    result = subprocess.run(cmd, cwd=str(SCRIPT_ROOT), env=env)
+    if result.returncode != 0:
+        print(f"    ✗ Failed with exit code {result.returncode}")
+        return False
+    return True
 
 
 def parse_args():
@@ -340,15 +338,37 @@ def main():
     print(f"Output root: {output_root}")
     print()
 
+    failed_datasets = []
+
     for dataset_name in selected:
         print(f"== {dataset_name} ==")
+        dataset_ok = True
         for index, stage in enumerate(iter_stages(dataset_name, include_optional=args.include_optional), start=1):
             script_path = SCRIPT_ROOT / stage["script"]
             if not script_path.exists():
-                raise FileNotFoundError(f"Stage script not found: {script_path}")
+                print(f"    ✗ Stage script not found: {script_path}")
+                dataset_ok = False
+                break
             print(f"{index}. {stage['description']}")
-            run_stage(script_path, args.python, env, args.dry_run)
+            if not run_stage(script_path, args.python, env, args.dry_run):
+                dataset_ok = False
+                break
+        if not dataset_ok:
+            failed_datasets.append(dataset_name)
+            print(f"  → Dataset '{dataset_name}' skipped remaining stages due to error.")
         print()
+
+    # ── Final summary ──
+    if failed_datasets:
+        print("=" * 60)
+        print(f"PIPELINE COMPLETE WITH {len(failed_datasets)} FAILED DATASET(S):")
+        for name in failed_datasets:
+            print(f"  ✗ {name}")
+        print()
+        print("Fix the failing dataset(s) and re-run individually, e.g.:")
+        print(f"  python run_pipeline.py {' '.join(failed_datasets)}")
+    else:
+        print("All datasets completed successfully.")
 
 
 if __name__ == "__main__":
