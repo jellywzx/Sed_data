@@ -140,3 +140,181 @@ qc_result = apply_hydro_qc_with_provenance(
 | `country` | 国家名称 |
 | `continent_region` | 大洲/区域 |
 | `geospatial_lat_min` / `geospatial_lat_max` | 纬度范围 |
+| `geospatial_lon_min` / `geospatial_lon_max` | 经度范围 |
+| `upstream_area` | 上游集水面积 (km²) |
+| `geographic_coverage` | 文字描述的地理覆盖范围 |
+
+#### 时间
+| 属性名 | 说明 |
+|--------|------|
+| `temporal_resolution` | 时间分辨率（daily/monthly/annual/climatology） |
+| `temporal_span` | 覆盖期字符串，如 `"2000-01-01 to 2020-12-31"` |
+| `time_coverage_start` | 起始日期 |
+| `time_coverage_end` | 结束日期 |
+
+#### 数据来源与引用
+| 属性名 | 说明 |
+|--------|------|
+| `data_source_name` | 数据集名称 |
+| `source_data_link` | 原始数据链接 |
+| `creator_institution` | 创建机构 |
+| `creator_name` | 创建者 |
+| `creator_email` | 创建者邮箱 |
+| `references` | 参考文献（多个用 ` | ` 拼接） |
+| `source` | 数据来源简述 |
+
+#### CF/ACDD 惯例
+| 属性名 | 说明 |
+|--------|------|
+| `Conventions` | 强制覆写为 `CF-1.8, ACDD-1.3` |
+| `title` | 数据集标题 |
+| `summary` | 数据集摘要 |
+| `history` | 处理历史 |
+| `date_created` | 创建日期 |
+| `date_modified` | 修改日期 |
+| `processing_level` | 处理等级 |
+| `featureType` | 特征类型 |
+| `comment` | 补充说明 |
+| `variables_provided` | 提供的变量列表 |
+
+### 4.2 向后兼容属性
+
+在写入标准 `station_id` 的同时，建议保留旧的兼容属性名（如 `Source_ID`），确保老版本的 `scripts_basin_test` 仍可解析：
+
+```python
+ds.station_id = str(station_id)   # 标准键名（必须）
+ds.Source_ID = str(station_id)    # 兼容键名（建议保留）
+```
+
+> 当前处理脚本使用的站点 ID 键名不一：`station_id`（GSED、Huanghe、RiverSed、Yajiang、Vanmaercke、Fukushima、Hydat、bayern）、`Source_ID`（HYBAM、Mekong_Delta、Shashi_Jianli、Eurasian_River、GFQA_v2、Robotham、Yajiang）、或两者兼有。建议统一写 `station_id`。
+
+---
+
+## 5. NetCDF 变量标准
+
+### 5.1 坐标变量
+
+| 变量名 | 维度 | 类型 | units |
+|--------|------|------|-------|
+| `time` | (time) | f8 | `days since 1970-01-01 00:00:00` |
+| `lat` | 标量 | f4 | `degrees_north` |
+| `lon` | 标量 | f4 | `degrees_east` |
+| `altitude` | 标量 | f4 | `m` |
+| `upstream_area` | 标量 | f4 | `km2` |
+
+### 5.2 数据变量
+
+| 变量名 | 维度 | 类型 | units | ancillary_variables |
+|--------|------|------|-------|-------------------|
+| `Q` | (time) | f4 | `m3 s-1` | `Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr` |
+| `SSC` | (time) | f4 | `mg L-1` | `SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q` |
+| `SSL` | (time) | f4 | `ton day-1` | `SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q` |
+
+### 5.3 QC 标志变量
+
+最终 QC 标志变量使用 `int8` 类型，共享相同的 flag_values/flag_meanings：
+
+```python
+flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
+flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
+```
+
+逐步 QC 标志不使用同一套含义。尤其是 `SSL_flag_qc3_from_ssc_q` 必须使用以下独立 contract：
+
+```python
+flag_values = np.array([0, 2, 8, 9], dtype=np.int8)
+flag_meanings = 'not_propagated propagated not_checked missing'
+```
+
+其中 `2=propagated`，表示 SSC-Q inconsistency 已传播到派生 SSL，因此 SSL 的最终标志也应为 suspect。不要将 `1` 用于 propagated，因为 `1` 只表示最终变量值为 estimated/derived。
+
+---
+
+## 6. FillValue 约定
+
+| 变量类型 | FillValue |
+|---------|-----------|
+| 浮点变量 (Q, SSC, SSL) | `-9999.0` (对应 `code.constants.FILL_VALUE_FLOAT`) |
+| 整型变量 (flags) | `9` (对应 `code.constants.FILL_VALUE_INT`，与 `FLAG_MISSING` 一致) |
+
+数据流中应使用 `np.nan` 进行计算，最终写入 NetCDF 时转为 FillValue。
+
+---
+
+## 7. QC 数据流规范
+
+```
+原始数据
+    │
+    ▼
+[单位转换]  → Q: m³/s, SSC: mg/L, SSL: ton/day
+    │
+    ▼
+[缺失推导]  → 仅 EUSEDcollab: 用 SSL=Q×SSC×0.0864 双向推导，标记 Q_derived/SSC_derived/SSL_derived
+    │
+    ▼
+[apply_hydro_qc_with_provenance]
+    │  ├─ QC1: Physical (flag bad/missing)
+    │  ├─ QC2: Log-IQR outlier (flag suspect)
+    │  └─ QC3: SSC-Q envelope + SSL propagation (flag suspect; step flag uses 2=propagated)
+    │
+    ▼
+[trim_to_valid_data]  → 裁剪到有效数据范围
+    │
+    ▼
+[write_netcdf]  → 写 CF-1.8 兼容 NetCDF，包括 final flags + stepwise flags
+    │
+    ▼
+[generate_summary_csv]  → 站点汇总表
+```
+
+---
+
+## 8. 时间分辨率约定
+
+| 实际时间分辨率 | 输出 temporal_resolution | s2 输出目录 |
+|---------------|------------------------|------------|
+| 小时 | `daily` | `daily` |
+| 日 | `daily` | `daily` |
+| 月 | `monthly` | `monthly` |
+| 季度 | `monthly` | `monthly` |
+| 年 | `annual` | `annual` |
+| 多年平均/气候态 | `climatology` | `climatology` |
+
+输出目录名必须与 `temporal_resolution` 全局属性一致。
+
+---
+
+## 9. 输出路径约定
+
+```
+Output_r/
+  {resolution}/           ← daily / monthly / annual / climatology
+    {dataset_name}/       ← EUSEDcollab / USGS / HYBAM / …
+      qc/                 ← 标准化 NetCDF 输出目录
+        EUSEDcollab_*.nc
+        …
+```
+
+---
+
+## 10. 当前差距清单
+
+| 规范要求 | 已符合的数据集 | 有差距的数据集 |
+|---------|--------------|--------------|
+| SSL 公式 0.0864 | EUSEDcollab, USGS, GFQA, HYBAM, Hydat | — |
+| NaN guard in SSL calc | EUSEDcollab, USGS, GFQA, HYBAM | — |
+| 逐步 QC 标志写入 NC | HYBAM, Eurasian_River, bayern, Chao_Phraya | **14 个数据集**（EUSEDcollab, USGS, GFQA, Dethier, Fukushima, Hydat, Mekong_Delta, Myanmar, NERC, Rhine, Robotham, Shashi_Jianli, Yajiang, ALi_De_Boer） |
+| `station_id` 标准键名 | GSED, Huanghe, RiverSed, Yajiang, Vanmaercke, Fukushima, Hydat, bayern | **需补充** station_id（HYBAM, Eurasian_River, GFQA, EUSEDcollab 等主要使用 Source_ID） |
+| `ancillary_variables` 关联完整 | HYBAM | **其余数据集**（EUSEDcollab 只关联 Q_flag/SSC_flag/SSL_flag） |
+
+---
+
+## 11. 数据集处理模式速查
+
+| 模式 | 代表数据集 | 特征 |
+|------|-----------|------|
+| **单脚本一体化** | HYBAM, GFQA, HMA, Rhine, EUSEDcollab | 1 个脚本完成读取→QC→标准化→输出 |
+| **两步式** | Huanghe, Vanmaercke, bayern | convert + qc_and_standardize 分离 |
+| **多步流水线** | Hydat (4步), Milliman (5步), GloRiSe (4步) | 流程拆分更细 |
+| **主处理+验证** | GSED, Myanmar, Mekong_Delta | 主脚本 + 独立验证/绘图脚本 |
