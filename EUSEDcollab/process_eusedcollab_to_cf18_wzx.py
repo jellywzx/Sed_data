@@ -24,6 +24,7 @@ Date: 2025-10-25
 
 import os
 import sys
+import inspect
 import pandas as pd
 import numpy as np
 import netCDF4 as nc
@@ -42,7 +43,7 @@ if SCRIPT_ROOT not in sys.path:
 from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
 from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
-    apply_hydro_qc_with_provenance,
+    apply_hydro_qc_with_provenance as shared_apply_hydro_qc_with_provenance,
     apply_quality_flag,
     apply_quality_flag_array,
     build_ssc_q_envelope,
@@ -688,7 +689,7 @@ def apply_hydro_qc_with_provenance(
     flag_estimated_mask=None,
 ):
     """
-    Apply QC (via qc_with_toolpy) + produce provenance summary.
+    Apply shared hydro QC + produce provenance summary.
 
     Returns
     -------
@@ -698,16 +699,115 @@ def apply_hydro_qc_with_provenance(
         station-level QC statistics (counts / percentages)
     """
 
-    # 1) run your existing QC
-    df_qc, ssc_q_bounds = qc_with_toolpy(
-        df=df,
-        station_id=station_id,
-        station_name=station_name,
-        diagnostic_dir=diagnostic_dir,
-        iqr_k=iqr_k,
-        min_samples_envelope=min_samples_envelope,
-        flag_estimated_mask=flag_estimated_mask,
+    del flag_estimated_mask
+
+    expected_params = {
+        "time",
+        "Q",
+        "SSC",
+        "SSL",
+        "Q_is_independent",
+        "SSC_is_independent",
+        "SSL_is_independent",
+        "Q_derived_mask",
+        "SSC_derived_mask",
+        "SSL_derived_mask",
+        "ssl_is_derived_from_q_ssc",
+        "qc2_k",
+        "qc2_min_samples",
+        "qc3_k",
+        "qc3_min_samples",
+    }
+    shared_params = inspect.signature(shared_apply_hydro_qc_with_provenance).parameters
+    missing_params = sorted(expected_params.difference(shared_params))
+    if missing_params:
+        raise TypeError(
+            "shared_apply_hydro_qc_with_provenance missing expected parameters: "
+            + ", ".join(missing_params)
+        )
+
+    df_qc = df.copy()
+
+    def _qc_array(column):
+        values = pd.to_numeric(df_qc[column], errors="coerce").to_numpy(dtype=float)
+        missing = (
+            np.isclose(values, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5)
+            | np.isclose(values, -9999.0, rtol=1e-5, atol=1e-5)
+        )
+        values[missing] = np.nan
+        df_qc[column] = values
+        return values
+
+    Q = _qc_array("Q")
+    SSC = _qc_array("SSC")
+    SSL = _qc_array("SSL")
+    valid_qc_mask = np.isfinite(Q) | np.isfinite(SSC) | np.isfinite(SSL)
+
+    qc_result = shared_apply_hydro_qc_with_provenance(
+        time=df["date"].to_numpy(),
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_derived_mask=df["Q_derived"].to_numpy(dtype=bool),
+        SSC_derived_mask=df["SSC_derived"].to_numpy(dtype=bool),
+        SSL_derived_mask=df["SSL_derived"].to_numpy(dtype=bool),
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=True,
+        ssl_is_derived_from_q_ssc=True,
+        qc2_k=iqr_k,
+        qc2_min_samples=min_samples_envelope,
+        qc3_k=iqr_k,
+        qc3_min_samples=min_samples_envelope,
     )
+
+    flag_columns = [
+        "Q_flag",
+        "SSC_flag",
+        "SSL_flag",
+        "Q_flag_qc1_physical",
+        "SSC_flag_qc1_physical",
+        "SSL_flag_qc1_physical",
+        "Q_flag_qc2_log_iqr",
+        "SSC_flag_qc2_log_iqr",
+        "SSL_flag_qc2_log_iqr",
+        "SSC_flag_qc3_ssc_q",
+        "SSL_flag_qc3_from_ssc_q",
+    ]
+    for column in flag_columns:
+        df_qc[column] = np.full(len(df_qc), FILL_VALUE_INT, dtype=np.int8)
+
+    ssc_q_bounds = None
+    if qc_result is not None:
+        expected_len = int(np.sum(valid_qc_mask))
+        actual_len = len(qc_result["Q_flag"])
+        if actual_len != expected_len:
+            raise ValueError(
+                f"shared QC result length mismatch: expected {expected_len}, got {actual_len}"
+            )
+        for column in flag_columns:
+            df_qc.loc[valid_qc_mask, column] = np.asarray(qc_result[column], dtype=np.int8)
+        ssc_q_bounds = qc_result.get("ssc_q_bounds")
+
+    df_qc["ssc_q_resid"] = np.full(len(df_qc), np.nan, dtype=float)
+
+    if diagnostic_dir is not None:
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        out_png = os.path.join(diagnostic_dir, f"EUSEDcollab_{station_id}_{station_name}_ssc_q.png")
+        try:
+            plot_ssc_q_diagnostic(
+                time=df_qc["date"].to_numpy(),
+                Q=Q,
+                SSC=SSC,
+                Q_flag=df_qc["Q_flag"].to_numpy(dtype=np.int8),
+                SSC_flag=df_qc["SSC_flag"].to_numpy(dtype=np.int8),
+                ssc_q_bounds=ssc_q_bounds,
+                station_id=str(station_id),
+                station_name=str(station_name),
+                out_png=out_png,
+            )
+        except Exception as e:
+            print(f"  Warning: diagnostic plot failed: {e}")
 
     # 2) build provenance summary
     def _flag_stats(flag_arr):

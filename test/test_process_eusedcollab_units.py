@@ -13,33 +13,32 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-SCRIPT = Path(__file__).resolve().parents[1] / "EUSEDcollab" / "process_eusedcollab_to_cf18_wzx.py"
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = SCRIPT_ROOT / "EUSEDcollab" / "process_eusedcollab_to_cf18_wzx.py"
 SOURCE_DIR = Path("/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/EUSEDcollab")
+
+
+def _load_repo_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _install_import_stubs():
     package = types.ModuleType("code")
-    package.__path__ = []
+    package.__path__ = [str(SCRIPT_ROOT / "code")]
     sys.modules["code"] = package
 
-    constants = types.ModuleType("code.constants")
-    constants.FILL_VALUE_FLOAT = np.float32(-9999.0)
-    constants.FILL_VALUE_INT = np.int8(-99)
-    sys.modules["code.constants"] = constants
+    _load_repo_module("code.constants", SCRIPT_ROOT / "code" / "constants.py")
 
     plot = types.ModuleType("code.plot")
     plot.plot_ssc_q_diagnostic = lambda *args, **kwargs: None
     sys.modules["code.plot"] = plot
 
-    qc = types.ModuleType("code.qc")
-    qc.apply_hydro_qc_with_provenance = lambda *args, **kwargs: None
-    qc.apply_quality_flag = lambda value, name: 9 if pd.isna(value) else (3 if value < 0 else 0)
-    qc.apply_quality_flag_array = lambda values, name: np.zeros(len(values), dtype=np.int8)
-    qc.build_ssc_q_envelope = lambda *args, **kwargs: None
-    qc.check_ssc_q_consistency = lambda *args, **kwargs: (False, np.nan)
-    qc.compute_log_iqr_bounds = lambda values, k=1.5: (None, None)
-    qc.propagate_ssc_q_inconsistency_to_ssl = lambda *args, **kwargs: None
-    sys.modules["code.qc"] = qc
+    _load_repo_module("code.qc", SCRIPT_ROOT / "code" / "qc.py")
 
     runtime = types.ModuleType("code.runtime")
     runtime.resolve_output_root = lambda start=None: Path(tempfile.gettempdir()) / "eused_output"
@@ -158,6 +157,67 @@ def test_timestep_q_ssl_use_interval_seconds():
     assert_close(out.loc[0, "Q"], 1.0)
     assert_close(out.loc[0, "SSC"], 100.0)
     assert_close(out.loc[0, "SSL"], 8.64)
+
+
+def _qc_input_frame(Q, SSC, SSL, *, ssc_derived_mask):
+    n = len(Q)
+    return pd.DataFrame({
+        "date": pd.to_datetime("2000-01-01") + pd.to_timedelta(np.arange(n), unit="D"),
+        "Q": np.asarray(Q, dtype=float),
+        "SSC": np.asarray(SSC, dtype=float),
+        "SSL": np.asarray(SSL, dtype=float),
+        "Q_derived": np.zeros(n, dtype=bool),
+        "SSC_derived": np.asarray(ssc_derived_mask, dtype=bool),
+        "SSL_derived": np.zeros(n, dtype=bool),
+    })
+
+
+def test_shared_qc_marks_clean_derived_ssc_estimated():
+    Q = np.array([1, 2, 3, 4, 5, 6], dtype=float)
+    SSC = np.array([10, 11, 10, 12, 11, 10], dtype=float)
+    SSL = Q * SSC * 0.0864
+    df = _qc_input_frame(
+        Q,
+        SSC,
+        SSL,
+        ssc_derived_mask=[True, False, False, False, False, False],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="clean_derived_ssc",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.loc[0, "Q_flag"]) == int(mod.FLAG_GOOD)
+    assert int(df_qc.loc[0, "SSL_flag"]) == int(mod.FLAG_GOOD)
+    assert int(df_qc.loc[0, "SSC_flag"]) == int(mod.FLAG_ESTIMATED)
+
+
+def test_shared_qc_propagates_suspect_ssl_to_derived_ssc():
+    Q = np.array([1, 2, 3, 4, 5, 6], dtype=float)
+    SSC = np.array([10, 11, 10, 12, 11, 10], dtype=float)
+    SSL = np.array([0.864, 1.9008, 2.592, 4.1472, 4.752, 100000.0], dtype=float)
+    df = _qc_input_frame(
+        Q,
+        SSC,
+        SSL,
+        ssc_derived_mask=[False, False, False, False, False, True],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="suspect_ssl_derived_ssc",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.iloc[-1]["Q_flag"]) == int(mod.FLAG_GOOD)
+    assert int(df_qc.iloc[-1]["SSL_flag"]) == int(mod.FLAG_SUSPECT)
+    assert int(df_qc.iloc[-1]["SSC_flag"]) == int(mod.FLAG_SUSPECT)
 
 
 def test_real_source_id15_no_1000x_ssc_regression():
