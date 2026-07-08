@@ -10,6 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
+import sys
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.runtime import resolve_output_root, resolve_source_root
+
 
 def read_char_variable(var, index=None):
     """读取字符变量"""
@@ -415,6 +423,175 @@ class SedimentDataExtractor:
         print(f"    ✓ 完成")
 
 
+def process_single_discharge(input_nc, output_dir, station_id, stations_info):
+    """Extract and save discharge data for a single station from DLY_FLOW group."""
+    try:
+        with nc.Dataset(input_nc, 'r') as ds:
+            if 'DLY_FLOW' not in ds.groups:
+                return station_id, False, "无 DLY_FLOW 数据组"
+
+            dly_flow = ds.groups['DLY_FLOW']
+            station_numbers = read_char_variable(dly_flow.variables['STATION_NUMBER'])
+            mask = np.array([s == station_id for s in station_numbers])
+
+            if not np.any(mask):
+                return station_id, False, "站点无流量数据"
+
+            years = dly_flow.variables['YEAR'][:][mask]
+            months = dly_flow.variables['MONTH'][:][mask]
+
+            if isinstance(years, np.ma.MaskedArray):
+                years = years.filled(-999)
+            if isinstance(months, np.ma.MaskedArray):
+                months = months.filled(-999)
+
+            data_records = []
+            for idx, (year, month) in enumerate(zip(years, months)):
+                if year == -999 or month == -999:
+                    continue
+                year, month = int(year), int(month)
+                try:
+                    n_days = pd.Timestamp(year=year, month=month, day=1).days_in_month
+                except:
+                    continue
+                for day in range(1, n_days + 1):
+                    flow_var = f'FLOW{day}'
+                    if flow_var in dly_flow.variables:
+                        flow_value = dly_flow.variables[flow_var][:][mask][idx]
+                        if isinstance(flow_value, np.ma.MaskedArray):
+                            if flow_value.mask:
+                                continue
+                            flow_value = flow_value.data
+                        if flow_value != -999 and not np.isnan(flow_value):
+                            try:
+                                date = pd.Timestamp(year=year, month=month, day=day)
+                                data_records.append({'time': date, 'discharge': float(flow_value)})
+                            except:
+                                continue
+
+            if not data_records:
+                return station_id, False, "无有效流量数据"
+
+            df = pd.DataFrame(data_records)
+            df = df.sort_values('time').reset_index(drop=True)
+
+            # Get station metadata
+            station_meta = stations_info.get(station_id, {'STATION_NUMBER': station_id})
+            lat = station_meta.get('LATITUDE', None)
+            lon = station_meta.get('LONGITUDE', None)
+            drainage_area = station_meta.get('DRAINAGE_AREA_GROSS',
+                              station_meta.get('DRAINAGE_AREA_EFFECT', None))
+
+            output_file = Path(output_dir) / f"HYDAT_{station_id}.nc"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            reference_date = pd.Timestamp('1850-01-01')
+            with nc.Dataset(output_file, 'w', format='NETCDF4') as ncfile:
+                ncfile.Conventions = "CF-1.8"
+                ncfile.title = f"HYDAT Station {station_id} - Discharge Data"
+                ncfile.institution = "Water Survey of Canada / Environment and Climate Change Canada"
+                ncfile.source = "HYDAT - Canadian Hydrometric Database"
+                ncfile.history = f"Created {datetime.now().isoformat()}"
+                ncfile.references = "https://www.canada.ca/en/environment-climate-change/services/water-overview/quantity/monitoring/survey/data-products-services/national-archive-hydat.html"
+                ncfile.station_id = station_id
+
+                if 'STATION_NAME' in station_meta:
+                    ncfile.station_name = station_meta['STATION_NAME']
+                if 'PROV_TERR_STATE_LOC' in station_meta:
+                    ncfile.province_territory = station_meta['PROV_TERR_STATE_LOC']
+
+                # Time dimension
+                time_dim = 'time_flow'
+                ncfile.createDimension(time_dim, len(df))
+                time_var = ncfile.createVariable('time_flow', 'f8', (time_dim,))
+                time_var.standard_name = "time"
+                time_var.long_name = "time for flow"
+                time_var.units = "days since 1850-01-01 00:00:00"
+                time_var.calendar = "gregorian"
+                time_var.axis = "T"
+                time_values = (df['time'] - reference_date).dt.total_seconds() / 86400.0
+                time_var[:] = time_values.values
+
+                # Discharge variable
+                dis_var = ncfile.createVariable('discharge', 'f4', (time_dim,),
+                                                fill_value=-999.0, zlib=True, complevel=4)
+                dis_var.long_name = "daily discharge"
+                dis_var.units = "m3/s"
+                dis_var[:] = df['discharge'].values
+
+                # Drainage area
+                if drainage_area is not None and drainage_area != -999 and not np.isnan(drainage_area):
+                    area_var = ncfile.createVariable('drainage_area', 'f4', ())
+                    area_var.long_name = "upstream drainage area"
+                    area_var.units = "km2"
+                    area_var[:] = float(drainage_area)
+
+                # Lat/Lon
+                if lat is not None:
+                    lat_var = ncfile.createVariable('lat', 'f4', ())
+                    lat_var.standard_name = "latitude"
+                    lat_var.units = "degrees_north"
+                    lat_var[:] = float(lat)
+                if lon is not None:
+                    lon_var = ncfile.createVariable('lon', 'f4', ())
+                    lon_var.standard_name = "longitude"
+                    lon_var.units = "degrees_east"
+                    lon_var[:] = float(lon)
+
+            print(f"  ✓ 流量文件: {output_file.name} ({len(df)} 条记录)")
+
+        return station_id, True, "成功"
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return station_id, False, str(e)
+
+
+def process_all_discharge_parallel(self):
+    """Extract discharge data for all stations with DLY_FLOW data."""
+    print(f"\n{'='*80}")
+    print(f"提取流量数据（并行模式）")
+    print(f"{'='*80}\n")
+
+    with nc.Dataset(self.input_nc, 'r') as ds:
+        self.load_stations(ds)
+        if 'DLY_FLOW' not in ds.groups:
+            print("  ✗ 未找到 DLY_FLOW 数据组，跳过流量提取")
+            return
+
+        station_numbers = read_char_variable(ds.groups['DLY_FLOW'].variables['STATION_NUMBER'])
+        station_list = sorted(set(sid for sid in station_numbers if sid))
+
+    print(f"找到 {len(station_list)} 个有流量数据的站点\n")
+    print(f"并行处理中，CPU 核心数 = {os.cpu_count()}\n")
+
+    success = 0
+    failed = 0
+
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = {
+            executor.submit(process_single_discharge, self.input_nc, self.output_dir, sid, self.stations_info): sid
+            for sid in station_list
+        }
+
+        for future in as_completed(futures):
+            sid, ok, msg = future.result()
+            if ok:
+                print(f" ✓ {sid} 处理成功")
+                success += 1
+            else:
+                print(f" ✗ {sid} 失败: {msg}")
+                failed += 1
+
+    print(f"\n流量提取完成! 成功: {success}, 失败: {failed}")
+    print(f"输出目录: {self.output_dir}")
+
+
+# 添加 discharge 处理方法
+SedimentDataExtractor.process_all_discharge = process_all_discharge_parallel
+
+
 def process_single_station(input_nc, output_dir, station_id, stations_info):
     try:
         with nc.Dataset(input_nc, 'r') as ds:
@@ -491,15 +668,30 @@ SedimentDataExtractor.process_all_stations = process_all_stations_parallel
 
 
 def main():
-    input_file = 'hydat.nc'
-    output_dir = 'sediment'
+    output_root = resolve_output_root(start=__file__, create=True)
+    hydat_dir = output_root / "daily" / "HYDAT"
+    input_file = os.fspath(hydat_dir / "hydat.nc")
+    output_dir = os.fspath(hydat_dir / "sediment")
+    discharge_dir = os.fspath(hydat_dir / "discharge_waterlevel")
 
     if not Path(input_file).exists():
         print(f"错误: 文件不存在: {input_file}")
+        print("请先运行 Stage 1 (1_hydat_to_netcdf_fixed.py) 生成 hydat.nc")
         return
 
+    # 提取泥沙数据
+    print(f"\n{'='*80}")
+    print(f"阶段 2a: 提取泥沙数据")
+    print(f"{'='*80}\n")
     extractor = SedimentDataExtractor(input_file, output_dir)
     extractor.process_all_stations()
+
+    # 提取流量数据 (供 Stage 3 使用)
+    print(f"\n{'='*80}")
+    print(f"阶段 2b: 提取流量数据")
+    print(f"{'='*80}\n")
+    discharge_extractor = SedimentDataExtractor(input_file, discharge_dir)
+    discharge_extractor.process_all_discharge()
 
 
 if __name__ == "__main__":

@@ -13,9 +13,16 @@ import netCDF4 as nc
 import numpy as np
 from pathlib import Path
 import sys
+import os
 from netCDF4 import num2date, date2num
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+from code.runtime import resolve_output_root
+
 
 
 
@@ -53,14 +60,32 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
 
         # Get sediment data
         time_sed_load = ds_sed['time_sed_load'][:] if 'time_sed_load' in ds_sed.variables else None
-        sediment_load_raw = ds_sed['sediment_load'][:, 0, 0] if 'sediment_load' in ds_sed.variables else None
+        if 'sediment_load' in ds_sed.variables:
+            sed_var = ds_sed['sediment_load']
+            if len(sed_var.shape) == 3:
+                sediment_load_raw = sed_var[:, 0, 0]
+            else:
+                sediment_load_raw = sed_var[:]
+        else:
+            sediment_load_raw = None
 
         time_sed_suscon = ds_sed['time_sed_suscon'][:] if 'time_sed_suscon' in ds_sed.variables else None
-        ssc_raw = ds_sed['suspended_sediment_concentration'][:, 0, 0] if 'suspended_sediment_concentration' in ds_sed.variables else None
+        if 'suspended_sediment_concentration' in ds_sed.variables:
+            ssc_var = ds_sed['suspended_sediment_concentration']
+            if len(ssc_var.shape) == 3:
+                ssc_raw = ssc_var[:, 0, 0]
+            else:
+                ssc_raw = ssc_var[:]
+        else:
+            ssc_raw = None
 
         # Get discharge data
         time_flow = ds_dis['time_flow'][:]
-        discharge_raw = ds_dis['discharge'][:, 0, 0]
+        dis_var = ds_dis['discharge']
+        if len(dis_var.shape) == 3:
+            discharge_raw = dis_var[:, 0, 0]
+        else:
+            discharge_raw = dis_var[:]
 
         # Determine unified time axis (use the union of all time points)
         all_times = []
@@ -244,10 +269,11 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
 
 
 def main():
-    base_dir = Path('./')
-    sediment_dir = base_dir / 'sediment'
-    discharge_dir = base_dir / 'discharge_waterlevel'
-    output_dir = base_dir / 'sediment_update'
+    output_root = resolve_output_root(start=__file__, create=True)
+    hydat_dir = output_root / "daily" / "HYDAT"
+    sediment_dir = hydat_dir / "sediment"
+    discharge_dir = hydat_dir / "discharge_waterlevel"
+    output_dir = hydat_dir / "sediment_update"
     output_dir.mkdir(exist_ok=True)
 
     sediment_files = sorted(sediment_dir.glob('HYDAT_*_SEDIMENT.nc'))
