@@ -58,7 +58,9 @@ OUTPUT_QC_DIR = os.fspath(
     resolve_output_root(start=__file__) / "daily" / "RiverSed" / "qc"
 )
 
-OUTPUT_NC_DIR = OUTPUT_QC_DIR
+OUTPUT_NC_DIR = os.fspath(
+    resolve_output_root(start=__file__) / "daily" / "RiverSed" / "qc"
+)
 
 # The DBF acts as the RiverSed reach/basin lookup table. It maps RiverSed IDs
 # to NHDPlus-derived metadata such as COMID, reach code, VPU/RPU, and area.
@@ -253,7 +255,10 @@ def _build_geographic_coverage(station_location, vpu_id="", rpu_id=""):
 
 def _run_station_task(station_id, station_df, output_dir, verbose):
     # Wrap station processing so the pool always returns a uniform
-    # (station_id, result, error) tuple instead of propagating raw exceptions.
+    # (station_id, result, error, diagnostic) tuple instead of
+    # propagating raw exceptions.  The diagnostic dict survives
+    # the process-pool boundary and feeds the final summary CSV.
+    n_source_rows = len(station_df)
     try:
         result = create_netcdf_file(
             station_id,
@@ -261,9 +266,33 @@ def _run_station_task(station_id, station_df, output_dir, verbose):
             output_dir,
             verbose=verbose,
         )
-        return station_id, result, None
+        if isinstance(result, dict):
+            n_daily = result.get("QC_n_days", result.get("n_days", 0))
+            diag = {
+                "station_id": str(station_id),
+                "status": "success",
+                "reason": "ok",
+                "n_source_rows": n_source_rows,
+                "n_daily_rows": n_daily,
+            }
+        else:
+            diag = {
+                "station_id": str(station_id),
+                "status": "failed",
+                "reason": "create_netcdf_returned_none",
+                "n_source_rows": n_source_rows,
+                "n_daily_rows": 0,
+            }
+        return station_id, result, None, diag
     except Exception as exc:
-        return station_id, None, str(exc)
+        print(f"  [ERROR] {station_id}: {type(exc).__name__}: {exc}")
+        return station_id, None, str(exc), {
+            "station_id": str(station_id),
+            "status": "failed",
+            "reason": f"exception: {type(exc).__name__}: {exc}",
+            "n_source_rows": n_source_rows,
+            "n_daily_rows": 0,
+        }
 
 
 def _process_station_from_shared_state(task):
@@ -299,8 +328,10 @@ def _process_station_collection(
     # fork sharing is unavailable.
     total_stations = len(station_ids)
     if total_stations == 0:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, {"exception": 0, "no_data": 0}, []
 
+    failure_reasons = {"exception": 0, "no_data": 0}
+    station_diagnostics = []
     chunksize = _compute_chunksize(total_stations, num_workers)
     use_shared_state = mp.get_start_method() == "fork"
 
@@ -330,7 +361,7 @@ def _process_station_collection(
     _render_progress(stage_label, 0, total_stations, started_at, success, failed)
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for i, (station_id, result, error) in enumerate(
+        for i, (station_id, result, error, diag) in enumerate(
             executor.map(worker_fn, task_iter, chunksize=chunksize),
             1,
         ):
@@ -339,11 +370,15 @@ def _process_station_collection(
                 sys.stdout.flush()
                 print(f"  Station {station_id} failed with error: {error}")
                 failed += 1
+                failure_reasons["exception"] += 1
             elif isinstance(result, dict):
                 stations_info.append(result)
                 success += 1
             else:
                 failed += 1
+                failure_reasons["no_data"] += 1
+            if diag:
+                station_diagnostics.append(diag)
 
             now = time.perf_counter()
             if (now - last_render_at >= PROGRESS_UPDATE_INTERVAL_SECONDS) or (i == total_stations):
@@ -352,7 +387,7 @@ def _process_station_collection(
 
     sys.stdout.write("\n")
     sys.stdout.flush()
-    return success, failed, time.perf_counter() - started_at
+    return success, failed, time.perf_counter() - started_at, failure_reasons, station_diagnostics
 
 
 def _normalize_riversed_id(value):
@@ -465,7 +500,7 @@ def _write_scalar_float_var(ds, name, value, long_name, units=None):
 def _write_scalar_text_var(ds, name, value, long_name):
     var = ds.createVariable(name, str)
     var.long_name = long_name
-    var.assignValue(str(value or ""))
+    var[0] = str(value or "")
     return var
 
 
@@ -865,7 +900,7 @@ def load_riversed_data(
     return df
 
 
-def apply_satellite_ssc_qc(df, station_id, diagnostic_dir=None):
+def apply_satellite_ssc_qc(df, station_id, diagnostic_dir=None, *, verbose=False):
     """
     QC for satellite-only SSC (TSS) data using tool.py logic.
 
@@ -948,9 +983,15 @@ def apply_satellite_ssc_qc(df, station_id, diagnostic_dir=None):
 
     # 至少保留一个非缺测值
     if np.all(np.isnan(df["tss"].values)):
-        if diagnostic_dir:
-            print(f"  -> All SSC invalid after QC for station {station_id}")
+        print(f"  [QC] {station_id}: all {ssc.size} SSC values invalid after QC")
         return None
+
+    if verbose:
+        n_pass = int(np.sum(ssc_flag_final == 0))
+        n_suspect = int(np.sum(ssc_flag_final == 2))
+        n_bad = int(np.sum(ssc_flag_final == 3))
+        n_missing = int(np.sum(ssc_flag_final == 9))
+        print(f"  [QC] {station_id}: pass={n_pass} suspect={n_suspect} bad={n_bad} missing={n_missing}")
 
     return df
 
@@ -966,8 +1007,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
 
     # Check if all TSS values are NaN
     if tss_df['tss'].isna().all():
-        if verbose:
-            print(f"  All TSS values are NaN for station {station_id}")
+        print(f"  [SKIP] {station_id}: all TSS values are NaN ({len(tss_df)} rows)")
         return None
 
     # Find time period
@@ -976,8 +1016,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
     tss_df = tss_df.dropna(subset=['date'])
 
     if tss_df.empty:
-        if verbose:
-            print(f"  No valid dates for station {station_id}")
+        print(f"  [SKIP] {station_id}: no valid dates after parsing")
         return None
 
     # Collapse multiple same-day satellite observations to one daily SSC value.
@@ -995,9 +1034,10 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
     # -----------------------------
     # Apply QC using tool.py
     # -----------------------------
-    daily_df = apply_satellite_ssc_qc(daily_df, station_id)
+    daily_df = apply_satellite_ssc_qc(daily_df, station_id, verbose=verbose)
 
     if daily_df is None:
+        print(f"  [SKIP] {station_id}: all SSC values invalid after QC (n_daily={len(tss_daily)})")
         return None
 
     actual_start = daily_df['date'].min()
@@ -1111,7 +1151,7 @@ def create_netcdf_file(station_id, tss_df, output_dir, *, verbose=False):
     safe_station_id = str(station_id).replace('/', '_').replace('\\', '_').replace(':', '_')
 
     # Create netCDF file
-    output_file = Path(output_dir) / f"RiverSed_{safe_station_id}.nc"
+    output_file = Path(output_dir) / f"{safe_station_id}.nc"
 
     with nc.Dataset(output_file, 'w', format='NETCDF4') as ds:
         # The file layout mirrors the common project convention:
@@ -1473,6 +1513,12 @@ def main():
         default=False,
         help="Also load and process the optional Aquasat source table.",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Enable verbose per-station diagnostic output.",
+    )
     args = parser.parse_args()
 
     total_started_at = time.perf_counter()
@@ -1496,7 +1542,7 @@ def main():
     output_qc_dir = OUTPUT_QC_DIR
 
     num_workers = _resolve_num_workers()
-    verbose_station_logs = VERBOSE_STATION_LOGS
+    verbose_station_logs = args.verbose
 
     Path(output_nc_dir).mkdir(parents=True, exist_ok=True)
     Path(output_qc_dir).mkdir(parents=True, exist_ok=True)
@@ -1537,6 +1583,10 @@ def main():
         for station_id, positions in riversed_all_group_indices.items()
         if len(positions) >= 5
     ]
+    n_dropped = len(riversed_all_group_indices) - len(riversed_stations)
+    if n_dropped > 0:
+        print(f"  Filtered out {n_dropped} stations with fewer than 5 observations "
+              f"({len(riversed_stations)} stations remaining)")
     riversed_group_indices = {
         station_id: riversed_all_group_indices[station_id]
         for station_id in riversed_stations
@@ -1561,13 +1611,15 @@ def main():
     # Process each dataset separately
     aquasat_success = 0
     aquasat_failed = 0
+    aquasat_failure_reasons = {"exception": 0, "no_data": 0}
+    aquasat_diags = []
     if args.include_aquasat:
         print("\n" + "="*80)
         print("PROCESSING AQUASAT STATIONS")
         print("="*80)
         print(f"Processing {len(aquasat_stations)} Aquasat stations...")
         print(f"Using {num_workers} parallel workers...")
-        aquasat_success, aquasat_failed, timing_stats["process_aquasat"] = _process_station_collection(
+        aquasat_success, aquasat_failed, timing_stats["process_aquasat"], aquasat_failure_reasons, aquasat_diags = _process_station_collection(
             "aquasat",
             aquasat_df,
             aquasat_group_indices,
@@ -1584,7 +1636,7 @@ def main():
     print("="*80)
     print(f"Processing {len(riversed_stations)} RiverSed stations (with at least 5 observations)...")
     print(f"Using {num_workers} parallel workers...")
-    riversed_success, riversed_failed, timing_stats["process_riversed"] = _process_station_collection(
+    riversed_success, riversed_failed, timing_stats["process_riversed"], riversed_failure_reasons, riversed_diags = _process_station_collection(
         "riversed",
         riversed_df,
         riversed_group_indices,
@@ -1614,16 +1666,37 @@ def main():
     print("\n" + "="*80)
     print("SUMMARY")
     print("="*80)
+
+    # ---- write station-level diagnostic CSV ----
+    all_diags = []
+    if args.include_aquasat:
+        all_diags.extend(aquasat_diags)
+    all_diags.extend(riversed_diags)
+    if all_diags:
+        import csv as _csv
+        diag_path = os.path.join(OUTPUT_QC_DIR, "riversed_station_diagnostics.csv")
+        with open(diag_path, "w", newline="") as _f:
+            _w = _csv.DictWriter(_f, fieldnames=["station_id", "status", "reason", "n_source_rows", "n_daily_rows"])
+            _w.writeheader()
+            _w.writerows(all_diags)
+        print(f"  Station diagnostics written to {diag_path}")
+
     if args.include_aquasat:
         print(f"Aquasat:")
         print(f"  Total stations: {len(aquasat_stations)}")
         print(f"  Successfully created: {aquasat_success}")
         print(f"  Failed (all NaN or no data): {aquasat_failed}")
+        if aquasat_failure_reasons:
+            print(f"    - Exception: {aquasat_failure_reasons.get('exception', 0)}")
+            print(f"    - No data after QC/filtering: {aquasat_failure_reasons.get('no_data', 0)}")
         print()
     print(f"RiverSed:")
     print(f"  Total stations (with ≥5 obs): {len(riversed_stations)}")
     print(f"  Successfully created: {riversed_success}")
     print(f"  Failed (all NaN or no data): {riversed_failed}")
+    if riversed_failure_reasons:
+        print(f"    - Exception: {riversed_failure_reasons.get('exception', 0)}")
+        print(f"    - No data after QC/filtering: {riversed_failure_reasons.get('no_data', 0)}")
     print(f"\nTotal netCDF files created: {aquasat_success + riversed_success}")
     print(f"\nTiming:")
     print(f"  Load data: {_format_duration(timing_stats['load_data'])}")
