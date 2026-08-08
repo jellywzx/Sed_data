@@ -106,6 +106,8 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
         sediment_load = np.full(n_time, fill_value, dtype=np.float32)
         ssc = np.full(n_time, fill_value, dtype=np.float32)
         discharge = np.full(n_time, fill_value, dtype=np.float32)
+        SSC_derived = np.zeros(n_time, dtype=bool)
+        SSL_derived = np.zeros(n_time, dtype=bool)
 
         # Map sediment_load to unified time
         if time_sed_load is not None and sediment_load_raw is not None:
@@ -146,6 +148,7 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
                 # sediment_load is in ton day-1 and discharge is in m3 s-1.
                 # This expression is equivalent to sediment_load / (discharge * 0.0864).
                 ssc[i] = (sediment_load[i] * 1000.0) / (discharge[i] * 86.4)
+                SSC_derived[i] = True
 
             # If ssc and discharge exist but sediment_load is missing, calculate it.
             elif (sediment_load[i] == fill_value and
@@ -153,6 +156,7 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
                   discharge[i] != fill_value):
                 # sediment_load (ton day-1) = discharge (m3 s-1) * ssc (mg L-1) * 0.0864.
                 sediment_load[i] = discharge[i] * ssc[i] * 86.4 / 1000.0
+                SSL_derived[i] = True
 
         # Get global attributes from original file
         station_id = ds_sed.station_id if hasattr(ds_sed, 'station_id') else ''
@@ -237,7 +241,20 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
         var_ssc.long_name = 'suspended sediment concentration'
         var_ssc.units = 'mg L-1'
         var_ssc.coordinates = 'time latitude longitude'
+        var_ssc.ancillary_variables = 'SSC_derived'
         var_ssc[:] = ssc
+
+        var_ssc_derived = ds_out.createVariable('SSC_derived', 'i1', ('time',),
+                                                chunksizes=[n_time])
+        var_ssc_derived.long_name = 'record-level provenance flag for suspended sediment concentration'
+        var_ssc_derived.flag_values = np.array([0, 1], dtype=np.int8)
+        var_ssc_derived.flag_meanings = 'source_or_not_derived derived'
+        var_ssc_derived.comment = (
+            '0 indicates source/non-derived SSC or missing SSC; 1 indicates SSC derived '
+            'from sediment_load / (discharge * 0.0864). Missingness is determined from '
+            'the SSC value and downstream QC flags.'
+        )
+        var_ssc_derived[:] = SSC_derived.astype(np.int8)
 
         # Sediment load
         var_load = ds_out.createVariable('sediment_load', 'f4', ('time',),
@@ -245,8 +262,25 @@ def update_sediment_file(sediment_file, discharge_file, output_file=None):
         var_load.long_name = 'suspended sediment load'
         var_load.units = 'ton day-1'
         var_load.coordinates = 'time latitude longitude'
-        var_load.comment = 'Calculated as: sediment_load (ton day-1) = discharge (m3 s-1) * ssc (mg L-1) * 0.0864.'
+        var_load.ancillary_variables = 'SSL_derived'
+        var_load.comment = (
+            'Suspended sediment load may be source-reported from HYDAT SED_DLY_LOADS '
+            'or derived where source sediment_load is missing using sediment_load = '
+            'discharge * ssc * 0.0864. See SSL_derived for record-level provenance.'
+        )
         var_load[:] = sediment_load
+
+        var_ssl_derived = ds_out.createVariable('SSL_derived', 'i1', ('time',),
+                                                chunksizes=[n_time])
+        var_ssl_derived.long_name = 'record-level provenance flag for suspended sediment load'
+        var_ssl_derived.flag_values = np.array([0, 1], dtype=np.int8)
+        var_ssl_derived.flag_meanings = 'source_or_not_derived derived'
+        var_ssl_derived.comment = (
+            '0 indicates source/non-derived sediment_load or missing sediment_load; '
+            '1 indicates sediment_load derived from discharge * ssc * 0.0864. '
+            'Missingness is determined from the sediment_load value and downstream QC flags.'
+        )
+        var_ssl_derived[:] = SSL_derived.astype(np.int8)
 
         # Global attributes
         ds_out.Conventions = 'CF-1.8'

@@ -286,10 +286,11 @@ def propagate_input_flags_to_derived_ssl(
     SSC_flag,
     SSL_flag,
     ssl_is_derived_from_q_ssc,
+    SSL_derived_mask=None,
     SSL_step_flag=None,
 ):
     """Propagate suspect input flags to SSL derived from Q and SSC."""
-    if not ssl_is_derived_from_q_ssc:
+    if SSL_derived_mask is None and not ssl_is_derived_from_q_ssc:
         return SSL_flag, SSL_step_flag
 
     Qv = _as_float_array(Q)
@@ -303,13 +304,29 @@ def propagate_input_flags_to_derived_ssl(
     if SSL_step_flag is not None:
         step = np.asarray(SSL_step_flag, dtype=np.int8).copy()
 
+    if SSL_derived_mask is None:
+        derived_mask = np.full(len(SSLf), bool(ssl_is_derived_from_q_ssc), dtype=bool)
+    else:
+        derived_mask = np.asarray(SSL_derived_mask, dtype=bool)
+        if derived_mask.shape[0] != len(SSLf):
+            raise ValueError(
+                "SSL_derived_mask length mismatch: expected {}, got {}".format(
+                    len(SSLf), derived_mask.shape[0]
+                )
+            )
+
     ssl_present = (
         np.isfinite(SSLv)
         & ~np.isclose(SSLv, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5)
         & (SSLf != FILL_VALUE_INT)
     )
     input_suspect = (Qf == FLAG_SUSPECT) | (SSCf == FLAG_SUSPECT)
-    propagate = ssl_present & input_suspect & np.isin(SSLf, [FLAG_GOOD, FLAG_ESTIMATED])
+    propagate = (
+        derived_mask
+        & ssl_present
+        & input_suspect
+        & np.isin(SSLf, [FLAG_GOOD, FLAG_ESTIMATED])
+    )
 
     SSLf[propagate] = FLAG_SUSPECT
     if step is not None:
@@ -438,6 +455,7 @@ def apply_hydro_qc_with_provenance(
         if SSC_derived_mask is None
         else np.asarray(SSC_derived_mask, dtype=bool)
     )
+    ssl_derived_mask_provided = SSL_derived_mask is not None
     ssl_default_derived = (not bool(SSL_is_independent)) and bool(ssl_is_derived_from_q_ssc)
     ssl_derived_mask = (
         np.full(n, ssl_default_derived, dtype=bool)
@@ -523,7 +541,11 @@ def apply_hydro_qc_with_provenance(
                 Q_flag=Q_flag[i],
                 SSC_flag=FLAG_GOOD,
                 SSL_flag=prev_ssl_flag,
-                ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
+                ssl_is_derived_from_q_ssc=(
+                    bool(ssl_derived_mask[i])
+                    if ssl_derived_mask_provided
+                    else ssl_is_derived_from_q_ssc
+                ),
             )
             SSL_flag_qc3_from_ssc_q[i] = (
                 FLAG_SUSPECT
@@ -539,6 +561,7 @@ def apply_hydro_qc_with_provenance(
         SSC_flag=SSC_flag,
         SSL_flag=SSL_flag,
         ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
+        SSL_derived_mask=ssl_derived_mask if ssl_derived_mask_provided else None,
         SSL_step_flag=SSL_flag_qc3_from_ssc_q,
     )
 
@@ -566,5 +589,8 @@ def apply_hydro_qc_with_provenance(
         "SSL_flag_qc2_log_iqr": SSL_flag_qc2_log_iqr[valid_time],
         "SSC_flag_qc3_ssc_q": SSC_flag_qc3_ssc_q[valid_time],
         "SSL_flag_qc3_from_ssc_q": SSL_flag_qc3_from_ssc_q[valid_time],
+        "Q_derived_mask": q_derived_mask[valid_time],
+        "SSC_derived_mask": ssc_derived_mask[valid_time],
+        "SSL_derived_mask": ssl_derived_mask[valid_time],
         "ssc_q_bounds": ssc_q_bounds,
     }
