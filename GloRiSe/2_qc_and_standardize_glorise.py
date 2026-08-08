@@ -33,7 +33,7 @@ from code.qc import (
     apply_quality_flag,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
-    compute_log_iqr_bounds,
+    propagate_derived_flag_from_inputs,
 )
 from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
 from code.units import convert_ssl_units_if_needed
@@ -101,14 +101,11 @@ def apply_tool_qc(discharge, ssc, ssl,return_envelope=False):
     # -------------------------
     # 2. log-IQR screening (SSL)
     # -------------------------
-    lower, upper = compute_log_iqr_bounds(ssl, k=1.5)
-    if lower is not None:
-        outlier = (
-            (ssl_flag == 0) &
-            ((ssl < lower) | (ssl > upper))
-        )
-        ssl_flag[outlier] = 2   # suspect
-        qc_report["SSL_logIQR_suspect"] = int(np.sum(outlier))
+    # GloRiSe SS SSL is fully derived from Q and SSC, not source-reported.
+    # Match shared provenance-aware QC: valid derived SSL is estimated (1),
+    # while suspect/bad/missing inputs propagate to the derived SSL flag.
+    lower, upper = None, None
+    outlier = np.zeros(n, dtype=bool)
 
     # -------------------------
     # 3. SSC–Q envelope consistency
@@ -138,10 +135,21 @@ def apply_tool_qc(discharge, ssc, ssl,return_envelope=False):
         print("    ℹ️ SSC–Q diagnostic skipped (insufficient samples)")
 
     # -------------------------
-    # 4. propagate to SSL
+    # 4. derived SSL provenance semantics
     # -------------------------
-    inherited = (ssl_flag == 0) & ((q_flag != 0) | (ssc_flag != 0))
-    ssl_flag[inherited] = 2
+    ssl_before_propagation = ssl_flag.copy()
+    for i in range(n):
+        ssl_flag[i] = propagate_derived_flag_from_inputs(
+            derived_value=ssl[i],
+            derived_flag=ssl_flag[i],
+            input_flags=[q_flag[i], ssc_flag[i]],
+            input_values=[discharge[i], ssc[i]],
+        )
+    inherited = (
+        (ssl_before_propagation != ssl_flag)
+        & np.isin(ssl_flag, [2, 3])
+        & (ssl_before_propagation != 9)
+    )
     qc_report["SSL_inherited_suspect"] = int(np.sum(inherited))
 
     # --- Step-level QC provenance arrays ---
