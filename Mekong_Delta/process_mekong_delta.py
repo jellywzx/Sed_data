@@ -138,7 +138,8 @@ def calculate_ssc_from_ssl(df):
 def get_summary_stats(df, var_name):
     """Calculate summary statistics for a variable."""
     flag_name = f"{var_name}_flag"
-    valid_data = df[df[flag_name] == 0][var_name]
+    ok_flags = [0, 1]  # good + estimated
+    valid_data = df[df[flag_name].isin(ok_flags)][var_name]
     if valid_data.empty:
         return np.nan, np.nan, 0.0
     
@@ -162,6 +163,7 @@ def apply_tool_qc(
     station_id,
     station_name,
     plot_dir=None,
+    SSC_derived_mask=None,
 ):
     """
     Use tool.py unified hydro QC WITH provenance(step) flags.
@@ -195,15 +197,19 @@ def apply_tool_qc(
     #      SSC: 由 SSL/(Q*0.0864) 推导 => independent False
     #      ssl_is_derived_from_q_ssc=False (因为 SSL 是原始给的)
     # -----------------------------
+    # When explicit mask is provided, use SSC_is_independent=True as
+    # the fallback (masked records are explicitly derived; unmasked = source).
+    ssc_independent = True if SSC_derived_mask is not None else False
     qc = apply_hydro_qc_with_provenance(
         time=time,
         Q=Q,
         SSC=SSC,
         SSL=SSL,
         Q_is_independent=True,
-        SSC_is_independent=False,
+        SSC_is_independent=ssc_independent,
         SSL_is_independent=True,
         ssl_is_derived_from_q_ssc=False,
+        SSC_derived_mask=SSC_derived_mask,
         qc2_k=1.5,
         qc2_min_samples=5,
         qc3_k=1.5,
@@ -468,8 +474,14 @@ def create_netcdf_file(filepath, df, station_meta):
         ssc_var.standard_name = "mass_concentration_of_suspended_matter_in_water_body"
         ssc_var.units = "mg L-1"
         ssc_var.coordinates = "lat lon altitude"
-        ssc_var.ancillary_variables = "SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q"
-        ssc_var.comment = "Source: Calculated. Formula: SSC = SSL / (Q * 0.0864)."
+        ssc_var.ancillary_variables = "SSC_flag SSC_derived_mask SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q"
+        ssc_var.comment = (
+            "Source: Mixed provenance. "
+            "Source-reported values preserved from original "
+            "'Section Averaged SSC (mg/l)' (SSC_derived_mask=0). "
+            "Derived values calculated as SSC = SSL / (Q × 0.0864) "
+            "where source SSC is unavailable (SSC_derived_mask=1)."
+        )
         ssc_var[:] = df['SSC'].fillna(fill_value).values
 
         # SSL
@@ -495,9 +507,9 @@ def create_netcdf_file(filepath, df, station_meta):
         # SSC_flag
         ssc_flag_var = ds.createVariable('SSC_flag', 'b', ('time',), fill_value=flag_fill_value)
         ssc_flag_var.long_name = "Quality flag for Suspended Sediment Concentration"
-        ssc_flag_var.flag_values = np.array([0, 2, 3, 9], dtype='b')
-        ssc_flag_var.flag_meanings = "good_data suspect_data bad_data missing_data"
-        ssc_flag_var.comment = "Flag definitions: 0=Good, 2=Suspect (e.g., extreme), 3=Bad (e.g., negative), 9=Missing in source."
+        ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype='b')
+        ssc_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
+        ssc_flag_var.comment = "Flag definitions: 0=Good, 1=Estimated (derived from SSL/(Q×0.0864)), 2=Suspect (e.g., extreme), 3=Bad (e.g., negative), 9=Missing in source."
         ssc_flag_var[:] = df['SSC_flag'].fillna(flag_fill_value).values
 
         # SSL_flag
@@ -507,6 +519,15 @@ def create_netcdf_file(filepath, df, station_meta):
         ssl_flag_var.flag_meanings = "good_data bad_data missing_data"
         ssl_flag_var.comment = "Flag definitions: 0=Good, 3=Bad (e.g., negative), 9=Missing in source."
         ssl_flag_var[:] = df['SSL_flag'].fillna(flag_fill_value).values
+        # SSC_derived_mask (provenance mask)
+        if 'SSC_derived_mask' in df.columns:
+            ssc_dm_var = ds.createVariable('SSC_derived_mask', 'b', ('time',), fill_value=flag_fill_value)
+            ssc_dm_var.long_name = "record-level provenance mask for suspended sediment concentration"
+            ssc_dm_var.flag_values = np.array([0, 1], dtype='b')
+            ssc_dm_var.flag_meanings = "source_reported derived"
+            ssc_dm_var.comment = "0: source-reported from 'Section Averaged SSC (mg/l)'; 1: derived from SSL/(Q×0.0864)."
+            ssc_dm_var[:] = df['SSC_derived_mask'].fillna(False).astype(np.int8).values
+
         # === STEP/PROVENANCE FLAG VARIABLES ===
         def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
             v = ds.createVariable(name, 'b', ('time',), fill_value=flag_fill_value)
@@ -598,8 +619,24 @@ def main():
             # Use an outer merge to keep all data points
             merged_df = pd.merge(ratings_df, fluxes_df, on='time', how='outer')
             
-            # Calculate SSC
-            merged_df['SSC'] = calculate_ssc_from_ssl(merged_df)
+            # --- SSC provenance-aware merge ---
+            # 1. Source SSC exists -> preserve it (independent)
+            # 2. Source SSC missing AND Q valid AND SSL valid -> derive
+            # 3. Otherwise -> NaN (missing)
+            source_ssc_present = (
+                merged_df['SSC_original'].notna()
+                & (merged_df['SSC_original'] > 0)
+            )
+            can_derive = (
+                ~source_ssc_present
+                & merged_df['Q'].notna() & (merged_df['Q'] > 0)
+                & merged_df['SSL'].notna() & (merged_df['SSL'] > 0)
+            )
+            merged_df['SSC'] = np.nan
+            merged_df.loc[source_ssc_present, 'SSC'] = merged_df.loc[source_ssc_present, 'SSC_original']
+            merged_df.loc[can_derive, 'SSC'] = calculate_ssc_from_ssl(merged_df.loc[can_derive])
+
+            SSC_derived_mask = can_derive.values.astype(bool)
             
             # Apply QC
             qc, qc_report = apply_tool_qc(
@@ -610,6 +647,7 @@ def main():
                 station_id=station_meta['Source_ID'],
                 station_name=station_meta['name'],
                 plot_dir=os.path.join(TARGET_NC_DIR, "diagnostic_plots"),
+                SSC_derived_mask=SSC_derived_mask,
             )
 
             if qc is None:
@@ -644,6 +682,9 @@ def main():
                 if col.endswith("_flag") or ("flag_qc" in col):
                     # for padded empty days: treat as missing
                     final_df[col] = final_df[col].fillna(9).astype(np.int8)
+            # Pad SSC_derived_mask: NaN -> False (padding days have no SSC)
+            if 'SSC_derived_mask' in final_df.columns:
+                final_df['SSC_derived_mask'] = final_df['SSC_derived_mask'].fillna(False).astype(bool)
 
 
             # Generate summary stats before creating file
