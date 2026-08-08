@@ -359,8 +359,8 @@ def create_station_netcdf(row, idx, output_dir, input_file,ssl_iqr_bounds, ssc_q
     SSL_var.units = 'ton day-1'
     SSL_var.coordinates = 'time lat lon'
     SSL_var.ancillary_variables = 'SSL_flag'
-    SSL_var.comment = ('Source: Calculated. Formula: SSL (ton/day) = '
-                       'sediment_load (Mt/yr) × 10⁶ / 365, where 1 Mt = 10⁶ ton. '
+    SSL_var.comment = ('Source-reported sediment load from Ali & De Boer; '
+                       'converted from the native unit to t d-1. '
                        f'Original sediment load: {sediment_mt_yr} Mt/yr. '
                        'Represents mean annual value over period of record.')
     if not pd.isna(SSL):
