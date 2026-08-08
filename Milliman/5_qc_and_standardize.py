@@ -14,7 +14,7 @@ This script:
 Unit Conversions (already done in input files):
 - Discharge: km³/yr → m³/s: Q (m³/s) = Q (km³/yr) × 10⁹ / 31,557,600
 - TSS: Mt/yr → ton/day: TSS (ton/day) = TSS (Mt/yr) × 10⁶ / 365.25
-- SSC: mg/L (calculated from TSS and Q)
+- SSC: mg/L (source-reported, from Milliman SedConc column)
 
 Author: Zhongwang Wei
 Date: 2025-10-25
@@ -304,7 +304,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ssc_var.units = "mg L-1"
         ssc_var.coordinates = "time lat lon altitude"
         ssc_var.ancillary_variables = "SSC_flag"
-        ssc_var.comment = "Source: Calculated from SSL and Q. Formula: SSC (mg/L) = SSL (ton/day) / (Q (m³/s) × 86.4). " \
+        ssc_var.comment = "Source: Source-reported suspended sediment concentration from Milliman & Farnsworth (2011). " \
                           "Represents long-term average suspended sediment concentration."
         ssc_var[:] = [ssc_val if not np.isnan(ssc_val) else -9999.0]
 
