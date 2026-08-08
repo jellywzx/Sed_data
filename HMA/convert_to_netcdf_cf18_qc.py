@@ -407,14 +407,16 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     # Convert units
     Q = convert_Q_to_discharge(Q_km3_yr)
 
-    # Calculate SSL: priority - from Qs, then from sediment yield
+    # Calculate SSL: priority - source-reported Qs, then derived from sediment yield.
     SSL_source = ""
+    SSL_derived = False
     if not np.isnan(Qs_Mt_yr):
         SSL = convert_Qs_to_SSL(Qs_Mt_yr)
-        SSL_source = f"Calculated. Formula: SSL (ton/day) = Qs (Mt/yr) × 10⁶ / 365.25. Original Qs: {Qs_Mt_yr} Mt/yr. Represents mean annual value over period {period_str}."
-    elif not np.isnan(sediment_yield):
+        SSL_source = f"Source: Source-reported sediment load (Qs) from Li et al. (2021), converted to release units. Unit conversion: SSL (ton/day) = Qs (Mt/yr) × 10⁶ / 365.25. Original Qs: {Qs_Mt_yr} Mt/yr. Represents mean annual value over period {period_str}."
+    elif not np.isnan(sediment_yield) and not np.isnan(basin_area):
         SSL = calculate_SSL_from_yield(sediment_yield, basin_area)
-        SSL_source = f"Calculated. Formula: SSL (ton/day) = sediment_yield (t/km²/yr) × basin_area (km²) / 365.25. Original sediment yield: {sediment_yield} t/km²/yr. Represents mean annual value over period {period_str}."
+        SSL_derived = True
+        SSL_source = f"Source: Calculated/derived from sediment yield and upstream area. Formula: SSL (ton/day) = sediment_yield (t/km²/yr) × basin_area (km²) / 365.25. Original sediment yield: {sediment_yield} t/km²/yr; upstream area: {basin_area} km². Represents mean annual value over period {period_str}."
     else:
         SSL = -9999.0
         SSL_source = "Missing in source data."
@@ -444,6 +446,16 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
         station_name=station_name,
         output_dir=output_dir
     )
+
+    if SSL_derived:
+        sediment_yield_flag = apply_quality_flag(sediment_yield, "sediment_yield")
+        basin_area_flag = apply_quality_flag(basin_area, "upstream_area")
+        SSL_flag = propagate_derived_scalar_flag(
+            derived_value=SSL,
+            derived_flag=SSL_flag,
+            input_flags=[sediment_yield_flag, basin_area_flag],
+            input_values=[sediment_yield, basin_area],
+        )
 
     # SSC is derived from Q and SSL in this HMA workflow.
     # Therefore, valid derived SSC is estimated unless an input flag is worse.
@@ -559,7 +571,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     SSL_var.long_name = 'suspended sediment load'
     SSL_var.units = 'ton day-1'
     SSL_var.coordinates = 'time lat lon'
-    SSL_var.ancillary_variables = 'SSL_flag'
+    SSL_var.ancillary_variables = 'SSL_flag SSL_derived_mask'
     SSL_var.comment = SSL_source
     SSL_var[:] = [SSL]
 
@@ -571,6 +583,14 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     SSL_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
     SSL_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
     SSL_flag_var[:] = [SSL_flag]
+
+    # SSL derived provenance mask
+    SSL_derived_var = nc.createVariable('SSL_derived_mask', 'i1', ('time',))
+    SSL_derived_var.long_name = 'record-level provenance mask for suspended sediment load'
+    SSL_derived_var.flag_values = np.array([0, 1], dtype='i1')
+    SSL_derived_var.flag_meanings = 'source_reported_or_unit_converted derived'
+    SSL_derived_var.comment = '0: source-reported sediment load/Qs converted to release units; 1: SSL calculated from sediment_yield and upstream_area.'
+    SSL_derived_var[:] = [1 if SSL_derived else 0]
 
     # Sediment yield
     if not np.isnan(sediment_yield):
@@ -599,7 +619,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
     ssc_qc1 = np.int8(SSC_flag)
     ssc_qc2 = np.int8(FILL_VALUE_INT)
     ssc_qc3 = np.int8(FILL_VALUE_INT)
-    ssl_qc1 = np.int8(SSL_flag)
+    ssl_qc1 = np.int8(apply_quality_flag(SSL, "SSL"))
     ssl_qc2 = np.int8(FILL_VALUE_INT)
     ssl_qc3 = np.int8(FILL_VALUE_INT)
 
@@ -614,7 +634,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
 
     Q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
     SSC_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
-    SSL_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+    SSL_var.ancillary_variables = 'SSL_flag SSL_derived_mask SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
     # ===== Global Attributes =====
 
@@ -729,6 +749,7 @@ def create_netcdf_for_station(station_data, output_dir, data_source_csv):
         'SSC_flag': SSC_flag,
         'SSL': SSL if SSL != -9999.0 else None,
         'SSL_flag': SSL_flag,
+        'SSL_derived': SSL_derived,
         'sediment_yield': sediment_yield if not np.isnan(sediment_yield) else None,
         'start_year': start_year,
         'end_year': end_year,
