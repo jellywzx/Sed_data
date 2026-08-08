@@ -177,8 +177,8 @@ def create_netcdf_file(station_data, output_path):
                                         fill_value=-9999.0)
         sed_var.units = 'ton day-1'
         sed_var.long_name = 'suspended sediment load'
-        sed_var.comment = (f'Calculated from sediment yield (SY): '
-                          f'sediment_load (ton/day) = SY (t/km²/y) * upstream_area (km²) / 365.25. '
+        sed_var.comment = (f'SSL derived from sediment yield and source-reported catchment area. '
+                          f'Formula: SSL (ton/day) = SY (t/km²/y) × upstream_area (km²) / 365.25. '
                           f'Original SY = {sy:.4f} t/km²/y, Area = {area:.2f} km²')
         sed_var[0] = sediment_load
 

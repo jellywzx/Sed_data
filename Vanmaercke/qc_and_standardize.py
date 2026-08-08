@@ -31,13 +31,16 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, SCRIPT_ROOT)
-from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.constants import (FILL_VALUE_FLOAT, FILL_VALUE_INT,
+                            FLAG_GOOD, FLAG_ESTIMATED, FLAG_SUSPECT,
+                            FLAG_BAD, FLAG_MISSING)
 from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
     apply_quality_flag,
     build_ssc_q_envelope,
     check_ssc_q_consistency,
     compute_log_iqr_bounds,
+    propagate_derived_flag_from_inputs,
 )
 from code.runtime import ensure_directory, resolve_output_root
 from code.units import convert_ssl_units_if_needed
@@ -81,6 +84,16 @@ def standardize_netcdf_file(input_file, output_dir):
         # Read upstream area
         upstream_area = float(ds_in.variables['upstream_area'][:]) if 'upstream_area' in ds_in.variables else np.nan
 
+        # Parse original sediment yield (SY) from sediment_load comment
+        sy_val = np.nan
+        if 'sediment_load' in ds_in.variables:
+            sy_match = re.search(
+                r'Original SY = ([\d.]+) t/km²/y',
+                getattr(ds_in.variables['sediment_load'], 'comment', ''),
+            )
+            if sy_match:
+                sy_val = float(sy_match.group(1))
+
         # Read metadata from global attributes
         station_id = ds_in.station_id if hasattr(ds_in, 'station_id') else ""
         station_name = ds_in.station_name if hasattr(ds_in, 'station_name') else ""
@@ -109,11 +122,19 @@ def standardize_netcdf_file(input_file, output_dir):
         return None
 
 # --------------------------------------------------
-    # Quality control using tool.py
+    # Quality control
     # --------------------------------------------------
 
-    # SSL is observed (derived from SY × area) → QC allowed
-    ssl_flag = apply_quality_flag(ssl_val, "SSL")
+    # SSL is DERIVED from sediment yield × area (not source-reported).
+    # Use propagate_derived_flag_from_inputs with ESTIMATED base.
+    sy_flag = apply_quality_flag(sy_val, "sediment_yield")
+    area_flag = apply_quality_flag(upstream_area, "upstream_area")
+    ssl_flag = propagate_derived_flag_from_inputs(
+        derived_value=ssl_val,
+        derived_flag=FLAG_ESTIMATED,
+        input_flags=[sy_flag, area_flag],
+        input_values=[sy_val, upstream_area],
+    )
 
     # Step-level QC arrays (climatology: QC2/QC3 = not_checked)
     ssl_qc1 = apply_quality_flag(ssl_val, "SSL")
@@ -130,7 +151,7 @@ def standardize_netcdf_file(input_file, output_dir):
     ssc_flag = FILL_VALUE_INT # = 9
 
     # Calculate statistics for CSV
-    ssl_percent = 100.0 if ssl_flag == 0 else 0.0
+    ssl_percent = 100.0 if ssl_flag in (FLAG_GOOD, FLAG_ESTIMATED) else 0.0
     ssc_percent = 100.0 if ssc_flag == 0 else 0.0
     q_percent = 100.0 if q_flag == 0 else 0.0
 
@@ -321,7 +342,7 @@ def standardize_netcdf_file(input_file, output_dir):
         ssl_var.units = "ton day-1"
         ssl_var.coordinates = "time lat lon altitude"
         ssl_var.ancillary_variables = "SSL_flag"
-        ssl_var.comment = "Source: Calculated from sediment yield (SY) and drainage area. " \
+        ssl_var.comment = "Source: SSL derived from sediment yield and source-reported catchment area. " \
                           "Formula: SSL (ton/day) = SY (t/km²/y) × upstream_area (km²) / 365.25. " \
                           "Represents climatological average over measurement period."
         ssl_var[:] = [ssl_val if not np.isnan(ssl_val) else -9999.0]
@@ -608,8 +629,9 @@ def main():
     print("="*80)
     print("Quality Checks Applied:")
     print("  SSL (Suspended Sediment Load):")
-    print("    - SSL < 0: Flagged as BAD (flag=3)")
-    print("    - Valid SSL: Flagged as GOOD (flag=0)")
+    print("    - Valid derived SSL (from SY × area): Flagged as ESTIMATED (flag=1)")
+    print("    - Missing / invalid SSL: Flagged as MISSING (flag=9)")
+    print("    - Input suspect/bad propagates to SSL flag")
     print("  Q (Discharge): All marked as MISSING (flag=9) - not available in source")
     print("  SSC (Concentration): All marked as MISSING (flag=9) - not available in source")
     print()
