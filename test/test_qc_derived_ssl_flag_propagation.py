@@ -57,6 +57,30 @@ def test_ssc_suspect_propagates_to_derived_ssl():
     assert qc["SSL_flag"][0] == FLAG_ESTIMATED
 
 
+def test_legacy_global_ssl_derivation_still_propagates_without_mask():
+    Q = np.asarray([1, 2, 3, 4, 5, 100000], dtype=float)
+    SSC = np.asarray([10, 11, 10, 12, 11, 10], dtype=float)
+    SSL = np.full(len(Q), 100.0, dtype=float)
+    qc = apply_hydro_qc_with_provenance(
+        time=np.arange(len(Q), dtype=float),
+        Q=Q,
+        SSC=SSC,
+        SSL=SSL,
+        Q_is_independent=True,
+        SSC_is_independent=True,
+        SSL_is_independent=True,
+        ssl_is_derived_from_q_ssc=True,
+        qc2_k=1.5,
+        qc2_min_samples=5,
+        qc3_k=1.5,
+        qc3_min_samples=5,
+    )
+
+    assert qc is not None
+    assert qc["Q_flag"][-1] == FLAG_SUSPECT
+    assert qc["SSL_flag"][-1] == FLAG_SUSPECT
+
+
 def main():
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

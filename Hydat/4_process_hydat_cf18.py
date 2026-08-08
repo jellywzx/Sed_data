@@ -55,6 +55,8 @@ def apply_tool_qc(
     SSL,
     station_id,
     station_name,
+    SSC_derived_mask=None,
+    SSL_derived_mask=None,
     plot_dir=None,
 ):
     """
@@ -71,7 +73,10 @@ def apply_tool_qc(
         SSL=SSL,
         Q_is_independent=True,
         SSC_is_independent=True,
-        SSL_is_independent=False,
+        SSL_is_independent=True,
+        Q_derived_mask=np.zeros(len(Q), dtype=bool),
+        SSC_derived_mask=SSC_derived_mask,
+        SSL_derived_mask=SSL_derived_mask,
         ssl_is_derived_from_q_ssc=True,
         qc2_k=1.5,
         qc2_min_samples=5,
@@ -126,6 +131,23 @@ def apply_tool_qc(
         )
 
     return qc
+
+
+def _read_derived_mask(ds_in, name, n_time, station_id):
+    if name not in ds_in.variables:
+        print(
+            f"  WARNING: {name} missing in Stage 3 input for {station_id}; "
+            "record-level provenance is unknown. Falling back to non-derived "
+            "for QC so source SSL is not automatically marked estimated. "
+            "Regenerate HYDAT Stage 3 outputs to recover provenance."
+        )
+        return np.zeros(n_time, dtype=bool)
+
+    mask = np.asarray(np.ma.filled(ds_in.variables[name][:], 0), dtype=np.int8)
+    if mask.shape[0] != n_time:
+        raise ValueError(f"{name} length mismatch: expected {n_time}, got {mask.shape[0]}")
+    return mask.astype(bool)
+
 
 class HYDATQualityControl: 
     """HYDAT批量数据质量控制和标准化处理类"""
@@ -291,6 +313,9 @@ class HYDATQualityControl:
                 else:
                     raise ValueError("Cannot find sediment load variable")
 
+                SSC_derived_mask = _read_derived_mask(ds_in, 'SSC_derived', len(time), station_id)
+                SSL_derived_mask = _read_derived_mask(ds_in, 'SSL_derived', len(time), station_id)
+
                 qc = apply_tool_qc(
                     time=time,
                     Q=Q,
@@ -298,6 +323,8 @@ class HYDATQualityControl:
                     SSL=SSL,
                     station_id=station_id,
                     station_name=station_name,
+                    SSC_derived_mask=SSC_derived_mask,
+                    SSL_derived_mask=SSL_derived_mask,
                     plot_dir=self.output_dir / "diagnostic_plots",
                 )
 
@@ -312,6 +339,8 @@ class HYDATQualityControl:
                 Q_flag = qc["Q_flag"]
                 SSC_flag = qc["SSC_flag"]
                 SSL_flag = qc["SSL_flag"] #这段在返回的字典里面取出这些变量进行下面工作
+                SSC_derived = np.asarray(qc["SSC_derived_mask"], dtype=np.int8)
+                SSL_derived = np.asarray(qc["SSL_derived_mask"], dtype=np.int8)
 
                 
                 # 计算时间范围
@@ -399,8 +428,12 @@ class HYDATQualityControl:
                     var_SSC.long_name = 'suspended sediment concentration'
                     var_SSC.units = 'mg L-1'
                     var_SSC.coordinates = 'time lat lon'
-                    var_SSC.ancillary_variables = 'SSC_flag'
-                    var_SSC.comment = 'Source: Original data from HYDAT database.'
+                    var_SSC.ancillary_variables = 'SSC_flag SSC_derived'
+                    var_SSC.comment = (
+                        'Suspended sediment concentration may be source-reported from HYDAT '
+                        'or derived where source SSC is missing using SSC = SSL / '
+                        '(Q * 0.0864). See SSC_derived for record-level provenance.'
+                    )
                     var_SSC[:] = SSC
 
                     # SSC质量标志
@@ -412,14 +445,29 @@ class HYDATQualityControl:
                     var_SSC_flag.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                     var_SSC_flag[:] = SSC_flag
 
+                    var_SSC_derived = ds_out.createVariable('SSC_derived', 'i1', ('time',), zlib=True, complevel=4)
+                    var_SSC_derived.long_name = 'record-level provenance flag for suspended sediment concentration'
+                    var_SSC_derived.flag_values = np.array([0, 1], dtype=np.int8)
+                    var_SSC_derived.flag_meanings = 'source_or_not_derived derived'
+                    var_SSC_derived.comment = (
+                        '0 indicates source/non-derived SSC or missing SSC; 1 indicates SSC '
+                        'derived from SSL / (Q * 0.0864). Missingness is determined from '
+                        'SSC values and SSC_flag.'
+                    )
+                    var_SSC_derived[:] = SSC_derived
+
                     # 创建数据变量 SSL
                     var_SSL = ds_out.createVariable('SSL', 'f4', ('time',),
                                                      fill_value=-9999.0, zlib=True, complevel=4)
                     var_SSL.long_name = 'suspended sediment load'
                     var_SSL.units = 'ton day-1'
                     var_SSL.coordinates = 'time lat lon'
-                    var_SSL.ancillary_variables = 'SSL_flag'
-                    var_SSL.comment = 'Source: Calculated. Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 86.4, where 86.4 = 86400 s/day × 10⁻⁶ ton/mg × 1000 L/m³.'
+                    var_SSL.ancillary_variables = 'SSL_flag SSL_derived'
+                    var_SSL.comment = (
+                        'Suspended sediment load may be source-reported from the HYDAT '
+                        'SED_DLY_LOADS table or derived where source SSL is missing using '
+                        'SSL = Q * SSC * 0.0864. See SSL_derived for record-level provenance.'
+                    )
                     var_SSL[:] = SSL
 
                     # SSL质量标志
@@ -430,6 +478,17 @@ class HYDATQualityControl:
                     var_SSL_flag.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
                     var_SSL_flag.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
                     var_SSL_flag[:] = SSL_flag
+
+                    var_SSL_derived = ds_out.createVariable('SSL_derived', 'i1', ('time',), zlib=True, complevel=4)
+                    var_SSL_derived.long_name = 'record-level provenance flag for suspended sediment load'
+                    var_SSL_derived.flag_values = np.array([0, 1], dtype=np.int8)
+                    var_SSL_derived.flag_meanings = 'source_or_not_derived derived'
+                    var_SSL_derived.comment = (
+                        '0 indicates source/non-derived SSL or missing SSL; 1 indicates SSL '
+                        'derived from Q * SSC * 0.0864. Missingness is determined from SSL '
+                        'values and SSL_flag.'
+                    )
+                    var_SSL_derived[:] = SSL_derived
 
                     # --- Step-level QC provenance flags ---
                     def _add_step_flag(name, arr, *, flag_values, flag_meanings, long_name):
@@ -475,8 +534,8 @@ class HYDATQualityControl:
 
                     # Update ancillary_variables to include step flags
                     var_Q.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
-                    var_SSC.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
-                    var_SSL.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+                    var_SSC.ancillary_variables = 'SSC_flag SSC_derived SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+                    var_SSL.ancillary_variables = 'SSL_flag SSL_derived SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
                     # 设置全局属性
                     ds_out.Conventions = 'CF-1.8, ACDD-1.3'
