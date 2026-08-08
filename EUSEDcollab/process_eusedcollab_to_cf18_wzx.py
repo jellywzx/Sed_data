@@ -1256,6 +1256,33 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         ssc_data[~np.isfinite(ssc_data)] = FILL_VALUE_FLOAT
         ssl_data[~np.isfinite(ssl_data)] = FILL_VALUE_FLOAT
 
+        def _derived_mask(column):
+            if column not in df.columns:
+                return np.zeros(len(df), dtype=bool)
+            return df[column].fillna(False).to_numpy(dtype=bool)
+
+        def _valid_data_mask(values):
+            return (
+                np.isfinite(values)
+                & ~np.isclose(values, float(FILL_VALUE_FLOAT), rtol=1e-5, atol=1e-5)
+            )
+
+        ssc_derived_mask = _derived_mask("SSC_derived")
+        ssl_derived_mask = _derived_mask("SSL_derived")
+        ssc_valid_mask = _valid_data_mask(ssc_data)
+        ssl_valid_mask = _valid_data_mask(ssl_data)
+
+        def _provenance_kind(valid_mask, derived_mask):
+            source_present = bool(np.any(valid_mask & (~derived_mask)))
+            derived_present = bool(np.any(valid_mask & derived_mask))
+            if source_present and derived_present:
+                return "mixed"
+            if derived_present:
+                return "derived"
+            if source_present:
+                return "source"
+            return "missing"
+
         # Q (Discharge)
         q_var = ds.createVariable('Q', 'f4', ('time',), fill_value=FILL_VALUE_FLOAT)
         q_var.standard_name = 'water_volume_transport_in_river_channel'
@@ -1286,10 +1313,26 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         ssc_var.long_name = 'suspended sediment concentration'
         ssc_var.units = 'mg L-1'
         ssc_var.coordinates = 'time lat lon'
-        ssc_var.ancillary_variables = 'SSC_flag'
+        ssc_var.ancillary_variables = 'SSC_flag SSC_derived_mask'
 
-        # Comment is same for both event and daily data (concentration doesn't need temporal conversion)
-        ssc_var.comment = 'Source: Original data provided by EUSEDcollab. Units converted from kg/m3 to mg/L (*1000) or g/m3 to mg/L (*1); turbidity is not treated as SSC.'
+        ssc_provenance_kind = _provenance_kind(ssc_valid_mask, ssc_derived_mask)
+        ssc_var.source = {
+            "mixed": "Mixed source-reported and derived EUSEDcollab data.",
+            "derived": "Derived from EUSEDcollab Q and SSL records.",
+            "source": "Source-reported EUSEDcollab data.",
+            "missing": "No valid SSC records.",
+        }[ssc_provenance_kind]
+        ssc_var.provenance = (
+            "Prioritize source-reported SSC after unit standardization; in applicable "
+            "records with missing SSC, derive SSC from same-record Q and SSL as "
+            "SSC = SSL / (Q * 0.0864)."
+        )
+        ssc_var.comment = (
+            "Units converted from kg/m3 to mg/L (*1000) or g/m3 to mg/L (*1); "
+            "turbidity is not treated as SSC. Mixed provenance is record-level: "
+            "source-reported SSC is retained when available, and missing SSC may be "
+            "derived from Q and SSL where applicable."
+        )
         ssc_var[:] = ssc_data
 
         # SSC flag
@@ -1301,18 +1344,46 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         ssc_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         ssc_flag_var[:] = ssc_flag
 
+        ssc_derived_var = ds.createVariable('SSC_derived_mask', 'b', ('time',))
+        ssc_derived_var.long_name = 'record-level derived-value mask for suspended sediment concentration'
+        ssc_derived_var.flag_values = np.array([0, 1], dtype=np.int8)
+        ssc_derived_var.flag_meanings = 'source_reported derived'
+        ssc_derived_var.comment = '1 where SSC was derived from same-record Q and SSL during EUSEDcollab harmonization; 0 where SSC is source-reported or missing.'
+        ssc_derived_var[:] = ssc_derived_mask.astype(np.int8)
+
         # SSL (Suspended Sediment Load)
         ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=FILL_VALUE_FLOAT)
         ssl_var.long_name = 'suspended sediment load'
         ssl_var.units = 'ton day-1'
         ssl_var.coordinates = 'time lat lon'
-        ssl_var.ancillary_variables = 'SSL_flag'
+        ssl_var.ancillary_variables = 'SSL_flag SSL_derived_mask'
 
         # Set comment based on data type
+        ssl_provenance_kind = _provenance_kind(ssl_valid_mask, ssl_derived_mask)
+        ssl_var.source = {
+            "mixed": "Mixed source-reported and derived EUSEDcollab data.",
+            "derived": "Derived from EUSEDcollab Q and SSC records.",
+            "source": "Source-reported EUSEDcollab data.",
+            "missing": "No valid SSL records.",
+        }[ssl_provenance_kind]
+        ssl_var.provenance = (
+            "Prioritize source-reported SSL after unit standardization; records with "
+            "missing SSL may be derived from same-record Q and SSC as "
+            "SSL = Q * SSC * 0.0864."
+        )
         if metadata.get('data_type', '').lower().startswith('event'):
-            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Event and timestep sediment loads standardized to ton day-1 using event duration or timestep length.'
+            ssl_var.comment = (
+                "Event and timestep sediment loads standardized to ton day-1 using "
+                "event duration or timestep length. Mixed provenance is record-level: "
+                "source-reported SSL is retained when available, and missing SSL may "
+                "be derived from Q and SSC."
+            )
         else:
-            ssl_var.comment = 'Source: Original data provided by EUSEDcollab. Daily and monthly sediment loads standardized to ton day-1.'
+            ssl_var.comment = (
+                "Daily and monthly sediment loads standardized to ton day-1. Mixed "
+                "provenance is record-level: source-reported SSL is retained when "
+                "available, and missing SSL may be derived from Q and SSC."
+            )
         ssl_var[:] = ssl_data
 
         # SSL flag
@@ -1323,6 +1394,13 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
         ssl_flag_var.comment = 'Flag definitions: 0=Good, 1=Estimated, 2=Suspect (e.g., zero/extreme), 3=Bad (e.g., negative), 9=Missing in source.'
         ssl_flag_var[:] = ssl_flag
+
+        ssl_derived_var = ds.createVariable('SSL_derived_mask', 'b', ('time',))
+        ssl_derived_var.long_name = 'record-level derived-value mask for suspended sediment load'
+        ssl_derived_var.flag_values = np.array([0, 1], dtype=np.int8)
+        ssl_derived_var.flag_meanings = 'source_reported derived'
+        ssl_derived_var.comment = '1 where SSL was derived from same-record Q and SSC during EUSEDcollab harmonization; 0 where SSL is source-reported or missing.'
+        ssl_derived_var[:] = ssl_derived_mask.astype(np.int8)
 
         # --- Step-level QC provenance flags ---
         def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
@@ -1366,8 +1444,8 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
 
             # Update ancillary_variables to include step flags
             q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
-            ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
-            ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
+            ssc_var.ancillary_variables = 'SSC_flag SSC_derived_mask SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q'
+            ssl_var.ancillary_variables = 'SSL_flag SSL_derived_mask SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q'
 
         # =================================================================
         # Global Attributes

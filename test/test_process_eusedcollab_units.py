@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import netCDF4 as nc
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = SCRIPT_ROOT / "EUSEDcollab" / "process_eusedcollab_to_cf18_wzx.py"
@@ -159,8 +160,10 @@ def test_timestep_q_ssl_use_interval_seconds():
     assert_close(out.loc[0, "SSL"], 8.64)
 
 
-def _qc_input_frame(Q, SSC, SSL, *, ssc_derived_mask):
+def _qc_input_frame(Q, SSC, SSL, *, ssc_derived_mask, ssl_derived_mask=None):
     n = len(Q)
+    if ssl_derived_mask is None:
+        ssl_derived_mask = np.zeros(n, dtype=bool)
     return pd.DataFrame({
         "date": pd.to_datetime("2000-01-01") + pd.to_timedelta(np.arange(n), unit="D"),
         "Q": np.asarray(Q, dtype=float),
@@ -168,7 +171,7 @@ def _qc_input_frame(Q, SSC, SSL, *, ssc_derived_mask):
         "SSL": np.asarray(SSL, dtype=float),
         "Q_derived": np.zeros(n, dtype=bool),
         "SSC_derived": np.asarray(ssc_derived_mask, dtype=bool),
-        "SSL_derived": np.zeros(n, dtype=bool),
+        "SSL_derived": np.asarray(ssl_derived_mask, dtype=bool),
     })
 
 
@@ -218,6 +221,147 @@ def test_shared_qc_propagates_suspect_ssl_to_derived_ssc():
     assert int(df_qc.iloc[-1]["Q_flag"]) == int(mod.FLAG_GOOD)
     assert int(df_qc.iloc[-1]["SSL_flag"]) == int(mod.FLAG_SUSPECT)
     assert int(df_qc.iloc[-1]["SSC_flag"]) == int(mod.FLAG_SUSPECT)
+
+
+def test_shared_qc_marks_source_and_derived_ssl_records():
+    df = _qc_input_frame(
+        Q=[1, 2, 3, 4],
+        SSC=[10, 10, 10, 10],
+        SSL=[0.864, 1.728, 2.592, 3.456],
+        ssc_derived_mask=[False, False, False, False],
+        ssl_derived_mask=[False, True, False, False],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="mixed_ssl",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.loc[0, "SSL_flag"]) == int(mod.FLAG_GOOD)
+    assert int(df_qc.loc[1, "SSL_flag"]) == int(mod.FLAG_ESTIMATED)
+
+
+def test_shared_qc_does_not_propagate_suspect_q_to_source_ssl():
+    df = _qc_input_frame(
+        Q=[1, 2, 3, 4, 5, 100000],
+        SSC=[10, 10, 10, 10, 10, 10],
+        SSL=[100, 100, 100, 100, 100, 100],
+        ssc_derived_mask=[False, False, False, False, False, False],
+        ssl_derived_mask=[False, False, False, False, False, False],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="source_ssl",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.iloc[-1]["Q_flag"]) == int(mod.FLAG_SUSPECT)
+    assert int(df_qc.iloc[-1]["SSL_flag"]) == int(mod.FLAG_GOOD)
+
+
+def test_shared_qc_propagates_suspect_q_to_derived_ssl():
+    df = _qc_input_frame(
+        Q=[1, 2, 3, 4, 5, 100000],
+        SSC=[10, 10, 10, 10, 10, 10],
+        SSL=[100, 100, 100, 100, 100, 100],
+        ssc_derived_mask=[False, False, False, False, False, False],
+        ssl_derived_mask=[False, False, False, False, False, True],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="derived_ssl",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.iloc[-1]["Q_flag"]) == int(mod.FLAG_SUSPECT)
+    assert int(df_qc.iloc[-1]["SSL_flag"]) == int(mod.FLAG_SUSPECT)
+
+
+def test_shared_qc_does_not_propagate_suspect_ssl_to_source_ssc():
+    df = _qc_input_frame(
+        Q=[1, 2, 3, 4, 5, 6],
+        SSC=[10, 11, 10, 12, 11, 10],
+        SSL=[0.864, 1.9008, 2.592, 4.1472, 4.752, 100000.0],
+        ssc_derived_mask=[False, False, False, False, False, False],
+    )
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        df,
+        station_id="synthetic",
+        station_name="source_ssc",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert int(df_qc.iloc[-1]["SSL_flag"]) == int(mod.FLAG_SUSPECT)
+    assert int(df_qc.iloc[-1]["SSC_flag"]) == int(mod.FLAG_GOOD)
+
+
+def test_write_netcdf_records_mixed_ssc_ssl_provenance_metadata():
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2000-01-01", "2000-01-02"]),
+        "Q": [1.0, 2.0],
+        "SSC": [10.0, 20.0],
+        "SSL": [0.864, 3.456],
+        "Q_derived": [False, False],
+        "SSC_derived": [False, True],
+        "SSL_derived": [False, True],
+    })
+    flags = np.array([mod.FLAG_GOOD, mod.FLAG_ESTIMATED], dtype=np.int8)
+    step_flags = df.assign(
+        Q_flag_qc1_physical=np.array([0, 0], dtype=np.int8),
+        Q_flag_qc2_log_iqr=np.array([8, 8], dtype=np.int8),
+        SSC_flag_qc1_physical=np.array([0, 0], dtype=np.int8),
+        SSC_flag_qc2_log_iqr=np.array([8, 8], dtype=np.int8),
+        SSC_flag_qc3_ssc_q=np.array([8, 8], dtype=np.int8),
+        SSL_flag_qc1_physical=np.array([0, 0], dtype=np.int8),
+        SSL_flag_qc2_log_iqr=np.array([8, 8], dtype=np.int8),
+        SSL_flag_qc3_from_ssc_q=np.array([8, 8], dtype=np.int8),
+    )
+    metadata = {
+        "station_name": "synthetic",
+        "catchment_id": 1,
+        "latitude": 1.0,
+        "longitude": 2.0,
+        "drainage_area": 3.0,
+        "data_type": "Daily",
+        "stream_type": "perennial",
+        "country": "BE",
+        "references": "synthetic",
+        "contact_name": np.nan,
+        "contact_email": np.nan,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "eused.nc"
+        mod.write_netcdf(df, metadata, flags, flags, flags, str(out), step_flags=step_flags)
+        with nc.Dataset(out) as ds:
+            ssc = ds.variables["SSC"]
+            ssl = ds.variables["SSL"]
+
+            assert ssc.long_name == "suspended sediment concentration"
+            assert ssl.long_name == "suspended sediment load"
+            assert "Mixed source-reported and derived" in ssc.source
+            assert "Mixed source-reported and derived" in ssl.source
+            assert "source-reported SSC" in ssc.provenance
+            assert "derive SSC" in ssc.provenance
+            assert "source-reported SSL" in ssl.provenance
+            assert "derived from Q and SSC" in ssl.comment
+            assert "SSC_derived_mask" in ssc.ancillary_variables
+            assert "SSL_derived_mask" in ssl.ancillary_variables
+            assert "SSC_flag_qc2_log_iqr" in ssc.ancillary_variables
+            assert "SSL_flag_qc2_log_iqr" in ssl.ancillary_variables
+            np.testing.assert_array_equal(ds.variables["SSC_derived_mask"][:], np.array([0, 1], dtype=np.int8))
+            np.testing.assert_array_equal(ds.variables["SSL_derived_mask"][:], np.array([0, 1], dtype=np.int8))
 
 
 def test_real_source_id15_no_1000x_ssc_regression():
