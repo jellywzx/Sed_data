@@ -342,7 +342,7 @@ def main():
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_task = {
-            executor.submit(update_sediment_file, sed_file, dis_file, out_file): info
+            executor.submit(update_sediment_file, sed_file, dis_file, out_file): (sed_file, dis_file, out_file, has_dis, stid)
             for sed_file, dis_file, out_file, has_dis, stid in tasks
         }
 
