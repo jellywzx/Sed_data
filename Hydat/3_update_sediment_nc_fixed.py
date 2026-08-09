@@ -86,20 +86,35 @@ def update_sediment_file(sediment_file, discharge_file=None, output_file=None):
 
     # --- Read discharge data (optional) -------------------------------------
     if has_discharge:
-        with nc.Dataset(discharge_file, 'r') as ds_dis:
-            upstream_area = float(ds_dis['drainage_area'][:]) if 'drainage_area' in ds_dis.variables else np.nan
+        try:
+            with nc.Dataset(discharge_file, 'r') as ds_dis:
+                if 'time_flow' not in ds_dis.variables:
+                    print(f"  + Warning: discharge file missing time_flow for {station_id}, treating as no-discharge")
+                    has_discharge = False
+                    upstream_area = np.nan
+                    time_flow = None
+                    discharge_raw = None
+                    original_time_units = 'days since 1850-01-01 00:00:00'
+                else:
+                    upstream_area = float(ds_dis['drainage_area'][:]) if 'drainage_area' in ds_dis.variables else np.nan
+                    time_flow = ds_dis['time_flow'][:]
+                    dis_var = ds_dis['discharge']
+                    if len(dis_var.shape) == 3:
+                        discharge_raw = dis_var[:, 0, 0]
+                    else:
+                        discharge_raw = dis_var[:]
 
-            time_flow = ds_dis['time_flow'][:]
-            dis_var = ds_dis['discharge']
-            if len(dis_var.shape) == 3:
-                discharge_raw = dis_var[:, 0, 0]
-            else:
-                discharge_raw = dis_var[:]
-
-            if 'units' in ds_dis['time_flow'].__dict__:
-                original_time_units = ds_dis['time_flow'].units
-            else:
-                original_time_units = 'days since 1850-01-01 00:00:00'
+                    if 'units' in ds_dis['time_flow'].__dict__:
+                        original_time_units = ds_dis['time_flow'].units
+                    else:
+                        original_time_units = 'days since 1850-01-01 00:00:00'
+        except Exception as e:
+            print(f"  + Warning: error reading discharge for {station_id}: {e}, treating as no-discharge")
+            has_discharge = False
+            upstream_area = np.nan
+            time_flow = None
+            discharge_raw = None
+            original_time_units = 'days since 1850-01-01 00:00:00'
     else:
         upstream_area = np.nan
         time_flow = None
@@ -118,6 +133,12 @@ def update_sediment_file(sediment_file, discharge_file=None, output_file=None):
         all_times.append(time_sed_suscon)
     if time_flow is not None:
         all_times.append(time_flow)
+
+    if not all_times:
+        print(f"  + Warning: no time data in {Path(sediment_file).name}, skipping")
+        return False, {'station_id': station_id, 'has_discharge': has_discharge,
+                       'has_ssc': False, 'has_ssl': False,
+                       'ssc_only': False, 'ssl_only': False}
 
     time_combined = np.unique(np.concatenate(all_times))
     time_combined.sort()
