@@ -8,10 +8,16 @@ and time series trimming for daily Bayern river sediment data.
 Processing Steps:
 1. Quality flag creation (Q_flag, SSC_flag, SSL_flag) with physical law checks
 2. Time series trimming (remove leading/trailing NaN periods)
-3. Variable renaming (discharge→Q, ssc→SSC, sediment_load→SSL, latitude→lat, longitude→lon)
+3. Variable renaming (discharge->Q, ssc->SSC, sediment_load->SSL, latitude->lat, longitude->lon)
 4. Dimension restructuring (time=UNLIMITED)
 5. CF-1.8 and ACDD-1.3 metadata standardization
 6. CSV summary generation
+
+Revised (2026-08):
+  - SSC-only stations (no discharge) are fully supported.
+  - QC3 (SSC-Q consistency) only runs on Q-SSC paired dates.
+  - Station eligibility is based on SSC OR SSL (not Q).
+  - Q-missing SSC records are never dropped by QC.
 
 Author: Zhongwang Wei
 Date: 2025-10-25
@@ -68,12 +74,12 @@ def log_station_qc(site_name, site_code=None, n=None,
 
     if n is not None:
         if skipped_log_iqr:
-            print(f"  ⚠️ [{tag}] Sample size = {n} < 5, log-IQR statistical QC skipped.")
+            print(f"  ! [{tag}] Sample size = {n} < 5, log-IQR statistical QC skipped.")
         if skipped_ssc_q:
-            print(f"  ⚠️ [{tag}] Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
+            print(f"  ! [{tag}] Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
 
     if created_path:
-        print(f"  ✓ Created: {created_path}")
+        print(f"  + Created: {created_path}")
 
     # values + flag
     if q is not None or q_flag is not None:
@@ -102,6 +108,9 @@ def find_valid_time_range(ds_in):
     - Remove trailing periods with all missing data
     - Keep the continuous middle section with at least some valid data
 
+    SSC-only stations (no discharge) are supported:
+    valid_mask is True wherever ANY variable (Q, SSC, or SSL) is non-missing.
+
     Parameters:
     -----------
     ds_in : netCDF4.Dataset
@@ -113,7 +122,7 @@ def find_valid_time_range(ds_in):
         Start and end indices for valid data range
     """
 
-    # Read time series data 
+    # Read time series data
     q_data = ds_in.variables['discharge'][:]
     ssc_data = ds_in.variables['ssc'][:]
     ssl_data = ds_in.variables['sediment_load'][:]
@@ -123,7 +132,8 @@ def find_valid_time_range(ds_in):
     ssc_data = np.where(ssc_data == -9999.0, np.nan, ssc_data)
     ssl_data = np.where(ssl_data == -9999.0, np.nan, ssl_data)
 
-    # Find where we have ANY valid data
+    # Find where we have ANY valid data (Q, SSC, or SSL)
+    # This correctly handles SSC-only stations where Q is entirely NaN.
     valid_mask = (~np.isnan(q_data)) | (~np.isnan(ssc_data)) | (~np.isnan(ssl_data))
 
     if not np.any(valid_mask):
@@ -145,6 +155,9 @@ def process_station(input_file, output_dir):
     - Trim time series
     - Rename variables
     - Standardize metadata
+
+    SSC-only stations (source_has_discharge='no') are fully supported.
+    QC3 (SSC-Q consistency) only runs on dates where both Q and SSC are valid.
 
     Parameters:
     -----------
@@ -168,6 +181,11 @@ def process_station(input_file, output_dir):
         station_name = ds_in.station_name if hasattr(ds_in, 'station_name') else ""
         river_name = ds_in.river_name if hasattr(ds_in, 'river_name') else ""
 
+        # Determine station type from source provenance
+        source_has_discharge = True  # default for legacy files
+        if hasattr(ds_in, 'source_has_discharge'):
+            source_has_discharge = (str(getattr(ds_in, 'source_has_discharge')).lower() == 'yes')
+
         # Read coordinates
         lat = float(ds_in.variables['latitude'][:])
         lon = float(ds_in.variables['longitude'][:])
@@ -188,7 +206,7 @@ def process_station(input_file, output_dir):
         ssc_data = np.where(ssc_data == FILL_VALUE_FLOAT, np.nan, ssc_data)
         ssl_data = np.where(ssl_data == FILL_VALUE_FLOAT, np.nan, ssl_data)
 
-        # Log_IQR Quality control   
+        # Log_IQR Quality control
         ssc_lower, ssc_upper = compute_log_iqr_bounds(ssc_data)
         ssl_lower, ssl_upper = compute_log_iqr_bounds(ssl_data)
 
@@ -198,20 +216,21 @@ def process_station(input_file, output_dir):
         ssl_flags = np.zeros(len(ssl_data), dtype=np.int8)
 
         # ==========================================================
-        # Build station-level SSC–Q envelope (daily data)
+        # Build station-level SSC-Q envelope (daily data)
+        # For SSC-only stations this returns None (no Q-SSC pairs).
         # ==========================================================
         ssc_q_bounds = build_ssc_q_envelope(
             Q_m3s=q_data,
             SSC_mgL=ssc_data,
             k=1.5
         )
-        # QC1-array（显式调用）：
+        # QC1-array (explicit call):
         Q_flag_qc1   = apply_quality_flag_array(q_data,  "Q")
         SSC_flag_qc1 = apply_quality_flag_array(ssc_data,"SSC")
         SSL_flag_qc1 = apply_quality_flag_array(ssl_data,"SSL")
         # ==========================================================
         qc = apply_hydro_qc_with_provenance(
-            time=time_data,  
+            time=time_data,
             Q=q_data,
             SSC=ssc_data,
             SSL=ssl_data,
@@ -219,17 +238,17 @@ def process_station(input_file, output_dir):
             SSC_is_independent=True, # ssc is independent variable
             SSL_is_independent=False, # ssl is independent variable
             ssl_is_derived_from_q_ssc=True,
-            qc2_k=1.5, 
+            qc2_k=1.5,
             qc2_min_samples=5,
-            qc3_k=1.5, 
+            qc3_k=1.5,
             qc3_min_samples=5,
         )
 
-        print("[DBG] qc is None?", qc is None)   # <- 加在 if qc is None 之前
+        print("[DBG] qc is None?", qc is None)   # <- add before if qc is None
         if qc is None:
             return None
 
-        # 把最终结果写回 flags 数组（后面统计/写文件都靠它）
+        # Write final results back to flags arrays
         q_flags   = qc["Q_flag"]
         ssc_flags = qc["SSC_flag"]
         ssl_flags = qc["SSL_flag"]
@@ -244,7 +263,7 @@ def process_station(input_file, output_dir):
         SSC_qc2 = qc.get("SSC_flag_qc2_log_iqr")
         SSL_qc2 = qc.get("SSL_flag_qc2_log_iqr")
 
-        # QC3: SSC–Q consistency step & SSL propagation step（key 名以 tool.py 实际为准）
+        # QC3: SSC-Q consistency step & SSL propagation step
         SSC_qc3 = qc.get("SSC_flag_qc3_ssc_q_consistency") or qc.get("SSC_flag_qc3_ssc_q")
         SSL_qc3 = qc.get("SSL_flag_qc3_propagation") or qc.get("SSL_flag_qc3_ssl_propagation")
 
@@ -263,13 +282,13 @@ def process_station(input_file, output_dir):
         if n_samples < 5:
             warnings.append("Sample size < 5: some statistical QC / SSC-Q checks may be skipped or unreliable")
 
-        # 如果你希望把“是否产生诊断图失败”也算 warning：
-        # 你现在 plot 的 except 只 print，不记录；改成同时 append
-        # （见下方“plot except 小改动”）
+        # SSC-only station note (informational, not a warning)
+        if not source_has_discharge:
+            warnings.append("SSC-only station: no discharge data available")
 
         def _flag_warn(var, flags):
             flags = np.asarray(flags)
-            # 统计站点级别的“坏/缺测”数量，作为警告摘要
+            # Count station-level bad/missing/suspect for warning summary
             n_bad = int((flags == 3).sum())
             n_missing = int((flags == 9).sum())
             n_suspect = int((flags == 2).sum())
@@ -294,10 +313,11 @@ def process_station(input_file, output_dir):
         import matplotlib.dates as mdates
         numeric_dates = mdates.date2num(dates)
         # ==========================================================
-        # SSC–Q diagnostic plot (station-level, optional but recommended)
+        # SSC-Q diagnostic plot (station-level, optional but recommended)
+        # For SSC-only stations ssc_q_bounds is None -> plot is skipped.
         # ==========================================================
         try:
-            
+
             plot_dir = os.path.join(output_dir, "diagnostic_plots")
             os.makedirs(plot_dir, exist_ok=True)
 
@@ -316,8 +336,8 @@ def process_station(input_file, output_dir):
             )
         except Exception as e:
             msg = f"Diagnostic plot failed: {e}"
-            print(f"  ⚠️ Diagnostic plot failed for {station_id}: {e}")
-            # 记录 warning（如果 warnings 还没定义，就先临时存一下）
+            print(f"  ! Diagnostic plot failed for {station_id}: {e}")
+            # Record warning
             try:
                 warnings.append(msg)
             except Exception:
@@ -331,12 +351,12 @@ def process_station(input_file, output_dir):
         q_suspect = np.sum(q_flags == 2)
         q_bad = np.sum(q_flags == 3)
         q_missing = np.sum(q_flags == 9)
-        # estimated（final flag == 1）
+        # estimated (final flag == 1)
         q_estimated   = np.sum(q_flags == 1)
         ssc_estimated = np.sum(ssc_flags == 1)
         ssl_estimated = np.sum(ssl_flags == 1)
-        # 站点最终用于统计的天数（trim 后）
-        qc_n_days = int(len(q_flags))   # 或 len(time_data)，两者这里等价
+        # Station final stats days (trimmed)
+        qc_n_days = int(len(q_flags))   # or len(time_data), equivalent here
 
         ssc_good = np.sum(ssc_flags == 0)
         ssc_suspect = np.sum(ssc_flags == 2)
@@ -350,7 +370,9 @@ def process_station(input_file, output_dir):
 
 
         print(f"  Station: {station_name} ({river_name})")
-        print(f"  Location: {lat:.3f}°, {lon:.3f}°")
+        print(f"  Location: {lat:.3f} deg, {lon:.3f} deg")
+        if not source_has_discharge:
+            print(f"  Type: SSC-only (no discharge data)")
         print(f"  Time series trimmed: {len(time_data)} days ({dates[0]} to {dates[-1]})")
         print(f"  Q: {q_good} good, {q_suspect} suspect, {q_bad} bad, {q_missing} missing")
         print(f"  SSC: {ssc_good} good, {ssc_suspect} suspect, {ssc_bad} bad, {ssc_missing} missing")
@@ -363,7 +385,7 @@ def process_station(input_file, output_dir):
         skipped_log_iqr = (n_samples < 5)
         skipped_ssc_q = (n_samples < 5)
 
-        # 用最后一个有效值来展示（更像你截图那种“一行一个站点”）
+        # Use last valid value for display
         def last_valid(arr):
             arr = np.asarray(arr)
             m = np.isfinite(arr)
@@ -373,7 +395,7 @@ def process_station(input_file, output_dir):
         ssc_show = last_valid(ssc_data)
         ssl_show = last_valid(ssl_data)
 
-        # 对应的 flag 也取最后一个有效位置
+        # Corresponding flag for last valid position
         def last_valid_flag(arr, flags):
             arr = np.asarray(arr)
             flags = np.asarray(flags)
@@ -460,7 +482,7 @@ def process_station(input_file, output_dir):
             ssc_var.units = 'mg L-1'
             ssc_var.coordinates = 'time lat lon altitude'
             ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q_consistency'
-            ssc_var.comment = 'Original data in g/m³, which equals mg/L'
+            ssc_var.comment = 'Original data in g/m3, which equals mg/L'
             ssc_var[:] = ssc_data
 
             ssl_var = ds.createVariable('SSL', 'f4', ('time',), fill_value=-9999.0,
@@ -469,7 +491,7 @@ def process_station(input_file, output_dir):
             ssl_var.units = 'ton day-1'
             ssl_var.coordinates = 'time lat lon altitude'
             ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_propagation'
-            ssl_var.comment = 'Calculated as: SSL = Q × SSC × 0.0864 (Q in m³/s, SSC in g/m³, SSL in ton/day)'
+            ssl_var.comment = 'Calculated as: SSL = Q x SSC x 0.0864 (Q in m3/s, SSC in g/m3, SSL in ton/day). Only computed on paired Q+SSC dates.'
             ssl_var[:] = ssl_data
 
             # Create quality flag variables
@@ -477,21 +499,21 @@ def process_station(input_file, output_dir):
             q_flag_var.long_name = 'quality flag for river discharge'
             q_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             q_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
-            q_flag_var.comment = 'Quality flags: 0=good (passes all checks), 1=estimated, 2=suspect (Q=0 or Q>10000 m³/s), 3=bad (Q<0), 9=missing'
+            q_flag_var.comment = 'Quality flags: 0=good (passes all checks), 1=estimated, 2=suspect (Q=0 or Q>10000 m3/s), 3=bad (Q<0), 9=missing'
             q_flag_var[:] = q_flags
 
             ssc_flag_var = ds.createVariable('SSC_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
             ssc_flag_var.long_name = 'quality flag for suspended sediment concentration'
             ssc_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             ssc_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
-            ssc_flag_var.comment = 'Quality flags: 0=good (0≤SSC≤3000 mg/L), 1=estimated, 2=suspect (SSC>3000 mg/L), 3=bad (SSC<0), 9=missing'
+            ssc_flag_var.comment = 'Quality flags: 0=good (0<=SSC<=3000 mg/L), 1=estimated, 2=suspect (SSC>3000 mg/L), 3=bad (SSC<0), 9=missing'
             ssc_flag_var[:] = ssc_flags
 
             ssl_flag_var = ds.createVariable('SSL_flag', 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
             ssl_flag_var.long_name = 'quality flag for suspended sediment load'
             ssl_flag_var.flag_values = np.array([0, 1, 2, 3, 9], dtype=np.byte)
             ssl_flag_var.flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
-            ssl_flag_var.comment = 'Quality flags: 0=good (SSL≥0), 1=estimated, 2=suspect, 3=bad (SSL<0), 9=missing'
+            ssl_flag_var.comment = 'Quality flags: 0=good (SSL>=0), 1=estimated, 2=suspect, 3=bad (SSL<0), 9=missing'
             ssl_flag_var[:] = ssl_flags
             # ------------------------------------------------------------
             # Step-level provenance flags (optional)
@@ -537,14 +559,14 @@ def process_station(input_file, output_dir):
             # Global attributes (CF-1.8 and ACDD-1.3 compliant)
             ds.Conventions = 'CF-1.8, ACDD-1.3'
             ds.title = 'Harmonized Global River Discharge and Sediment'
-            ds.summary = f'Daily time series of river discharge, suspended sediment concentration, and sediment load for {river_name} at {station_name}, Bavaria, Germany. Data from Bayerisches Landesamt für Umwelt (Bavarian Environment Agency) monitoring network.'
+            ds.summary = f'Daily time series of river discharge, suspended sediment concentration, and sediment load for {river_name} at {station_name}, Bavaria, Germany. Data from Bayerisches Landesamt fur Umwelt (Bavarian Environment Agency) monitoring network.'
             ds.source = 'In-situ station data'
             ds.data_source_name = 'Bayern State Environmental Agency (LfU) River Monitoring Network'
             ds.observation_type = 'In-situ'
             ds.temporal_resolution = 'daily'
             ds.temporal_span = f'{dates[0].strftime("%Y-%m-%d")} to {dates[-1].strftime("%Y-%m-%d")}'
 
-            # Determine which variables are provided
+            # Determine which variables are provided (based on SSC or SSL, not Q)
             vars_provided = []
             if q_good > 0:
                 vars_provided.append('Q')
@@ -556,8 +578,11 @@ def process_station(input_file, output_dir):
 
             ds.variables_provided = vars_provided_str
             ds.geographic_coverage = 'Bavaria, Germany'
-            ds.references = 'Data from Bayerisches Landesamt für Umwelt (LfU). Available at: https://www.gkd.bayern.de/en/rivers/discharge and https://www.gkd.bayern.de/en/rivers/suspended-sediment'
+            ds.references = 'Data from Bayerisches Landesamt fur Umwelt (LfU). Available at: https://www.gkd.bayern.de/en/rivers/discharge and https://www.gkd.bayern.de/en/rivers/suspended-sediment'
             ds.source_data_link = 'https://www.gkd.bayern.de/en/'
+
+            # Provenance: preserve whether discharge was in original source
+            ds.source_has_discharge = 'yes' if source_has_discharge else 'no'
 
             # Creator information
             ds.creator_name = 'Zhongwang Wei'
@@ -566,7 +591,7 @@ def process_station(input_file, output_dir):
 
             # Processing history
             original_history = f"Created on 2025-10-24 by convert_bayern_to_netcdf.py"
-            qc_history = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Quality controlled and standardized to CF-1.8/ACDD-1.3 compliance. Added quality flags (Q_flag, SSC_flag, SSL_flag), renamed variables (discharge→Q, ssc→SSC, sediment_load→SSL, latitude→lat, longitude→lon), trimmed time series from {len(time_data)} to {len(time_data)} days (removed leading/trailing NaN periods), changed time dimension to UNLIMITED. Script: qc_and_standardize.py"
+            qc_history = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Quality controlled and standardized to CF-1.8/ACDD-1.3 compliance. Added quality flags (Q_flag, SSC_flag, SSL_flag), renamed variables (discharge->Q, ssc->SSC, sediment_load->SSL, latitude->lat, longitude->lon), trimmed time series from {len(time_data)} to {len(time_data)} days (removed leading/trailing NaN periods), changed time dimension to UNLIMITED. Script: qc_and_standardize.py"
             ds.history = f"{original_history}; {qc_history}"
 
             # Station-specific attributes
@@ -592,6 +617,7 @@ def process_station(input_file, output_dir):
             'Variables Provided': vars_provided_str,
             'Geographic Coverage': 'Bavaria, Germany',
             'Reference/DOI': 'https://www.gkd.bayern.de/en/',
+            'source_has_discharge': 'yes' if source_has_discharge else 'no',
             'Q_start_date': dates[0].strftime('%Y-%m-%d') if q_good > 0 else 'N/A',
             'Q_end_date': dates[-1].strftime('%Y-%m-%d') if q_good > 0 else 'N/A',
             'Q_percent_complete': f"{100.0 * q_good / len(q_data):.1f}" if q_good > 0 else 'N/A',
@@ -601,7 +627,7 @@ def process_station(input_file, output_dir):
             'SSL_start_date': dates[0].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
             'SSL_end_date': dates[-1].strftime('%Y-%m-%d') if ssl_good > 0 else 'N/A',
             'SSL_percent_complete': f"{100.0 * ssl_good / len(ssl_data):.1f}" if ssl_good > 0 else 'N/A',
-            
+
             'filepath': output_file,
             'warnings': warnings_str,
             'n_warnings': n_warnings,
@@ -628,7 +654,7 @@ def process_station(input_file, output_dir):
             "SSL_final_bad": int(ssl_bad),
             "SSL_final_missing": int(ssl_missing),
         }
-        # ===== b 部分：把“范例式字段”补齐（final_* + estimated）=====
+        # ===== b part: fill in final_* + estimated fields =====
         q_estimated   = int((q_flags == 1).sum())
         ssc_estimated = int((ssc_flags == 1).sum())
         ssl_estimated = int((ssl_flags == 1).sum())
@@ -674,13 +700,13 @@ def process_station(input_file, output_dir):
         # QC2: 0 pass, 2 suspect, 8 not_checked, 9 missing
         qc2_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
 
-        # QC3 SSC–Q: 0 pass, 2 suspect, 8 not_checked, 9 missing
+        # QC3 SSC-Q: 0 pass, 2 suspect, 8 not_checked, 9 missing
         qc3_map = {"pass": 0, "suspect": 2, "not_checked": 8, "missing": 9}
 
         # QC3 SSL propagation: 0 not_propagated, 2 propagated, 8 not_checked, 9 missing
         qc3_ssl_map = {"not_propagated": 0, "propagated": 2, "not_checked": 8, "missing": 9}
 
-        # 逐个变量逐步写入（有就写，没有就跳过）
+        # Write step-level flags per variable
         for var, arr, mp, prefix in [
             ("Q",   Q_qc1,   qc1_map,     "qc1"),
             ("SSC", SSC_qc1, qc1_map,     "qc1"),
@@ -698,7 +724,7 @@ def process_station(input_file, output_dir):
                 station_info.update({f"{var}_{prefix}_{k}": v for k, v in c.items()})
 
         return station_info
-    
+
     except Exception as e:
         print(f"  ERROR processing {os.path.basename(input_file)}: {e}")
         import traceback
@@ -733,6 +759,20 @@ def main():
     print(f"Found {len(input_files)} NetCDF files to process")
     print()
 
+    # --- Audit counters ---
+    audit = {
+        'total_input': len(input_files),
+        'processed': 0,
+        'skipped': 0,
+        'ssc_only_stations': 0,
+        'stations_with_q': 0,
+        'stations_with_ssc': 0,
+        'stations_with_ssl': 0,
+        'ssc_records_total': 0,
+        'q_records_total': 0,
+        'ssl_records_total': 0,
+    }
+
     # Process each station
     station_info_list = []
     processed_count = 0
@@ -746,6 +786,19 @@ def main():
         if station_info:
             station_info_list.append(station_info)
             processed_count += 1
+
+            # Track types
+            if station_info.get('source_has_discharge') == 'no':
+                audit['ssc_only_stations'] += 1
+            else:
+                audit['stations_with_q'] += 1
+            if station_info.get('SSC_good', 0) > 0:
+                audit['stations_with_ssc'] += 1
+            if station_info.get('SSL_good', 0) > 0:
+                audit['stations_with_ssl'] += 1
+            audit['ssc_records_total'] += int(station_info.get('SSC_good', 0))
+            audit['q_records_total'] += int(station_info.get('Q_good', 0))
+            audit['ssl_records_total'] += int(station_info.get('SSL_good', 0))
         else:
             skipped_count += 1
 
@@ -771,6 +824,7 @@ def main():
             'altitude', 'upstream_area', 'Data Source Name', 'Type',
             'Temporal Resolution', 'Temporal Span', 'Variables Provided',
             'Geographic Coverage', 'Reference/DOI',
+            'source_has_discharge',
             'Q_start_date', 'Q_end_date', 'Q_percent_complete',
             'SSC_start_date', 'SSC_end_date', 'SSC_percent_complete',
             'SSL_start_date', 'SSL_end_date', 'SSL_percent_complete'
@@ -813,31 +867,23 @@ def main():
     print(f"Skipped (no valid data): {skipped_count}")
     print(f"Output directory: {output_dir}")
     print("="*80)
-    print()
 
-    # Quality control summary
-    # print("="*80)
-    # print("Quality Control Summary")
-    # print("="*80)
-    # print("Quality Checks Applied:")
-    # print("  Q (Discharge):")
-    # print("    - Q < 0: Flagged as BAD (flag=3)")
-    # print("    - Q == 0: Flagged as SUSPECT (flag=2)")
-    # print("    - Q > 10000 m³/s: Flagged as SUSPECT (flag=2)")
-    # print("    - Valid Q: Flagged as GOOD (flag=0)")
-    # print("  SSC (Concentration):")
-    # print("    - SSC < 0: Flagged as BAD (flag=3)")
-    # print("    - SSC > 3000 mg/L: Flagged as SUSPECT (flag=2)")
-    # print("    - Valid SSC: Flagged as GOOD (flag=0)")
-    # print("  SSL (Load):")
-    # print("    - SSL < 0: Flagged as BAD (flag=3)")
-    # print("    - Valid SSL: Flagged as GOOD (flag=0)")
-    # print()
-    # print("Time Series Trimming:")
-    # print("  - Removed leading/trailing periods with all missing data")
-    # print("  - Kept continuous middle section with valid measurements")
-    # print("="*80)
-    # print()
+    # --- QC Audit summary ---
+    print(f"\n{'=' * 60}")
+    print(f"QC AUDIT SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"Input stations:                         {audit['total_input']}")
+    print(f"  -> Successfully QC'd:                 {audit['processed']}")
+    print(f"  -> Skipped / failed:                  {audit['skipped']}")
+    print(f"Stations with Q data:                   {audit['stations_with_q']}")
+    print(f"SSC-only stations (no Q):               {audit['ssc_only_stations']}")
+    print(f"Stations with any good SSC records:     {audit['stations_with_ssc']}")
+    print(f"Stations with any good SSL records:     {audit['stations_with_ssl']}")
+    print(f"Total good Q records:                   {audit['q_records_total']}")
+    print(f"Total good SSC records:                 {audit['ssc_records_total']}")
+    print(f"Total good SSL records:                 {audit['ssl_records_total']}")
+    print(f"{'=' * 60}")
+    print()
 
 
 if __name__ == '__main__':
