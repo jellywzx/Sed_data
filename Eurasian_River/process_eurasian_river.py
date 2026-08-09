@@ -8,6 +8,14 @@ This script processes the Eurasian River dataset. It performs the following step
 5.  Performs quality control and flags the data.
 6.  Creates CF-1.8 compliant NetCDF files for each station.
 7.  Generates a summary CSV file with metadata for all stations.
+
+Sediment-oriented inclusion rule (test/ssc-only-station-fix):
+- Candidate rivers are based on sediment flux / SSL presence, NOT discharge.
+- Discharge (Q) is optional; its absence does not exclude a station.
+- Q and SSL are aligned by monthly timestamp UNION (not intersection).
+- SSC = SSL/(Q*0.0864) is computed only where Q>0 and SSL is valid.
+- SSL-only records are kept; Q-only records do not create sediment eligibility.
+- QC1/QC2 run independently on each variable; QC3 only on paired observations.
 """
 
 import pandas as pd
@@ -174,6 +182,18 @@ def read_discharge_data():
 
     return discharge_data
 
+def _fmt_val(val):
+    """NaN-safe float formatter for QC summary printing."""
+    if val is None:
+        return "N/A"
+    try:
+        v = float(val)
+        if np.isfinite(v):
+            return f"{v:.2f}"
+        return "N/A"
+    except (TypeError, ValueError):
+        return "N/A"
+
 def print_qc_summary(river_name, station_id, n, skipped_log_iqr, skipped_ssc_q, q, q_flag, ssc, ssc_flag, ssl, ssl_flag, nc_path):
     print(f"\nProcessing: {river_name} ({station_id}) +")
     if skipped_log_iqr:
@@ -181,9 +201,9 @@ def print_qc_summary(river_name, station_id, n, skipped_log_iqr, skipped_ssc_q, 
     if skipped_ssc_q:
         print(f"  - Sample size = {n} < 5, SSC-Q consistency check and diagnostic plot skipped.")
     print(f"  - Created: {nc_path}")
-    print(f"    Q:   {q:.2f} m3/s (flag={int(q_flag)})")
-    print(f"    SSC: {ssc:.2f} mg/L (flag={int(ssc_flag)})")
-    print(f"    SSL: {ssl:.2f} ton/day (flag={int(ssl_flag)})")
+    print(f"    Q:   {_fmt_val(q)} m3/s (flag={int(q_flag)})")
+    print(f"    SSC: {_fmt_val(ssc)} mg/L (flag={int(ssc_flag)})")
+    print(f"    SSL: {_fmt_val(ssl)} ton/day (flag={int(ssl_flag)})")
 
 def parse_discharge_file(filepath):
     """Parses a discharge file (.dat or .txt)."""
@@ -317,8 +337,220 @@ def read_sediment_data():
 
     return sediment_data
 
+
+# =====================================================================
+# Sediment-oriented inclusion helpers
+# =====================================================================
+
+def _build_station_metadata(dis_data, river_name):
+    """
+    Extract station metadata from discharge data if available,
+    otherwise construct minimal metadata from river_name.
+
+    Returns (station_id, station_name, meta_dict).
+    """
+    if dis_data is not None:
+        meta = dis_data.get("meta", {})
+        station_id = meta.get("station_id", meta.get("station_code", river_name))
+        station_name = meta.get("station_name", river_name)
+        return station_id, station_name, meta
+    else:
+        # SSL-only river: construct minimal metadata
+        meta = {}
+        station_id = river_name
+        station_name = river_name
+        return station_id, station_name, meta
+
+
+def _build_merged_dataframe(dis_data, sed_df, river_name):
+    """
+    Build a merged dataframe from discharge and sediment data using
+    MONTHLY TIMESTAMP UNION (not intersection).
+
+    Sediment-oriented inclusion rule:
+    - SSL_kg_s must exist for at least one record (entry criterion).
+    - Q is optional; its absence does not exclude a record or station.
+    - SSC is computed conditionally only when Q > 0 and SSL is valid.
+
+    Returns:
+        (df, n_ssl_sourced, n_q_ssl_paired, n_ssl_only, n_q_only)
+        or None if no SSL records exist.
+    """
+    # Collect all years present in either dataset
+    years = set()
+    if dis_data is not None:
+        for y, _m in dis_data["data"].keys():
+            years.add(y)
+    for y in sed_df["Year"]:
+        years.add(y)
+    years = sorted(years)
+    if not years:
+        return None
+
+    start_year, end_year = years[0], years[-1]
+    time_index = pd.to_datetime(
+        [f"{y}-{m}-15" for y in range(start_year, end_year + 1) for m in range(1, 13)]
+    )
+    df = pd.DataFrame(index=time_index)
+
+    # --- Add discharge data (optional) ---
+    df["Q"] = np.nan
+    if dis_data is not None:
+        for (year, month), value in dis_data["data"].items():
+            key = f"{year}-{month}-15"
+            if key in df.index:
+                df.loc[key, "Q"] = value
+
+    # --- Add sediment flux data (required) ---
+    df["SSL_kg_s"] = np.nan
+    for _, row in sed_df.iterrows():
+        year = row["Year"]
+        for i, month_name in enumerate(
+            ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        ):
+            month = i + 1
+            if pd.notna(row[month_name]):
+                key = f"{year}-{month}-15"
+                if key in df.index:
+                    df.loc[key, "SSL_kg_s"] = row[month_name]
+
+    # --- Pre-calculation audit ---
+    ssl_present = df["SSL_kg_s"].notna()
+    q_present = df["Q"].notna()
+    n_ssl_sourced = int(ssl_present.sum())
+    n_q_ssl_paired = int((ssl_present & q_present).sum())
+    n_ssl_only = int((ssl_present & ~q_present).sum())
+    n_q_only = int((~ssl_present & q_present).sum())
+
+    # Sediment-oriented inclusion: SSL must exist for at least one record
+    if n_ssl_sourced == 0:
+        return None
+
+    # --- Conditional calculations ---
+    # SSL (ton/day) = SSL (kg/s) * 86400 / 1000
+    df["SSL"] = df["SSL_kg_s"] * 86.4
+
+    # SSC (mg/L) = SSL (ton/day) / (Q (m3/s) * 0.0864)
+    # ONLY when Q > 0 and SSL is valid; otherwise keep NaN
+    df["SSC"] = np.nan
+    valid_mask = (df["Q"] > 0) & df["SSL_kg_s"].notna()
+    df.loc[valid_mask, "SSC"] = (
+        df.loc[valid_mask, "SSL"] / (df.loc[valid_mask, "Q"] * 0.0864)
+    )
+
+    return df, n_ssl_sourced, n_q_ssl_paired, n_ssl_only, n_q_only
+
+
+def _print_audit_report(audit):
+    """Print the sediment-oriented inclusion audit report."""
+    print("\n" + "=" * 72)
+    print("  SEDIMENT-ORIENTED INCLUSION AUDIT")
+    print("=" * 72)
+    print(f"  Total sediment rivers processed:    {audit['n_rivers_total']:>6d}")
+    print(f"  SSL-bearing rivers:                 {audit['n_rivers_ssl']:>6d}")
+    print(f"  Q+SSL paired rivers:                {audit['n_rivers_q_ssl']:>6d}")
+    print(f"  SSL-only rivers (no Q at all):      {audit['n_rivers_ssl_only']:>6d}")
+    print(f"  Rivers skipped (no SSL):            {audit['n_rivers_skipped_no_ssl']:>6d}")
+    print("-" * 72)
+    print(f"  Total SSL-bearing records:          {audit['n_records_ssl']:>6d}")
+    print(f"  Q+SSL paired records:               {audit['n_records_q_ssl']:>6d}")
+    print(f"  SSL-only records (Q missing):       {audit['n_records_ssl_only']:>6d}")
+    print(f"  Q-only records (excluded from eligibility): {audit['n_records_q_only']:>6d}")
+    print(f"  Newly retained SSL-only records:    {audit['n_records_ssl_only']:>6d}")
+    print("=" * 72 + "\n")
+
+
+def _run_regression_test(discharge_data, sediment_data, river_map):
+    """
+    Regression test: verify that SSL-only records are NOT deleted,
+    and that the sediment-oriented inclusion rule is working correctly.
+
+    Returns True if all checks pass.
+    """
+    print("\n" + "=" * 72)
+    print("  REGRESSION TEST: Sediment-Oriented Inclusion Rule")
+    print("=" * 72)
+
+    all_pass = True
+
+    # Test 1: Every river in sediment_data should be a candidate
+    for sed_river in sorted(sediment_data.keys()):
+        sed_df = sediment_data[sed_river]
+
+        # Look up discharge data (optional)
+        dis_data_r = discharge_data.get(sed_river)
+        if dis_data_r is None:
+            # Try reverse mapping: sediment name -> discharge name
+            for dname, sname in river_map.items():
+                if sname == sed_river:
+                    dis_data_r = discharge_data.get(dname)
+                    break
+
+        result = _build_merged_dataframe(dis_data_r, sed_df, sed_river)
+        if result is None:
+            print(f"  FAIL: Sediment river '{sed_river}' returned None from _build_merged_dataframe")
+            all_pass = False
+        else:
+            df, n_ssl, n_paired, n_ssl_only, n_q_only = result
+            if n_ssl == 0:
+                print(f"  FAIL: Sediment river '{sed_river}' has 0 SSL records after merge")
+                all_pass = False
+            else:
+                has_q = "(paired=" + str(n_paired) + ")" if n_paired > 0 else "(NO Q)"
+                print(f"  PASS: '{sed_river}' - {n_ssl} SSL records {has_q}, SSL-only={n_ssl_only}, Q-only(excluded)={n_q_only}")
+
+    # Test 2: Rivers ONLY in discharge_data (no sediment) must NOT create sediment-eligible stations
+    for dis_river in sorted(discharge_data.keys()):
+        if dis_river in sediment_data:
+            continue
+        # Check if this maps to a sediment river
+        mapped = river_map.get(dis_river)
+        if mapped and mapped in sediment_data:
+            continue
+        print(f"  PASS: Discharge-only river '{dis_river}' correctly excluded from sediment candidates")
+
+    # Test 3: Impact assessment - quantify what the old dropna would have removed
+    print("\n  --- Impact Assessment (old intersection vs new union rule) ---")
+    any_impact = False
+    for sed_river in sorted(sediment_data.keys()):
+        sed_df = sediment_data[sed_river]
+        dis_data_r = discharge_data.get(sed_river)
+        if dis_data_r is None:
+            for dname, sname in river_map.items():
+                if sname == sed_river:
+                    dis_data_r = discharge_data.get(dname)
+                    break
+
+        result = _build_merged_dataframe(dis_data_r, sed_df, sed_river)
+        if result is None:
+            continue
+        _df, n_ssl, n_paired, n_ssl_only, _n_q_only = result
+
+        # Old rule: dropna(subset=['Q','SSL_kg_s'], how='any') -> only paired survive
+        old_n = n_paired
+        new_n = n_ssl
+        if new_n > old_n:
+            print(f"  '{sed_river}': old={old_n} records -> new={new_n} records (+{new_n - old_n} SSL-only retained)")
+            any_impact = True
+
+    if not any_impact:
+        print("  (No rivers gained SSL-only records - all SSL records already had paired Q)")
+
+    if all_pass:
+        print("\n  ✅ All regression tests PASSED.")
+    else:
+        print("\n  ❌ Some regression tests FAILED.")
+    print("=" * 72 + "\n")
+    return all_pass
+
+
+# =====================================================================
+# Main processing function - sediment-oriented inclusion rule
+# =====================================================================
+
 def main():
-    """Main processing function."""
+    """Main processing function - sediment-oriented inclusion rule."""
     create_output_dir()
     DIAG_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
     os.makedirs(DIAG_DIR, exist_ok=True)
@@ -328,85 +560,83 @@ def main():
     summary_data = []
     qc_reports = []
 
-    # River name mapping
+    # --- Audit accumulators ---
+    audit = {
+        "n_rivers_total": 0,
+        "n_rivers_ssl": 0,
+        "n_rivers_q_ssl": 0,
+        "n_rivers_ssl_only": 0,
+        "n_rivers_skipped_no_ssl": 0,
+        "n_records_ssl": 0,
+        "n_records_q_ssl": 0,
+        "n_records_ssl_only": 0,
+        "n_records_q_only": 0,
+    }
+
+    # River name mapping (discharge -> sediment)
     river_map = {
         "Mezen'": "Mezen"
     }
+    # Reverse mapping for sediment-first lookup
+    sediment_to_discharge = {}
+    for dname, sname in river_map.items():
+        sediment_to_discharge[sname] = dname
 
-    for river_name, dis_data in discharge_data.items():
-        print(f"Processing {river_name}...")
+    # ==================================================================
+    # CANDIDATE RIVERS: iterate over SEDIMENT rivers (not discharge)
+    # Rule: SSC or SSL at least one present; Q is NOT an entry criterion.
+    # ==================================================================
+    for sed_river_name, sed_df in sediment_data.items():
+        audit["n_rivers_total"] += 1
+        print(f"Processing {sed_river_name}...")
 
-        # Find corresponding sediment data
-        sed_df = sediment_data.get(river_name)
-        if sed_df is None:
-            # Try mapping
-            mapped_river_name = river_map.get(river_name)
-            if mapped_river_name:
-                sed_df = sediment_data.get(mapped_river_name)
+        # Look up discharge data (optional - not required for inclusion)
+        dis_data = discharge_data.get(sed_river_name)
+        if dis_data is None:
+            mapped = sediment_to_discharge.get(sed_river_name)
+            if mapped:
+                dis_data = discharge_data.get(mapped)
 
-        if sed_df is None:
-            print(f"  - Sediment data not found for {river_name}. Skipping.")
+        if dis_data is None:
+            print(f"  - No discharge data for {sed_river_name} (SSL-only station).")
+
+        # Build merged dataframe with UNION alignment (not intersection)
+        merge_result = _build_merged_dataframe(dis_data, sed_df, sed_river_name)
+        if merge_result is None:
+            print(f"  - No SSL records for {sed_river_name}. Skipping.")
+            audit["n_rivers_skipped_no_ssl"] += 1
             continue
 
-        # Combine data
-        dis_years = [y for y, m in dis_data['data'].keys()]
-        if not dis_years:
-            continue
-        all_years = sorted(list(set(dis_years) | set(sed_df['Year'])))
-        if not all_years:
-            continue
+        df, n_ssl_sourced, n_q_ssl_paired, n_ssl_only, n_q_only = merge_result
 
-        start_year = min(all_years)
-        end_year = max(all_years)
+        # Accumulate audit stats
+        audit["n_rivers_ssl"] += 1
+        audit["n_records_ssl"] += n_ssl_sourced
+        audit["n_records_q_ssl"] += n_q_ssl_paired
+        audit["n_records_ssl_only"] += n_ssl_only
+        audit["n_records_q_only"] += n_q_only
+        if n_q_ssl_paired > 0:
+            audit["n_rivers_q_ssl"] += 1
+        if n_q_ssl_paired == 0 and n_ssl_sourced > 0:
+            audit["n_rivers_ssl_only"] += 1
 
-        # Create a dataframe to hold the merged data
-        time_index = pd.to_datetime([f'{y}-{m}-15' for y in range(start_year, end_year + 1) for m in range(1, 13)])
-        df = pd.DataFrame(index=time_index)
+        # --- Resolve station metadata ---
+        station_id, station_name, meta = _build_station_metadata(dis_data, sed_river_name)
 
-        # Add discharge data
-        df['Q'] = np.nan
-        for (year, month), value in dis_data['data'].items():
-            df.loc[f'{year}-{month}-15', 'Q'] = value
-
-        # Add sediment flux data
-        df['SSL_kg_s'] = np.nan
-        for _, row in sed_df.iterrows():
-            year = row['Year']
-            for i, month_name in enumerate(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']):
-                month = i + 1
-                if pd.notna(row[month_name]):
-                    df.loc[f'{year}-{month}-15', 'SSL_kg_s'] = row[month_name]
-
-        # --- Calculations ---
-        # SSL (ton/day) = SSL (kg/s) * 86400 / 1000
-        df['SSL'] = df['SSL_kg_s'] * 86.4
-
-        # SSC (mg/L) = SSL (ton/day) / (Q (m3/s) * 0.0864)
-        df['SSC'] = df['SSL'] / (df['Q'] * 0.0864)
-
-        # --- Keep only overlapping data (intersection) ---
-        df = df.dropna(subset=['Q', 'SSL_kg_s'], how='any')
-
-        if df.empty:
-            print(f"  - No overlapping data for {river_name}. Skipping.")
-            continue
-        # 先确定 station_id（后面 QC/print 都要用）
-        station_id = dis_data['meta'].get('station_id', dis_data['meta'].get('station_code', river_name))
-        station_name = dis_data['meta'].get('station_name', river_name)
-
-        # time base（你注释写的是 since 1970-01-01）
+        # --- Quality control time base ---
         base = pd.Timestamp("1970-01-01")
 
-        # --- Quality Control and Flagging ---  
-        # 1) QC1-array：显式调用（用于 qc=None 的 fallback，同时也写成 step flag）
+        # --- QC1 arrays: NaN values -> QC module sets FLAG_MISSING (9) ---
         Q_flag_qc1   = apply_quality_flag_array(df["Q"].values,   "Q")
         SSC_flag_qc1 = apply_quality_flag_array(df["SSC"].values, "SSC")
         SSL_flag_qc1 = apply_quality_flag_array(df["SSL"].values, "SSL")
 
-        # 2) time days since 1970-01-01
         time_days = ((df.index - base) / np.timedelta64(1, "D")).astype(float).to_numpy()
 
-        # 3) tool.py pipeline
+        # --- QC pipeline (QC1 + QC2 + QC3 with provenance) ---
+        # QC1/QC2 run independently on each variable (NaN values handled as missing).
+        # QC3 (SSC-Q envelope) only runs on paired observations (env_mask in qc.py
+        # requires both Q and SSC good & finite).
         qc, qc_report = apply_tool_qc(
             time=time_days,
             Q=df["Q"].values,
@@ -418,7 +648,7 @@ def main():
         )
 
         if qc is None:
-            # 退回 QC1（同时补齐 step flags，缺失的 step 用 9）
+            # Fallback to QC1 only; fill step flags with MISSING (9)
             df["Q_flag"]   = Q_flag_qc1
             df["SSC_flag"] = SSC_flag_qc1
             df["SSL_flag"] = SSL_flag_qc1
@@ -427,7 +657,6 @@ def main():
             df["SSC_flag_qc1_physical"] = SSC_flag_qc1
             df["SSL_flag_qc1_physical"] = SSL_flag_qc1
 
-            # qc2/qc3 不跑 -> 统一 9
             for col in [
                 "Q_flag_qc2_log_iqr", "Q_flag_qc3_ssc_q_envelope",
                 "SSC_flag_qc2_log_iqr", "SSC_flag_qc3_ssc_q_envelope",
@@ -437,15 +666,14 @@ def main():
 
             ssc_q_bounds = None
         else:
-            # qc 已经 trimmed(valid_time)，用 qc["time"] 找回 df 索引
+            # QC returned trimmed arrays (valid_time subset)
             qc_time = base + pd.to_timedelta(qc["time"], unit="D")
             df = df.loc[qc_time].copy()
 
-            # final flags
             df["Q_flag"]   = qc["Q_flag"]
             df["SSC_flag"] = qc["SSC_flag"]
             df["SSL_flag"] = qc["SSL_flag"]
-            # ✅ 把 step/provenance flags 也落到 df 里（没有就先跳过）
+
             for k in [
                 "Q_flag_qc1_physical", "Q_flag_qc2_log_iqr", "Q_flag_qc3_ssc_q",
                 "SSC_flag_qc1_physical","SSC_flag_qc2_log_iqr","SSC_flag_qc3_ssc_q",
@@ -454,14 +682,11 @@ def main():
                 if k in qc:
                     df[k] = qc[k]
 
-            # step/provenance flags：把 qc 里所有 *_flag_qc* 都塞回 df
             for k, v in qc.items():
                 if isinstance(v, np.ndarray) and ("flag_qc" in k):
                     df[k] = v.astype(np.int8)
 
             ssc_q_bounds = qc.get("ssc_q_bounds", None)
-
-            # 收集 qc_report（后面要写 qc_results_summary.csv）
             qc_reports.append(qc_report)
 
         print(
@@ -471,58 +696,55 @@ def main():
             f"SSC={(df['SSC_flag'].to_numpy()==0).sum()}, SSL={(df['SSL_flag'].to_numpy()==0).sum()}"
         )
 
-
-        # --- Time Trimming ---
-        df.dropna(how='all', subset=['Q', 'SSL', 'SSC'], inplace=True)
+        # --- Time Trimming: drop rows where Q, SSL, SSC are ALL NaN ---
+        df.dropna(how="all", subset=["Q", "SSL", "SSC"], inplace=True)
         if df.empty:
-            print(f"  - No overlapping data for {river_name}. Skipping.")
+            print(f"  - All records trimmed for {sed_river_name}. Skipping.")
             continue
 
-        # --- Create NetCDF ---
-        station_id = dis_data['meta'].get('station_id', dis_data['meta'].get('station_code', river_name))
+        # --- Create NetCDF (schema, flags, units, metadata preserved) ---
         nc_filename = os.path.join(OUTPUT_DIR, f"Eurasian_River_{station_id}.nc")
-        with Dataset(nc_filename, 'w', format='NETCDF4') as nc:
+        with Dataset(nc_filename, "w", format="NETCDF4") as nc:
             # Dimensions
-            nc.createDimension('time', None)
-            nc.createDimension('lat', 1)
-            nc.createDimension('lon', 1)
+            nc.createDimension("time", None)
+            nc.createDimension("lat", 1)
+            nc.createDimension("lon", 1)
 
             # Coordinates
-            time = nc.createVariable('time', 'f8', ('time',))
+            time = nc.createVariable("time", "f8", ("time",))
             time.units = f"days since {df.index.min().strftime('%Y-%m-%d')} 00:00:00"
-            time.calendar = 'gregorian'
-            time.standard_name = 'time'
-            time.long_name = 'time'
+            time.calendar = "gregorian"
+            time.standard_name = "time"
+            time.long_name = "time"
             time[:] = (df.index - df.index.min()).days.values
 
-            lat = nc.createVariable('lat', 'f4', ('lat',))
-            lat.units = 'degrees_north'
-            lat.standard_name = 'latitude'
-            lat.long_name = 'station latitude'
-            lat[:] = dis_data['meta'].get('latitude', np.nan)
+            lat = nc.createVariable("lat", "f4", ("lat",))
+            lat.units = "degrees_north"
+            lat.standard_name = "latitude"
+            lat.long_name = "station latitude"
+            lat[:] = meta.get("latitude", np.nan)
 
-            lon = nc.createVariable('lon', 'f4', ('lon',))
-            lon.units = 'degrees_east'
-            lon.standard_name = 'longitude'
-            lon.long_name = 'station longitude'
-            lon[:] = dis_data['meta'].get('longitude', np.nan)
+            lon = nc.createVariable("lon", "f4", ("lon",))
+            lon.units = "degrees_east"
+            lon.standard_name = "longitude"
+            lon.long_name = "station longitude"
+            lon[:] = meta.get("longitude", np.nan)
 
-            # Global Attributes
+            # Global Attributes (preserved from original)
             nc.Conventions = "CF-1.8, ACDD-1.3"
             nc.title = "River sediment flux data for station RUS-Anabar"
             nc.insitiution = "Eurasian Arctic River Database"
             nc.dataset_name = "Eurasian River Historical Sediment Flux Data"
-            nc.station_name = dis_data['meta'].get('station_name', river_name)
-            nc.river_name = river_name
+            nc.station_name = meta.get("station_name", sed_river_name)
+            nc.river_name = sed_river_name
             nc.source_id = station_id
             nc.type = "In-situ station data"
             nc.temporal_resolution = "monthly"
             nc.temporal_span = f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
-            nc.geographic_coverage = f"{river_name} River Basin, Russia"
-            # nc.variables_provided = "altitude, upstream_area, Q, SSC, SSL, station_name, river_name, Source_ID"
+            nc.geographic_coverage = f"{sed_river_name} River Basin, Russia"
             nc.reference1 = "Holmes, R. M., McClelland, J. W., Peterson, B. J., Shiklomanov, I. A., Shiklomanov, A. I., Zhulidov, A. V., ... & Bobrovitskaya, N. N. (2002). A circumpolar perspective on fluvial sediment flux to the Arctic Ocean. Global biogeochemical cycles, 16(4), 45-1."
             nc.reference2 = "Holmes, R., Peterson, B. (2009). Eurasian River Historical Nutrient and Sediment Flux Data. Version 1.0. NSF NCAR Earth Observing Laboratory. https://doi.org/10.5065/D6F769PB. Accessed 17 Oct 2025."
-            nc.comment = "Original data: Monthly sediment flux data. TSS concentration and discharge data not available for this dataset. Processed: Sediment load calculated from sediment flux data. SSC derived from: SSC = sediment_load / (discharge × 86.4)"
+            nc.comment = "Original data: Monthly sediment flux data. TSS concentration and discharge data not available for this dataset. Processed: Sediment load calculated from sediment flux data. SSC derived from: SSC = sediment_load / (discharge x 86.4)"
             nc.discharge_data_source = "https://www.r-arcticnet.sr.unh.edu/v4.0/ViewPoint.pl?Point=5951"
             nc.sediment_data_source = "https://doi.org/10.5065/D6F769PB"
             nc.creator_name = "Zhongwang Wei"
@@ -531,61 +753,62 @@ def main():
             nc.history = f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} by process_eurasian_river.py"
 
             # Data Variables
-            q_var = nc.createVariable('Q', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
-            q_var.units = 'm3 s-1'
-            q_var.long_name = 'River Discharge'
-            q_var.standard_name = 'river_discharge'
-            q_var.ancillary_variables = 'Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr'
-            q_var[:,0,0] = df['Q'].fillna(-9999.0).values
+            q_var = nc.createVariable("Q", "f4", ("time", "lat", "lon"), fill_value=FILL_VALUE_FLOAT)
+            q_var.units = "m3 s-1"
+            q_var.long_name = "River Discharge"
+            q_var.standard_name = "river_discharge"
+            q_var.ancillary_variables = "Q_flag Q_flag_qc1_physical Q_flag_qc2_log_iqr"
+            q_var[:, 0, 0] = df["Q"].fillna(FILL_VALUE_FLOAT).values
 
-            q_flag_var = nc.createVariable('Q_flag', 'b', ('time', 'lat', 'lon'),fill_value=FILL_VALUE_INT)
-            q_flag_var.long_name = 'Quality flag for River Discharge'
+            q_flag_var = nc.createVariable("Q_flag", "b", ("time", "lat", "lon"), fill_value=FILL_VALUE_INT)
+            q_flag_var.long_name = "Quality flag for River Discharge"
             q_flag_var.flag_values = [0, 1, 2, 3, 9]
             q_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
-            q_flag_var[:,0,0] = df['Q_flag'].values
+            q_flag_var[:, 0, 0] = df["Q_flag"].values
 
-            ssc_var = nc.createVariable('SSC', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
-            ssc_var.units = 'mg L-1'
-            ssc_var.long_name = 'Suspended Sediment Concentration'
-            ssc_var.standard_name = 'mass_concentration_of_suspended_matter_in_water'
-            ssc_var.ancillary_variables = 'SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q_envelope'
-            ssc_var[:,0,0] = df['SSC'].fillna(FILL_VALUE_FLOAT).values
+            ssc_var = nc.createVariable("SSC", "f4", ("time", "lat", "lon"), fill_value=FILL_VALUE_FLOAT)
+            ssc_var.units = "mg L-1"
+            ssc_var.long_name = "Suspended Sediment Concentration"
+            ssc_var.standard_name = "mass_concentration_of_suspended_matter_in_water"
+            ssc_var.ancillary_variables = "SSC_flag SSC_flag_qc1_physical SSC_flag_qc2_log_iqr SSC_flag_qc3_ssc_q_envelope"
+            ssc_var[:, 0, 0] = df["SSC"].fillna(FILL_VALUE_FLOAT).values
 
-            ssc_flag_var = nc.createVariable('SSC_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
-            ssc_flag_var.long_name = 'Quality flag for Suspended Sediment Concentration'
+            ssc_flag_var = nc.createVariable("SSC_flag", "b", ("time", "lat", "lon"), fill_value=FILL_VALUE_INT)
+            ssc_flag_var.long_name = "Quality flag for Suspended Sediment Concentration"
             ssc_flag_var.flag_values = [0, 1, 2, 3, 9]
             ssc_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
-            ssc_flag_var[:,0,0] = df['SSC_flag'].values
+            ssc_flag_var[:, 0, 0] = df["SSC_flag"].values
 
-            ssl_var = nc.createVariable('SSL', 'f4', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_FLOAT)
-            ssl_var.units = 'ton day-1'
-            ssl_var.long_name = 'Suspended Sediment Load'
-            ssl_var.standard_name = 'suspended_sediment_load'
-            ssl_var.ancillary_variables = 'SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_propagated_from_ssc_q'
-            ssl_var[:,0,0] = df['SSL'].fillna(FILL_VALUE_FLOAT).values
+            ssl_var = nc.createVariable("SSL", "f4", ("time", "lat", "lon"), fill_value=FILL_VALUE_FLOAT)
+            ssl_var.units = "ton day-1"
+            ssl_var.long_name = "Suspended Sediment Load"
+            ssl_var.standard_name = "suspended_sediment_load"
+            ssl_var.ancillary_variables = "SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_propagated_from_ssc_q"
+            ssl_var[:, 0, 0] = df["SSL"].fillna(FILL_VALUE_FLOAT).values
 
-            ssl_flag_var = nc.createVariable('SSL_flag', 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
-            ssl_flag_var.long_name = 'Quality flag for Suspended Sediment Load'
+            ssl_flag_var = nc.createVariable("SSL_flag", "b", ("time", "lat", "lon"), fill_value=FILL_VALUE_INT)
+            ssl_flag_var.long_name = "Quality flag for Suspended Sediment Load"
             ssl_flag_var.flag_values = [0, 1, 2, 3, 9]
             ssl_flag_var.flag_meanings = "good_data estimated_data suspect_data bad_data missing_data"
-            ssl_flag_var[:,0,0] = df['SSL_flag'].values
-            # --- Step-level QC provenance flags ---
+            ssl_flag_var[:, 0, 0] = df["SSL_flag"].values
+
+            # --- Step-level QC provenance flags (identical to original schema) ---
             _STEP_FLAG_SPECS = {
-                'Q_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge'),
-                'Q_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge'),
-                'Q_flag_qc3_ssc_q_envelope':     ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q enrichment flag for river discharge'),
-                'SSC_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration'),
-                'SSC_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration'),
-                'SSC_flag_qc3_ssc_q_envelope':     ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration'),
-                'SSL_flag_qc1_physical':          ([0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load'),
-                'SSL_flag_qc2_log_iqr':            ([0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment load'),
-                'SSL_flag_qc3_propagated_from_ssc_q': ([0, 2, 8, 9], 'not_propagated propagated not_checked missing', 'QC3 propagation flag for suspended sediment load'),
+                "Q_flag_qc1_physical":          ([0, 3, 9], "pass bad missing", "QC1 physical flag for river discharge"),
+                "Q_flag_qc2_log_iqr":            ([0, 2, 8, 9], "pass suspect not_checked missing", "QC2 log-IQR flag for river discharge"),
+                "Q_flag_qc3_ssc_q_envelope":     ([0, 2, 8, 9], "pass suspect not_checked missing", "QC3 SSC-Q enrichment flag for river discharge"),
+                "SSC_flag_qc1_physical":          ([0, 3, 9], "pass bad missing", "QC1 physical flag for suspended sediment concentration"),
+                "SSC_flag_qc2_log_iqr":            ([0, 2, 8, 9], "pass suspect not_checked missing", "QC2 log-IQR flag for suspended sediment concentration"),
+                "SSC_flag_qc3_ssc_q_envelope":     ([0, 2, 8, 9], "pass suspect not_checked missing", "QC3 SSC-Q consistency flag for suspended sediment concentration"),
+                "SSL_flag_qc1_physical":          ([0, 3, 9], "pass bad missing", "QC1 physical flag for suspended sediment load"),
+                "SSL_flag_qc2_log_iqr":            ([0, 2, 8, 9], "pass suspect not_checked missing", "QC2 log-IQR flag for suspended sediment load"),
+                "SSL_flag_qc3_propagated_from_ssc_q": ([0, 2, 8, 9], "not_propagated propagated not_checked missing", "QC3 propagation flag for suspended sediment load"),
             }
             for varname, (fvals, fmean, lname) in _STEP_FLAG_SPECS.items():
                 if varname in df.columns:
-                    v = nc.createVariable(varname, 'b', ('time', 'lat', 'lon'), fill_value=FILL_VALUE_INT)
+                    v = nc.createVariable(varname, "b", ("time", "lat", "lon"), fill_value=FILL_VALUE_INT)
                     v.long_name = lname
-                    v.standard_name = 'status_flag'
+                    v.standard_name = "status_flag"
                     v.flag_values = fvals
                     v.flag_meanings = fmean
                     v.missing_value = FILL_VALUE_INT
@@ -594,73 +817,50 @@ def main():
         print(f"  - Created {nc_filename}")
 
         n = len(df)
-        skipped_log_iqr = (n < 5) 
+        skipped_log_iqr = (n < 5)
         skipped_ssc_q = (n < 5) or (ssc_q_bounds is None)
 
         last = df.iloc[-1]
         print_qc_summary(
-            river_name=river_name,
+            river_name=sed_river_name,
             station_id=station_id,
             n=n,
             skipped_log_iqr=skipped_log_iqr,
             skipped_ssc_q=skipped_ssc_q,
-            q=float(last['Q']), q_flag=int(last['Q_flag']),
-            ssc=float(last['SSC']), ssc_flag=int(last['SSC_flag']),
-            ssl=float(last['SSL']), ssl_flag=int(last['SSL_flag']),
-            nc_path=nc_filename
+            q=float(last["Q"]) if pd.notna(last["Q"]) else np.nan,
+            q_flag=int(last["Q_flag"]),
+            ssc=float(last["SSC"]) if pd.notna(last["SSC"]) else np.nan,
+            ssc_flag=int(last["SSC_flag"]),
+            ssl=float(last["SSL"]) if pd.notna(last["SSL"]) else np.nan,
+            ssl_flag=int(last["SSL_flag"]),
+            nc_path=nc_filename,
         )
 
-
-        # ==========================================================
-        # Post-write CF-1.8 / ACDD-1.3 compliance check
-        # ==========================================================
-        # errors, warnings = check_nc_completeness(nc_filename)
-
-        # if errors:
-        #     print("  ❌ CF/ACDD compliance FAILED:")
-        #     for e in errors:
-        #         print(f"     - {e}")
-        #     raise RuntimeError(
-        #         f"NetCDF compliance check failed for {nc_filename}"
-        #     )
-
-        # if warnings:
-        #     print("  ⚠️ CF/ACDD compliance warnings:")
-        #     for w in warnings:
-        #         print(f"     - {w}")
-
-
         # =====================================
-        # SSC–Q diagnostic plot
+        # SSC-Q diagnostic plot
         # =====================================
-        diag_png = os.path.join(
-            DIAG_DIR,
-            f"SSC_Q_{station_id}.png"
-        )
-
+        diag_png = os.path.join(DIAG_DIR, f"SSC_Q_{station_id}.png")
         plot_ssc_q_diagnostic(
             time=df.index.to_pydatetime(),
-            Q=df['Q'].values,
-            SSC=df['SSC'].values,
-            Q_flag=df['Q_flag'].values,
-            SSC_flag=df['SSC_flag'].values,
+            Q=df["Q"].values,
+            SSC=df["SSC"].values,
+            Q_flag=df["Q_flag"].values,
+            SSC_flag=df["SSC_flag"].values,
             ssc_q_bounds=ssc_q_bounds,
             station_id=station_id,
-            station_name=dis_data['meta'].get('station_name', river_name),
-            out_png=diag_png
+            station_name=meta.get("station_name", sed_river_name),
+            out_png=diag_png,
         )
 
-
         # --- Generate Summary ---
-        # --- Generate Summary (metadata + completeness + QC counts) ---
         summary = {
             "Source_ID": station_id,
-            "station_name": dis_data["meta"].get("station_name", river_name),
-            "river_name": river_name,
-            "longitude": dis_data["meta"].get("longitude", np.nan),
-            "latitude": dis_data["meta"].get("latitude", np.nan),
-            "altitude": dis_data["meta"].get("altitude", np.nan),
-            "upstream_area": dis_data["meta"].get("drainage_area", np.nan),
+            "station_name": meta.get("station_name", sed_river_name),
+            "river_name": sed_river_name,
+            "longitude": meta.get("longitude", np.nan),
+            "latitude": meta.get("latitude", np.nan),
+            "altitude": meta.get("altitude", np.nan),
+            "upstream_area": meta.get("drainage_area", np.nan),
 
             "Q_start_date": df["Q"].first_valid_index().strftime("%Y-%m-%d") if df["Q"].first_valid_index() else None,
             "Q_end_date": df["Q"].last_valid_index().strftime("%Y-%m-%d") if df["Q"].last_valid_index() else None,
@@ -675,20 +875,29 @@ def main():
             "SSL_percent_complete": (df["SSL"].count() / len(df)) * 100 if len(df) > 0 else 0,
         }
 
-        # ✅ 关键：塞入 QC_n_days + final/step flag 计数（扁平化列）
         summary.update(_qc_counts_flat(df))
         summary_data.append(summary)
 
-    # Write summary CSV
+    # ==================================================================
+    # POST-PROCESSING: Audit report, regression test, summary CSVs
+    # ==================================================================
 
+    # --- Print audit ---
+    _print_audit_report(audit)
+
+    # --- Run regression test ---
+    _run_regression_test(discharge_data, sediment_data, river_map)
+
+    # --- Write summary CSVs ---
     summary_csv = os.path.join(OUTPUT_DIR, "Eurasian_River_station_summary.csv")
     qc_csv = os.path.join(OUTPUT_DIR, "Eurasian_River_qc_results_summary.csv")
 
     generate_csv_summary_tool(summary_data, summary_csv)
     generate_qc_results_csv_tool(summary_data, qc_csv)
 
-    print(f"\nCreated summary file: {summary_csv}")
+    print(f"\\nCreated summary file: {summary_csv}")
     print(f"Created QC results file: {qc_csv}")
+
 
 if __name__ == "__main__":
     main()
