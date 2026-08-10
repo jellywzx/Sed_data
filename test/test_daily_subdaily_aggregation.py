@@ -33,10 +33,39 @@ def test_eused_subdaily_recomputed_ssl_from_daily_means():
     assert bool(out.loc[0, "SSL_derived"])
 
 
-def test_eused_duplicate_timestamp_and_ssl_only_day_are_preserved():
+def test_eused_exact_duplicates_do_not_overweight_daily_mean():
     df = pd.DataFrame(
         {
-            "date": pd.to_datetime(["2020-01-01 00:00:00", "2020-01-01 00:00:00"]),
+            "date": pd.to_datetime(
+                [
+                    "2020-01-01 00:00:00",
+                    "2020-01-01 00:00:00",
+                    "2020-01-01 12:00:00",
+                ]
+            ),
+            "Q": [1.0, 3.0, 6.0],
+            "SSC": [10.0, 30.0, 40.0],
+            "SSL": [-9999.0, -9999.0, -9999.0],
+            "Q_derived": [False, False, False],
+            "SSC_derived": [False, False, False],
+            "SSL_derived": [False, False, False],
+        }
+    )
+
+    out = aggregate_eused_to_daily(df)
+
+    # Exact 00:00 duplicates first become Q=2, SSC=20; then 00:00 and 12:00
+    # receive equal weight in the daily mean.
+    assert len(out) == 1
+    assert np.isclose(out.loc[0, "Q"], 4.0)
+    assert np.isclose(out.loc[0, "SSC"], 30.0)
+    assert np.isclose(out.loc[0, "SSL"], 4.0 * 30.0 * 0.0864)
+
+
+def test_eused_ssl_only_day_is_preserved():
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-01 00:00:00", "2020-01-01 12:00:00"]),
             "Q": [-9999.0, -9999.0],
             "SSC": [-9999.0, -9999.0],
             "SSL": [10.0, 20.0],
@@ -63,6 +92,16 @@ def test_unix_subdaily_series_collapses_to_unique_utc_days():
 
     assert np.array_equal(days, np.array([0.0, 86400.0]))
     assert np.allclose(daily_values, np.array([3.0, 10.0]))
+
+
+def test_unix_exact_duplicates_do_not_overweight_daily_mean():
+    times = np.array([0.0, 0.0, 43200.0])
+    values = np.array([10.0, 30.0, 40.0])
+
+    days, daily_values = aggregate_unix_series_to_daily(times, values)
+
+    assert np.array_equal(days, np.array([0.0]))
+    assert np.allclose(daily_values, np.array([30.0]))
 
 
 def test_daily_alignment_uses_union_without_duplicate_days():
