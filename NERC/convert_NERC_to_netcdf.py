@@ -89,6 +89,36 @@ STATION_METADATA = {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Audit helpers
+# ---------------------------------------------------------------------------
+
+_AUDIT_ROWS = []  # collected across stations during a single run
+
+
+def _emit_audit(audit, output_dir):
+    """Append a station-level audit dict to the global list and print summary."""
+    _AUDIT_ROWS.append(audit)
+    print(f"  \U0001f4cb AUDIT [{audit['station']}]: "
+          f"chem={'Y' if audit['has_chemistry'] else 'N'} "
+          f"Q={'Y' if audit['has_discharge'] else 'N'} "
+          f"SSC_only={'Y' if audit.get('ssc_only', False) else 'N'} "
+          f"| chem_raw={audit.get('n_chemistry_raw', 0)} "
+          f"chem_valid_ssc={audit.get('n_chemistry_valid_ssc', 0)} "
+          f"| final_records={audit.get('n_final_records', 0)}")
+
+
+def _write_audit_csv(output_dir):
+    """Persist the accumulated audit rows to a CSV in output_dir."""
+    if not _AUDIT_ROWS:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "NERC_audit.csv")
+    pd.DataFrame(_AUDIT_ROWS).to_csv(path, index=False)
+    print(f"\n\U0001f4cb Audit CSV written to {path}")
+
+
+
 def parse_date(date_str):
     """Parse date string in DD/MM/YYYY format."""
     try:
@@ -144,7 +174,8 @@ def apply_tool_qc(time, Q, SSC, SSL, station_id, station_name, plot_dir=None):
     present_Q   = _present(qc["Q"],   qc["Q_flag"])
     present_SSC = _present(qc["SSC"], qc["SSC_flag"])
     present_SSL = _present(qc["SSL"], qc["SSL_flag"])
-    valid_time = present_Q | present_SSC | present_SSL
+    # SSC-first: keep records that have SSC OR SSL; Q-only records are dropped
+    valid_time = present_SSC | present_SSL
     if not np.any(valid_time):
         return None, None
 
@@ -272,6 +303,12 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
     """
     Process data for a single station and create CF-1.8 compliant NetCDF file.
 
+    Sediment eligibility rule (SSC-first):
+      - surface-water chemistry/SSC is the core sediment source.
+      - Discharge (Q) is OPTIONAL; missing Q -> Q=NaN.
+      - A station with chemistry/SSC proceeds regardless of discharge presence.
+      - A Q-only station (no chemistry, no other SSC/SSL) is NOT a sediment product.
+
     Parameters:
     -----------
     station_code : str
@@ -283,32 +320,72 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
     """
 
     print(f"\nProcessing station: {station_code}")
+    audit = {
+        "station": station_code,
+        "has_chemistry": False,
+        "has_discharge": False,
+        "ssc_only": False,
+        "n_chemistry_raw": 0,
+        "n_chemistry_valid_ssc": 0,
+        "n_discharge_raw": 0,
+        "n_final_records": 0,
+    }
 
     # Get station metadata
     metadata = STATION_METADATA[station_code]
 
-    # Read discharge data
-    discharge_file = f"{data_dir}/{station_code}_Discharge_data.csv"
-    print(f"  Reading {discharge_file}...")
-    df_q = pd.read_csv(discharge_file)
+    # --- discharge file (OPTIONAL) ---
+    discharge_file = os.path.join(data_dir, f"{station_code}_Discharge_data.csv")
+    df_q = None
+    if os.path.exists(discharge_file):
+        audit["has_discharge"] = True
+        print(f"  Reading discharge (optional): {discharge_file}...")
+        df_q = pd.read_csv(discharge_file)
+        df_q['date'] = df_q['Date'].apply(parse_date)
+        df_q['Q'] = pd.to_numeric(df_q.iloc[:, 1], errors='coerce')
+        audit["n_discharge_raw"] = len(df_q)
+    else:
+        print(f"  Discharge file NOT FOUND (optional): {discharge_file}  -> Q will be NaN.")
 
-    # Parse dates and discharge
-    df_q['date'] = df_q['Date'].apply(parse_date)
-    df_q['Q'] = pd.to_numeric(df_q.iloc[:, 1], errors='coerce')
+    # --- chemistry / SSC file (PRIMARY sediment source) ---
+    chemistry_file = os.path.join(data_dir, f"{station_code}_surfacewater_chemistry.csv")
+    df_chem = None
+    if os.path.exists(chemistry_file):
+        audit["has_chemistry"] = True
+        print(f"  Reading chemistry (SSC source): {chemistry_file}...")
+        df_chem = pd.read_csv(chemistry_file)
+        df_chem['date'] = df_chem['Date'].apply(parse_date)
+        df_chem['SSC'] = pd.to_numeric(df_chem['SSC (mg L-1)'], errors='coerce')
+        audit["n_chemistry_raw"] = len(df_chem)
+        audit["n_chemistry_valid_ssc"] = int(df_chem['SSC'].notna().sum())
+    else:
+        print(f"  Chemistry file NOT FOUND: {chemistry_file}")
 
-    # Read chemistry data (includes SSC)
-    chemistry_file = f"{data_dir}/{station_code}_surfacewater_chemistry.csv"
-    print(f"  Reading {chemistry_file}...")
-    df_chem = pd.read_csv(chemistry_file)
+    # --- station eligibility gate ---
+    # Chemistry/SSC is the core source. Without it and without any other
+    # SSC/SSL pathway, a Q-only station does NOT enter the sediment product.
+    if not audit["has_chemistry"]:
+        print(f"  \u26a0 No chemistry/SSC file for station {station_code} -- "
+              f"Q-only station, NOT a sediment product. Skipping.")
+        _emit_audit(audit, output_dir)
+        return None, None, None, None, None
 
-    # Parse dates and SSC
-    df_chem['date'] = df_chem['Date'].apply(parse_date)
-    df_chem['SSC'] = pd.to_numeric(df_chem['SSC (mg L-1)'], errors='coerce')
+    # --- build union dataframe (outer join: keeps all SSC dates + all Q dates) ---
+    if df_q is not None and df_chem is not None:
+        print("  Merging discharge and chemistry (outer join)...")
+        df = pd.merge(df_q[['date', 'Q']], df_chem[['date', 'SSC']],
+                      on='date', how='outer')
+    elif df_chem is not None:
+        # Chemistry only -- no discharge file
+        print("  Building SSC-only frame (no discharge file)...")
+        audit["ssc_only"] = True
+        df = df_chem[['date', 'SSC']].copy()
+        df['Q'] = np.nan
+    else:
+        # Should not reach here (gate above)
+        _emit_audit(audit, output_dir)
+        return None, None, None, None, None
 
-    # Merge discharge and chemistry data
-    print("  Merging discharge and chemistry data...")
-    df = pd.merge(df_q[['date', 'Q']], df_chem[['date', 'SSC']],
-                  on='date', how='outer')
     df = df.sort_values('date').reset_index(drop=True)
 
     # Remove rows with missing dates
@@ -333,7 +410,9 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
     )
 
     if qc is None:
+        audit["n_final_records"] = 0
         warnings.warn(f"No valid data after QC for station {station_code}. Skipping.")
+        _emit_audit(audit, output_dir)
         return None, None, None, None, None
     # -------- print QC summary (station-level) --------
     n_raw = len(df)  # 注意：这里的 df 还是 merge 后的原始表（还没被 df = DataFrame(qc) 覆盖）
@@ -393,6 +472,10 @@ def process_station(station_code, data_dir='data', output_dir='Output'):
         start_date = "N/A"
         end_date = "N/A"
         temporal_span = "N/A"
+
+    # --- audit: record final counts ---
+    audit["n_final_records"] = len(df)
+    _emit_audit(audit, output_dir)
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -741,6 +824,9 @@ def main():
             print(f"  Error processing station {station_code}: {str(e)}")
             continue
 
+    # Write audit CSV
+    _write_audit_csv(output_dir=args.output_dir)
+
     # Generate summary CSV
     if station_summaries:
         generate_summary_csv(station_summaries, output_dir=args.output_dir)
@@ -748,6 +834,72 @@ def main():
     print("\n" + "="*70)
     print("Processing complete!")
     print("="*70)
+
+
+# ---------------------------------------------------------------------------
+# Regression test
+# ---------------------------------------------------------------------------
+
+def regression_test(tmpdir=None):
+    """
+    Regression test: chemistry file with valid SSC, NO discharge file.
+    Must succeed and produce a station NetCDF with SSC records but Q=NaN.
+    """
+    import tempfile
+    import shutil
+
+    if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(prefix="nerc_regression_")
+
+    outdir = os.path.join(tmpdir, "output")
+    datadir = os.path.join(tmpdir, "data")
+    os.makedirs(datadir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
+
+    # Synthesize a chemistry CSV with SSC for station AS
+    chem_csv = os.path.join(datadir, "AS_surfacewater_chemistry.csv")
+    with open(chem_csv, "w") as f:
+        f.write("Date,SSC (mg L-1)\n")
+        for i in range(1, 11):
+            f.write(f"{i:02d}/01/2015,{10.0 + i * 2.0}\n")
+
+    # DO NOT create a discharge file
+
+    # Reset audit before test
+    global _AUDIT_ROWS
+    _AUDIT_ROWS = []
+
+    df, metadata, start_date, end_date, qc_report = process_station(
+        "AS", data_dir=datadir, output_dir=outdir
+    )
+
+    # Assertions
+    assert df is not None, "FAIL: expected non-None df for SSC-only station"
+    assert len(df) == 10, f"FAIL: expected 10 records, got {len(df)}"
+    assert metadata["Source_ID"] == "NERC_AS"
+    assert os.path.exists(os.path.join(outdir, "NERC_AS.nc")), \
+        "FAIL: NetCDF not created for SSC-only station"
+
+    # Verify NetCDF content
+    ds = nc.Dataset(os.path.join(outdir, "NERC_AS.nc"), "r")
+    ssc = ds.variables["SSC"][:]
+    q = ds.variables["Q"][:]
+    ssl = ds.variables["SSL"][:]
+    ssc_flag = ds.variables["SSC_flag"][:]
+
+    assert np.all(ssc > 0), "FAIL: SSC should be positive"
+    assert np.all(ssc_flag == 0), f"FAIL: SSC_flag should be 0 (good), got {set(ssc_flag)}"
+    assert np.all(q == -9999.0) or np.all(np.isnan(q)), \
+        "FAIL: Q should be fill/missing when no discharge file"
+    assert np.all(ssl == -9999.0) or np.all(np.isnan(ssl)), \
+        "FAIL: SSL should be fill/missing when Q is missing"
+    ds.close()
+
+    print("\n\u2705 Regression test PASSED: SSC-only station (no discharge file) produces valid NetCDF.")
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return True
+
+
 
 if __name__ == '__main__':
     main()

@@ -120,19 +120,30 @@ def process_station(station_code, data_dir, output_dir):
     discharge_file = os.path.join(data_dir, f"{station_code}_Discharge_data.csv")
     chemistry_file = os.path.join(data_dir, f"{station_code}_surfacewater_chemistry.csv")
 
-    if not os.path.exists(discharge_file) or not os.path.exists(chemistry_file):
-        print(f"Data files for station {station_code} not found. Skipping.")
+    # Chemistry/SSC file is mandatory for sediment product.
+    # Discharge file is OPTIONAL.
+    if not os.path.exists(chemistry_file):
+        print(f"Chemistry file for station {station_code} not found. Q-only station, skipping.")
         return None, None, None, None
 
-    df_q = pd.read_csv(discharge_file, parse_dates=['Date'], dayfirst=True)
-    df_q.rename(columns={'Date': 'date', df_q.columns[1]: 'Q'}, inplace=True)
-    df_q['Q'] = pd.to_numeric(df_q['Q'], errors='coerce')
+    # Discharge file is OPTIONAL
+    if os.path.exists(discharge_file):
+        df_q = pd.read_csv(discharge_file, parse_dates=['Date'], dayfirst=True)
+        df_q.rename(columns={'Date': 'date', df_q.columns[1]: 'Q'}, inplace=True)
+        df_q['Q'] = pd.to_numeric(df_q['Q'], errors='coerce')
+    else:
+        df_q = None
 
     df_chem = pd.read_csv(chemistry_file, parse_dates=['Date'], dayfirst=True)
     df_chem.rename(columns={'Date': 'date', 'SSC (mg L-1)': 'SSC'}, inplace=True)
     df_chem['SSC'] = pd.to_numeric(df_chem['SSC'], errors='coerce')
 
-    df = pd.merge(df_q[['date', 'Q']], df_chem[['date', 'SSC']], on='date', how='outer')
+    # Build union frame: Q optional, SSC from chemistry
+    if os.path.exists(discharge_file):
+        df = pd.merge(df_q[['date', 'Q']], df_chem[['date', 'SSC']], on='date', how='outer')
+    else:
+        df = df_chem[['date', 'SSC']].copy()
+        df['Q'] = np.nan
     df = df.sort_values('date').reset_index(drop=True)
     df.dropna(subset=['date'], inplace=True)
 
@@ -141,7 +152,7 @@ def process_station(station_code, data_dir, output_dir):
     df = apply_quality_checks(df)
 
     # Time slicing
-    valid_data = df[(df['Q_flag'] == 0) | (df['SSC_flag'] == 0)]
+    valid_data = df[(df['SSC_flag'] == 0) | (df['SSL_flag'] == 0)]
     if valid_data.empty:
         print(f"No valid data for station {station_code}. Skipping.")
         return None, None, None, None

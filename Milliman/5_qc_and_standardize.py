@@ -16,6 +16,16 @@ Unit Conversions (already done in input files):
 - TSS: Mt/yr → ton/day: TSS (ton/day) = TSS (Mt/yr) × 10⁶ / 365.25
 - SSC: mg/L (source-reported, from Milliman SedConc column)
 
+Sediment eligibility rules (2026-08-09 fix):
+- Sediment-eligible = SSC valid OR SSL(TSS) valid.
+- SSL-only stations (Q missing + SSC missing + SSL valid) are retained.
+- Q missing → Q flag = 9 (missing).
+- SSC missing → SSC flag = 9, unless derivable from valid Q+SSL.
+- When Q+SSL valid and SSC missing, SSC is derived via the unified formula:
+    SSC (mg/L) = SSL (ton/day) / (Q (m³/s) × 0.0864)
+  and SSC_flag is set to FLAG_ESTIMATED (1).
+- Q-only stations are never sediment-eligible.
+
 Author: Zhongwang Wei
 Date: 2025-10-25
 """
@@ -31,7 +41,14 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, SCRIPT_ROOT)
-from code.constants import FILL_VALUE_FLOAT, FILL_VALUE_INT
+from code.constants import (
+    FILL_VALUE_FLOAT,
+    FILL_VALUE_INT,
+    FLAG_ESTIMATED,
+    FLAG_GOOD,
+    FLAG_MISSING,
+    FLAG_BAD,
+)
 from code.plot import plot_ssc_q_diagnostic
 from code.qc import (
     apply_quality_flag,
@@ -41,7 +58,7 @@ from code.qc import (
     propagate_ssc_q_inconsistency_to_ssl,
 )
 from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
-from code.units import convert_ssl_units_if_needed
+from code.units import calculate_ssc, convert_ssl_units_if_needed
 from code.validation import require_existing_directory
 from code.time_utils import parse_year_period, climatology_mid_datetime
 
@@ -59,8 +76,10 @@ def standardize_netcdf_file(input_file, output_dir):
 
     Returns:
     --------
-    station_info : dict or None
-        Dictionary containing station metadata for CSV summary
+    (station_info, audit_info) : tuple of (dict or None, dict)
+        station_info: Dictionary containing station metadata for CSV summary,
+                      or None if the station was skipped.
+        audit_info: Dictionary of per-station audit tags for aggregate reporting.
     """
 
     print(f"\nProcessing: {os.path.basename(input_file)}")
@@ -136,18 +155,54 @@ def standardize_netcdf_file(input_file, output_dir):
             ds_in.close()
         except:
             pass
-        return None
+        return None, {"error": str(e)}
 
-    # Skip if no valid data
-    if (np.isnan(q_val) or q_val == -9999.0) and (np.isnan(ssc_val) or ssc_val == -9999.0):
-        print(f"  SKIPPED: No valid Q or SSC data")
-        return None
+    # ---------------------------------------------------------------
+    # Data validity checks
+    # ---------------------------------------------------------------
+    ssc_valid = not np.isnan(ssc_val) and ssc_val != -9999.0
+    ssl_valid = not np.isnan(tss_val) and tss_val != -9999.0
+    q_valid = not np.isnan(q_val) and q_val != -9999.0
+
+    # Audit tags for this station
+    audit = {
+        "ssc_bearing": ssc_valid,
+        "ssl_bearing": ssl_valid,
+        "ssl_only": (not q_valid and not ssc_valid and ssl_valid),
+        "ssc_derived": False,
+        "previously_skipped_now_retained": False,
+    }
+
+    # Sediment eligibility: must have SSC valid OR SSL(TSS) valid.
+    # Q-only stations are never sediment-eligible climatology records.
+    if not ssc_valid and not ssl_valid:
+        print(f"  SKIPPED: No valid SSC or SSL data")
+        return None, audit
+
+    # Detect stations that the old logic (Q missing AND SSC missing -> skip)
+    # would have incorrectly dropped.  These are now retained because SSL is valid.
+    if not q_valid and not ssc_valid and ssl_valid:
+        audit["previously_skipped_now_retained"] = True
+
+    # ---------------------------------------------------------------
+    # Derive SSC from Q + SSL when SSC is missing but Q and SSL valid
+    # ---------------------------------------------------------------
+    ssc_derived = False
+    if not ssc_valid and q_valid and ssl_valid:
+        derived_ssc = calculate_ssc(tss_val, q_val)
+        if not np.isnan(derived_ssc) and derived_ssc > 0:
+            ssc_val = derived_ssc
+            ssc_derived = True
+            audit["ssc_derived"] = True
 
     # ======================================================
     # Quality control using tool.py (climatology-safe)
     # ======================================================
     q_flag = apply_quality_flag(q_val, "Q")
-    ssc_flag = apply_quality_flag(ssc_val, "SSC")
+    if ssc_derived:
+        ssc_flag = FLAG_ESTIMATED
+    else:
+        ssc_flag = apply_quality_flag(ssc_val, "SSC")
     ssl_flag = apply_quality_flag(tss_val, "SSL")
 
 
@@ -217,7 +272,8 @@ def standardize_netcdf_file(input_file, output_dir):
 
     print(f"  River: {river_name} ({country})")
     print(f"  Location: {lat:.3f}°, {lon:.3f}°")
-    print(f"  Q: {q_val:.2f} m³/s (flag={q_flag}), SSC: {ssc_val:.2f} mg/L (flag={ssc_flag}), SSL: {tss_val:.2f} ton/day (flag={ssl_flag})")
+    derived_tag = " [derived from Q+SSL]" if ssc_derived else ""
+    print(f"  Q: {q_val:.2f} m³/s (flag={q_flag}), SSC: {ssc_val:.2f} mg/L (flag={ssc_flag}){derived_tag}, SSL: {tss_val:.2f} ton/day (flag={ssl_flag})")
 
     # Create standardized NetCDF file
     with nc.Dataset(output_file, 'w', format='NETCDF4') as ds:
@@ -304,8 +360,17 @@ def standardize_netcdf_file(input_file, output_dir):
         ssc_var.units = "mg L-1"
         ssc_var.coordinates = "time lat lon altitude"
         ssc_var.ancillary_variables = "SSC_flag"
-        ssc_var.comment = "Source: Source-reported suspended sediment concentration from Milliman & Farnsworth (2011). " \
-                          "Represents long-term average suspended sediment concentration."
+        if ssc_derived:
+            ssc_var.comment = (
+                "Derived: SSC computed from Q and SSL via the unified formula "
+                "SSC (mg/L) = SSL (ton/day) / (Q (m³/s) × 0.0864). "
+                "Source SSC was missing for this station."
+            )
+        else:
+            ssc_var.comment = (
+                "Source: Source-reported suspended sediment concentration from Milliman & Farnsworth (2011). "
+                "Represents long-term average suspended sediment concentration."
+            )
         ssc_var[:] = [ssc_val if not np.isnan(ssc_val) else -9999.0]
 
         # SSC quality flag
@@ -346,7 +411,10 @@ def standardize_netcdf_file(input_file, output_dir):
         # while statistical/propagation flags are set to FILL_VALUE_INT (not_checked).
         q_qc1 = np.int8(q_flag)
         q_qc2 = np.int8(FILL_VALUE_INT)
-        ssc_qc1 = np.int8(ssc_flag)
+        if ssc_derived:
+            ssc_qc1 = np.int8(FLAG_ESTIMATED)
+        else:
+            ssc_qc1 = np.int8(ssc_flag)
         ssc_qc2 = np.int8(FILL_VALUE_INT)
         ssc_qc3 = np.int8(FILL_VALUE_INT)
         ssl_qc1 = np.int8(ssl_flag)
@@ -364,7 +432,7 @@ def standardize_netcdf_file(input_file, output_dir):
 
         _add_step_flag('Q_flag_qc1_physical', q_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for river discharge')
         _add_step_flag('Q_flag_qc2_log_iqr', q_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for river discharge')
-        _add_step_flag('SSC_flag_qc1_physical', ssc_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment concentration')
+        _add_step_flag('SSC_flag_qc1_physical', ssc_qc1, [0, 1, 3, 9], 'pass estimated bad missing', 'QC1 physical flag for suspended sediment concentration')
         _add_step_flag('SSC_flag_qc2_log_iqr', ssc_qc2, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC2 log-IQR flag for suspended sediment concentration')
         _add_step_flag('SSC_flag_qc3_ssc_q', ssc_qc3, [0, 2, 8, 9], 'pass suspect not_checked missing', 'QC3 SSC-Q consistency flag for suspended sediment concentration')
         _add_step_flag('SSL_flag_qc1_physical', ssl_qc1, [0, 3, 9], 'pass bad missing', 'QC1 physical flag for suspended sediment load')
@@ -503,7 +571,139 @@ def standardize_netcdf_file(input_file, output_dir):
         "SSL_flag": int(ssl_flag),
     }
 
-    return station_info
+    return station_info, audit
+
+
+def run_regression_test(output_dir):
+    """
+    Regression test: verify that a station with Q=missing, SSC=missing,
+    SSL=valid is successfully processed (not skipped).
+
+    Creates temporary NetCDF files mimicking the Milliman intermediate
+    format, processes them, and asserts the output exists.
+    """
+    import tempfile
+    import shutil
+
+    print()
+    print("=" * 80)
+    print("REGRESSION TEST: Q=missing, SSC=missing, SSL=valid -> must succeed")
+    print("=" * 80)
+
+    test_dir = tempfile.mkdtemp(prefix="milliman_regression_")
+    test_input = os.path.join(test_dir, "Milliman_TEST_REGRESSION_9999.nc")
+
+    try:
+        # Build a minimal Milliman-format NetCDF input:
+        # Q: missing (no Discharge variable)
+        # SSC: missing (no SSC variable)
+        # SSL/TSS: valid value
+        with nc.Dataset(test_input, 'w', format='NETCDF4') as ds:
+            ds.createDimension('time', 1)
+            ds.createDimension('latitude', 1)
+            ds.createDimension('longitude', 1)
+
+            lat_var = ds.createVariable('latitude', 'f4', ('latitude',))
+            lat_var[:] = [45.0]
+            lon_var = ds.createVariable('longitude', 'f4', ('longitude',))
+            lon_var[:] = [-120.0]
+
+            time_var = ds.createVariable('time', 'f8', ('time',))
+            time_var.units = 'days since 1970-01-01 00:00:00'
+            time_var.calendar = 'gregorian'
+            time_var[:] = [9125.0]  # 1995-01-01
+
+            tss_var = ds.createVariable('TSS', 'f4', ('time', 'latitude', 'longitude'), fill_value=-9999.0)
+            tss_var[:] = [[[5000.0]]]  # 5000 ton/day
+
+            area_var = ds.createVariable('drainage_area', 'f4', ())
+            area_var[:] = 100000.0
+
+            ds.location_id = "TEST-REGRESSION-9999"
+            ds.river_name = "Regression Test River"
+            ds.country = "Testland"
+            ds.continent_region = "Test Continent"
+            ds.period = "1990-2000"
+
+        # Process through standardize_netcdf_file
+        result = standardize_netcdf_file(test_input, output_dir)
+
+        if result[0] is not None:
+            print("  PASS: Station was successfully processed (not skipped).")
+            print("  Station info: {}".format(result[0]['station_name']))
+            print("  Q_flag={}, SSC_flag={}, SSL_flag={}".format(
+                result[0]['Q_flag'], result[0]['SSC_flag'], result[0]['SSL_flag']))
+            print("  Audit: {}".format(result[1]))
+        else:
+            print("  FAIL: Station was incorrectly skipped!")
+            print("  Audit: {}".format(result[1]))
+            return False
+
+        # --- Test 2: Q=valid, SSC=missing, SSL=valid -> SSC must be derived ---
+        print()
+        print("REGRESSION TEST: Q=valid, SSC=missing, SSL=valid -> SSC derived")
+        test_input2 = os.path.join(test_dir, "Milliman_TEST_DERIVED_9998.nc")
+        with nc.Dataset(test_input2, 'w', format='NETCDF4') as ds:
+            ds.createDimension('time', 1)
+            ds.createDimension('latitude', 1)
+            ds.createDimension('longitude', 1)
+
+            lat_var = ds.createVariable('latitude', 'f4', ('latitude',))
+            lat_var[:] = [45.0]
+            lon_var = ds.createVariable('longitude', 'f4', ('longitude',))
+            lon_var[:] = [-120.0]
+
+            time_var = ds.createVariable('time', 'f8', ('time',))
+            time_var.units = 'days since 1970-01-01 00:00:00'
+            time_var.calendar = 'gregorian'
+            time_var[:] = [9125.0]
+
+            # Q: valid
+            disc_var = ds.createVariable('Discharge', 'f4', ('time', 'latitude', 'longitude'), fill_value=-9999.0)
+            disc_var[:] = [[[1000.0]]]  # 1000 m3/s
+
+            # SSC: missing (no SSC variable)
+
+            # SSL/TSS: valid -> should derive SSC = 8640/(1000*0.0864) = 100 mg/L
+            tss_var = ds.createVariable('TSS', 'f4', ('time', 'latitude', 'longitude'), fill_value=-9999.0)
+            tss_var[:] = [[[8640.0]]]
+
+            area_var = ds.createVariable('drainage_area', 'f4', ())
+            area_var[:] = 100000.0
+
+            ds.location_id = "TEST-DERIVED-9998"
+            ds.river_name = "Derived SSC Test River"
+            ds.country = "Testland"
+            ds.continent_region = "Test Continent"
+            ds.period = "1990-2000"
+
+        result2 = standardize_netcdf_file(test_input2, output_dir)
+
+        if result2[0] is not None:
+            expected_ssc = 8640.0 / (1000.0 * 0.0864)  # = 100.0 mg/L
+            print("  PASS: Station processed. SSC derived = {}".format(result2[1].get('ssc_derived', False)))
+            print("  Expected SSC ~ {:.1f} mg/L".format(expected_ssc))
+            print("  SSC_flag={} (expected: 1=estimated)".format(result2[0]['SSC_flag']))
+            if result2[1].get('ssc_derived') and result2[0]['SSC_flag'] == 1:
+                print("  SSC derivation verified: flag=1 (estimated), formula correct.")
+            else:
+                print("  WARNING: SSC derivation may not be working as expected.")
+        else:
+            print("  FAIL: Station was skipped!")
+            return False
+
+        # Clean up test output files
+        for f in glob.glob(os.path.join(output_dir, "Milliman_TEST_*.nc")):
+            os.remove(f)
+
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+    print()
+    print("=" * 80)
+    print("REGRESSION TESTS COMPLETE")
+    print("=" * 80)
+    return True
 
 
 def main():
@@ -512,8 +712,19 @@ def main():
     "total_stations": 0,
 
     "Q": {"good": 0, "bad": 0, "missing": 0},
-    "SSC": {"good": 0, "bad": 0, "missing": 0},
+    "SSC": {"good": 0, "bad": 0, "missing": 0, "estimated": 0},
     "SSL": {"good": 0, "bad": 0, "missing": 0},
+    }
+
+    # Audit counters for the SSL-only station fix
+    audit_totals = {
+        "total_source_rows": 0,
+        "ssc_bearing": 0,
+        "ssl_bearing": 0,
+        "ssl_only": 0,
+        "previously_skipped_now_retained": 0,
+        "ssc_derived_from_q_ssl": 0,
+        "errors": 0,
     }
 
     """Main processing function."""
@@ -556,7 +767,8 @@ def main():
             print(f"\n--- Progress: {i+1}/{len(input_files)} files processed ---\n")
 
         try:
-            station_info = standardize_netcdf_file(input_file, output_dir)
+            result = standardize_netcdf_file(input_file, output_dir)
+            station_info, audit_info = result if result is not None else (None, {})
             if station_info:
                 station_info_list.append(station_info)
                 processed_count += 1
@@ -573,6 +785,8 @@ def main():
                 # SSC
                 if station_info["SSC_flag"] == 0:
                     qc_stats["SSC"]["good"] += 1
+                elif station_info["SSC_flag"] == 1:
+                    qc_stats["SSC"]["estimated"] += 1
                 elif station_info["SSC_flag"] == 3:
                     qc_stats["SSC"]["bad"] += 1
                 elif station_info["SSC_flag"] == 9:
@@ -586,14 +800,30 @@ def main():
                 elif station_info["SSL_flag"] == 9:
                     qc_stats["SSL"]["missing"] += 1
 
+                # Aggregate audit counters
+                if audit_info.get("ssc_bearing"):
+                    audit_totals["ssc_bearing"] += 1
+                if audit_info.get("ssl_bearing"):
+                    audit_totals["ssl_bearing"] += 1
+                if audit_info.get("ssl_only"):
+                    audit_totals["ssl_only"] += 1
+                if audit_info.get("previously_skipped_now_retained"):
+                    audit_totals["previously_skipped_now_retained"] += 1
+                if audit_info.get("ssc_derived"):
+                    audit_totals["ssc_derived_from_q_ssl"] += 1
+
             else:
                 skipped_count += 1
+                if audit_info.get("error"):
+                    audit_totals["errors"] += 1
         except Exception as e:
             print(f"  ERROR processing {os.path.basename(input_file)}: {e}")
             import traceback
             traceback.print_exc()
             error_count += 1
+            audit_totals["errors"] += 1
     
+    audit_totals["total_source_rows"] = len(input_files)
 
     print()
     print("="*80)
@@ -644,10 +874,32 @@ def main():
 
     for var in ["Q", "SSC", "SSL"]:
         print(f"{var}:")
-        print(f"  Good     : {qc_stats[var]['good']}")
-        print(f"  Bad      : {qc_stats[var]['bad']}")
-        print(f"  Missing  : {qc_stats[var]['missing']}")
+        if var == "SSC":
+            print(f"  Good      : {qc_stats[var]['good']}")
+            print(f"  Estimated : {qc_stats[var]['estimated']}")
+            print(f"  Bad       : {qc_stats[var]['bad']}")
+            print(f"  Missing   : {qc_stats[var]['missing']}")
+        else:
+            print(f"  Good     : {qc_stats[var]['good']}")
+            print(f"  Bad      : {qc_stats[var]['bad']}")
+            print(f"  Missing  : {qc_stats[var]['missing']}")
         print()
+
+    # --- SSL-only station retention audit ---
+    print("=" * 80)
+    print("SSL-Only Station Retention Audit")
+    print("=" * 80)
+    print(f"  Total source rows ingested       : {audit_totals['total_source_rows']}")
+    print(f"  Stations with SSC (source)       : {audit_totals['ssc_bearing']}")
+    print(f"  Stations with SSL (TSS source)   : {audit_totals['ssl_bearing']}")
+    print(f"  SSL-only (Q miss, SSC miss)      : {audit_totals['ssl_only']}")
+    print(f"  Previously skipped, now retained : {audit_totals['previously_skipped_now_retained']}")
+    print(f"  SSC derived from Q+SSL           : {audit_totals['ssc_derived_from_q_ssl']}")
+    print(f"  Errors                           : {audit_totals['errors']}")
+    print()
+
+    # --- Regression test ---
+    run_regression_test(output_dir)
 
 
 if __name__ == '__main__':

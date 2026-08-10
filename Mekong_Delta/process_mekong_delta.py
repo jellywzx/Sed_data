@@ -134,6 +134,21 @@ def calculate_ssc_from_ssl(df):
     ssc[~np.isfinite(ssc)] = np.nan
     return ssc
 
+def calculate_ssl_from_q_ssc(df):
+    """
+    Calculate SSL from discharge (Q) and SSC.
+    Formula: SSL (ton/day) = Q (m³/s) × SSC (mg/L) × 0.0864
+    Derivation:
+      - Q (m³/s) × SSC (mg/L) -> Q (m³/s) × SSC (g/m³) = Q × SSC (g/s)
+      - Convert to ton/day: Q×SSC (g/s) × 86400 (s/day) / 1e6 (g/ton) = Q×SSC×0.0864
+    """
+    # Suppress division by zero warnings, they are handled by np.inf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ssl = df['Q'] * df['SSC'] * 0.0864
+    # Replace inf/-inf/nan with np.nan
+    ssl[~np.isfinite(ssl)] = np.nan
+    return ssl
+
 
 def get_summary_stats(df, var_name):
     """Calculate summary statistics for a variable."""
@@ -164,6 +179,8 @@ def apply_tool_qc(
     station_name,
     plot_dir=None,
     SSC_derived_mask=None,
+    SSL_derived_mask=None,
+    ssl_is_derived_from_q_ssc=False,
 ):
     """
     Use tool.py unified hydro QC WITH provenance(step) flags.
@@ -208,8 +225,9 @@ def apply_tool_qc(
         Q_is_independent=True,
         SSC_is_independent=ssc_independent,
         SSL_is_independent=True,
-        ssl_is_derived_from_q_ssc=False,
+        ssl_is_derived_from_q_ssc=ssl_is_derived_from_q_ssc,
         SSC_derived_mask=SSC_derived_mask,
+        SSL_derived_mask=SSL_derived_mask,
         qc2_k=1.5,
         qc2_min_samples=5,
         qc3_k=1.5,
@@ -489,8 +507,14 @@ def create_netcdf_file(filepath, df, station_meta):
         ssl_var.long_name = "Suspended Sediment Load"
         ssl_var.units = "ton day-1"
         ssl_var.coordinates = "lat lon altitude"
-        ssl_var.ancillary_variables = "SSL_flag SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q"
-        ssl_var.comment = "Source: Original data provided by Darby et al. (2020)."
+        ssl_var.ancillary_variables = "SSL_flag SSL_derived_mask SSL_flag_qc1_physical SSL_flag_qc2_log_iqr SSL_flag_qc3_from_ssc_q"
+        ssl_var.comment = (
+            "Source: Mixed provenance. "
+            "Source-reported values preserved from original fluxes file "
+            "(SSL_derived_mask=0). "
+            "Derived values calculated as SSL = Q × SSC × 0.0864 "
+            "where source SSL is unavailable (SSL_derived_mask=1)."
+        )
         ssl_var[:] = df['SSL'].fillna(fill_value).values
 
         # === FLAG VARIABLES ===
@@ -527,6 +551,15 @@ def create_netcdf_file(filepath, df, station_meta):
             ssc_dm_var.flag_meanings = "source_reported derived"
             ssc_dm_var.comment = "0: source-reported from 'Section Averaged SSC (mg/l)'; 1: derived from SSL/(Q×0.0864)."
             ssc_dm_var[:] = df['SSC_derived_mask'].fillna(False).astype(np.int8).values
+
+        # SSL_derived_mask (provenance mask)
+        if 'SSL_derived_mask' in df.columns:
+            ssl_dm_var = ds.createVariable('SSL_derived_mask', 'b', ('time',), fill_value=flag_fill_value)
+            ssl_dm_var.long_name = "record-level provenance mask for suspended sediment load"
+            ssl_dm_var.flag_values = np.array([0, 1], dtype='b')
+            ssl_dm_var.flag_meanings = "source_reported derived"
+            ssl_dm_var.comment = "0: source-reported from original fluxes file; 1: derived from Q×SSC×0.0864."
+            ssl_dm_var[:] = df['SSL_derived_mask'].fillna(False).astype(np.int8).values
 
         # === STEP/PROVENANCE FLAG VARIABLES ===
         def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
@@ -609,34 +642,120 @@ def main():
     os.makedirs(TARGET_NC_DIR, exist_ok=True)
     
     station_summaries = []
+    
+    # --- Audit tracking ---
+    audit = {
+        'ratings_only': [],
+        'fluxes_only': [],
+        'both_files': [],
+        'SSC_only': [],
+        'SSL_only': [],
+        'paired': [],
+        'retained': [],
+        'skipped': [],
+    }
 
     for station_id, station_meta in STATIONS.items():
         try:
-            # Read and merge data
-            fluxes_df = read_fluxes_file(os.path.join(SOURCE_DATA_DIR, f'{station_id}fluxes.csv'))
-            ratings_df = read_ratings_file(os.path.join(SOURCE_DATA_DIR, f'{station_id}ratings.csv'))
+            # --- Independent file existence checks ---
+            fluxes_path = os.path.join(SOURCE_DATA_DIR, f'{station_id}fluxes.csv')
+            ratings_path = os.path.join(SOURCE_DATA_DIR, f'{station_id}ratings.csv')
             
-            # Use an outer merge to keep all data points
+            has_fluxes = os.path.isfile(fluxes_path)
+            has_ratings = os.path.isfile(ratings_path)
+            
+            # Track file availability for audit
+            if has_ratings and has_fluxes:
+                audit['both_files'].append(station_id)
+            elif has_ratings and not has_fluxes:
+                audit['ratings_only'].append(station_id)
+            elif has_fluxes and not has_ratings:
+                audit['fluxes_only'].append(station_id)
+            else:
+                warnings.warn(f"No data files found for station {station_id}. Skipping.")
+                audit['skipped'].append(station_id)
+                continue
+            
+            # --- Load ratings (Q + source SSC) or create empty placeholder ---
+            if has_ratings:
+                ratings_df = read_ratings_file(ratings_path)
+            else:
+                ratings_df = pd.DataFrame(columns=['time', 'Q', 'SSC_original'])
+            
+            # --- Load fluxes (source SSL) or create empty placeholder ---
+            if has_fluxes:
+                fluxes_df = read_fluxes_file(fluxes_path)
+            else:
+                fluxes_df = pd.DataFrame(columns=['time', 'SSL'])
+            
+            # --- Outer merge on time ---
             merged_df = pd.merge(ratings_df, fluxes_df, on='time', how='outer')
             
-            # --- SSC provenance-aware merge ---
-            # 1. Source SSC exists -> preserve it (independent)
-            # 2. Source SSC missing AND Q valid AND SSL valid -> derive
-            # 3. Otherwise -> NaN (missing)
-            source_ssc_present = (
+            # --- Source presence masks ---
+            has_source_ssc = (
                 merged_df['SSC_original'].notna()
                 & (merged_df['SSC_original'] > 0)
             )
-            can_derive = (
-                ~source_ssc_present
-                & merged_df['Q'].notna() & (merged_df['Q'] > 0)
-                & merged_df['SSL'].notna() & (merged_df['SSL'] > 0)
+            has_source_ssl = (
+                merged_df['SSL'].notna()
+                & (merged_df['SSL'] > 0)
             )
+            has_q = (
+                merged_df['Q'].notna() & (merged_df['Q'] > 0)
+            )
+            
+            # --- SSC provenance-aware merge ---
+            # Rule 6: source SSC priority
             merged_df['SSC'] = np.nan
-            merged_df.loc[source_ssc_present, 'SSC'] = merged_df.loc[source_ssc_present, 'SSC_original']
-            merged_df.loc[can_derive, 'SSC'] = calculate_ssc_from_ssl(merged_df.loc[can_derive])
-
-            SSC_derived_mask = can_derive.values.astype(bool)
+            if has_source_ssc.any():
+                merged_df.loc[has_source_ssc, 'SSC'] = merged_df.loc[has_source_ssc, 'SSC_original']
+            
+            # Rule 8: source SSC missing AND Q+SSL valid -> derive SSC
+            can_derive_ssc = (
+                ~has_source_ssc
+                & has_q
+                & has_source_ssl
+            )
+            if can_derive_ssc.any():
+                merged_df.loc[can_derive_ssc, 'SSC'] = calculate_ssc_from_ssl(merged_df.loc[can_derive_ssc])
+            SSC_derived_mask = can_derive_ssc.values.astype(bool)
+            
+            # --- SSL provenance-aware merge ---
+            # Rule 7: source SSL priority (already in merged_df['SSL'])
+            # Rule 9: source SSL missing AND Q+SSC valid -> derive SSL
+            can_derive_ssl = (
+                ~has_source_ssl
+                & has_q
+                & has_source_ssc
+            )
+            if can_derive_ssl.any():
+                merged_df.loc[can_derive_ssl, 'SSL'] = calculate_ssl_from_q_ssc(merged_df.loc[can_derive_ssl])
+            SSL_derived_mask = can_derive_ssl.values.astype(bool)
+            
+            # Ensure numeric dtypes (empty .loc guard prevents dtype drift)
+            merged_df['SSC'] = merged_df['SSC'].astype(np.float64)
+            merged_df['SSL'] = merged_df['SSL'].astype(np.float64)
+            
+            # --- Sediment availability check (SSC OR SSL, not Q) ---
+            has_ssc = (merged_df['SSC'].notna() & (merged_df['SSC'] > 0)).any()
+            has_ssl = (merged_df['SSL'].notna() & (merged_df['SSL'] > 0)).any()
+            
+            if has_ssc and has_ssl:
+                audit['paired'].append(station_id)
+            elif has_ssc and not has_ssl:
+                audit['SSC_only'].append(station_id)
+            elif has_ssl and not has_ssc:
+                audit['SSL_only'].append(station_id)
+            
+            # Rule 11: skip only if NEITHER SSC nor SSL has data
+            if not has_ssc and not has_ssl:
+                warnings.warn(f"No sediment data (SSC or SSL) for station {station_id}. Skipping.")
+                audit['skipped'].append(station_id)
+                continue
+            
+            # Determine QC provenance flags
+            # ssl_is_derived: True when ANY SSL was derived (ratings-only case)
+            ssl_is_derived = bool(SSL_derived_mask.any())
             
             # Apply QC
             qc, qc_report = apply_tool_qc(
@@ -648,17 +767,21 @@ def main():
                 station_name=station_meta['name'],
                 plot_dir=os.path.join(TARGET_NC_DIR, "diagnostic_plots"),
                 SSC_derived_mask=SSC_derived_mask,
+                SSL_derived_mask=SSL_derived_mask,
+                ssl_is_derived_from_q_ssc=ssl_is_derived,
             )
 
             if qc is None:
                 warnings.warn(f"No valid data after QC for station {station_id}. Skipping.")
                 continue
 
+            # Pop ssc_q_bounds (dict) before DataFrame creation
+            qc.pop('ssc_q_bounds', None)
             qc_df = pd.DataFrame(qc)
 
 
-            # Truncate time series
-            valid_df = qc_df.dropna(subset=['Q', 'SSC', 'SSL'], how='all')
+            # Truncate time series (Rule 11: based on SSC OR SSL, not Q)
+            valid_df = qc_df.dropna(subset=['SSC', 'SSL'], how='all')
             if valid_df.empty:
                 warnings.warn(f"No valid data for station {station_id} after QC. Skipping.")
                 continue
@@ -685,6 +808,9 @@ def main():
             # Pad SSC_derived_mask: NaN -> False (padding days have no SSC)
             if 'SSC_derived_mask' in final_df.columns:
                 final_df['SSC_derived_mask'] = final_df['SSC_derived_mask'].fillna(False).astype(bool)
+            # Pad SSL_derived_mask: NaN -> False (padding days have no SSL)
+            if 'SSL_derived_mask' in final_df.columns:
+                final_df['SSL_derived_mask'] = final_df['SSL_derived_mask'].fillna(False).astype(bool)
 
 
             # Generate summary stats before creating file
@@ -734,6 +860,7 @@ def main():
                 SSL=qc_df["SSL"].values, SSL_flag=qc_df["SSL_flag"].values,
                 created_path=output_filepath,
             )
+            audit['retained'].append(station_id)
 
 
             # errors, warnings_nc = check_nc_completeness(output_filepath, strict=True)
@@ -766,6 +893,24 @@ def main():
         generate_qc_results_csv_tool(station_summaries, qc_csv_path)
         print(f"Successfully created summary file: {csv_filepath}")
         print(f"Successfully created QC results  : {qc_csv_path}")
+    # --- Audit summary ---
+    print("\n" + "="*60)
+    print("AUDIT SUMMARY")
+    print("="*60)
+    print(f"  Ratings-only stations:  {len(audit['ratings_only']):>3d}  {audit['ratings_only']}")
+    print(f"  Fluxes-only stations:   {len(audit['fluxes_only']):>3d}  {audit['fluxes_only']}")
+    print(f"  Both files stations:    {len(audit['both_files']):>3d}  {audit['both_files']}")
+    print(f"  SSC-only stations:      {len(audit['SSC_only']):>3d}  {audit['SSC_only']}")
+    print(f"  SSL-only stations:      {len(audit['SSL_only']):>3d}  {audit['SSL_only']}")
+    print(f"  Paired (SSC+SSL):       {len(audit['paired']):>3d}  {audit['paired']}")
+    print(f"  Retained stations:      {len(audit['retained']):>3d}  {audit['retained']}")
+    print(f"  Skipped stations:       {len(audit['skipped']):>3d}  {audit['skipped']}")
+    
+    # Count records
+    for station_id in audit['retained']:
+        pass  # record counts already printed per-station
+    print("="*60)
+    
     print("Processing complete.")
 
 if __name__ == "__main__":

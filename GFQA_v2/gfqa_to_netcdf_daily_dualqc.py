@@ -9,9 +9,21 @@ with Dual Quality Control:
 - 输出含两类质量信息：
   1. Data.Quality（来自原始CSV）
   2. QC Flags（自动判断）
-- 仅保留“流量与泥沙在同一天都有观测”的日期
+- 站点准入基于实际存在有效 TSS/SSC 的 water-quality records（不要求 Q）
+- Q 和 SSC daily series 独立聚合 → outer merge（保留 SSC-only 日期）
+- SSL = Q * SSC * 0.0864 仅当 Q 和 SSC 同时有效时计算
+- QC3 SSC-Q consistency 仅对有效 Q-SSC pairs 执行
 - 不插值、不补齐日期
 - 输出 CF-1.8 兼容的 NetCDF 文件
+
+统一规则 (manuscript-consistent):
+1. Q 不是站点或记录的准入条件
+2. 只要一个站点存在有效 SSC/TSS 或 SSL，就应保留
+3. 一个时间点只要 SSC 或 SSL 至少一个有值，就应视为 sediment-eligible
+4. 如果只有 SSC 而没有 Q，保留 SSC，Q 和 SSL 设为 missing
+5. 只有 Q 和 SSC 同时存在时才计算 SSL = Q * SSC * 0.0864
+6. QC3 SSC-Q consistency 只对有效 Q-SSC pairs 执行
+7. source-reported values 优先于 derived values
 """
 
 import pandas as pd
@@ -90,6 +102,16 @@ def clean_value(value):
     except Exception:
         return np.nan
 
+def _safe_fmt(val):
+    """Safely format a float for logging; returns 'N/A' for NaN."""
+    try:
+        v = float(val)
+        if np.isfinite(v):
+            return f"{v:.2f}"
+        return "N/A"
+    except (TypeError, ValueError):
+        return "N/A"
+
 def log_station_qc(station_id, station_name, n_samples,
                    skipped_log_iqr, skipped_ssc_q,
                    q_value, q_flag, ssc_value, ssc_flag, ssl_value, ssl_flag,
@@ -100,9 +122,9 @@ def log_station_qc(station_id, station_name, n_samples,
     if skipped_ssc_q:
         print(f"  [{station_name} ({station_id})] Sample size = {n_samples} < 5, SSC-Q consistency check and diagnostic plot skipped.")
     print(f"✓ Created: {created_path}")
-    print(f"  Q:   {q_value:.2f} m3/s (flag={int(q_flag)})")
-    print(f"  SSC: {ssc_value:.2f} mg/L (flag={int(ssc_flag)})")
-    print(f"  SSL: {ssl_value:.2f} ton/day (flag={int(ssl_flag)})")
+    print(f"  Q:   {_safe_fmt(q_value)} m3/s (flag={int(q_flag)})")
+    print(f"  SSC: {_safe_fmt(ssc_value)} mg/L (flag={int(ssc_flag)})")
+    print(f"  SSL: {_safe_fmt(ssl_value)} ton/day (flag={int(ssl_flag)})")
 
 def parse_float(value):
     """解析浮点元数据"""
@@ -170,18 +192,12 @@ def read_csv_files():
     water_df = pd.read_csv(base_dir / "Water.csv", delimiter=';', parse_dates=['Sample.Date'], encoding='iso-8859-1')
     station_df = pd.read_excel(base_dir / "GEMStat_station_metadata.xlsx")
 
-    # print(flux_df['Sample.Date'].head())
-    # print(water_df['Sample.Date'].head())
     flux_df['GEMS.Station.Number'] = flux_df['GEMS.Station.Number'].astype(str).str.strip()
     water_df['GEMS.Station.Number'] = water_df['GEMS.Station.Number'].astype(str).str.strip()
     station_df['GEMS Station Number'] = station_df['GEMS Station Number'].astype(str).str.strip()
     report_station_metadata_altitude(station_df)
     flux_df['Parameter.Code'] = flux_df['Parameter.Code'].astype(str).str.strip()
     water_df['Parameter.Code'] = water_df['Parameter.Code'].astype(str).str.strip()
-    # print("Flux station sample:", list(flux_stations)[:5])
-    # print("Water station sample:", list(water_stations)[:5])
-    # print("Intersection size:", len(common_stations))
-
 
     print(f"Flux records: {len(flux_df)}")
     print(f"Water records: {len(water_df)}")
@@ -205,7 +221,7 @@ def extract_station_data(station_id, flux_df, water_df):
 
 
 def find_overlapping_period(discharge_data, sediment_data):
-    """找到两个数据集的重叠时间段"""
+    """找到两个数据集的重叠时间段（保留用于信息输出，不再作为 gate）"""
     if len(discharge_data) == 0 or len(sediment_data) == 0:
         return None, None
     start = max(discharge_data['Sample.Date'].min(), sediment_data['Sample.Date'].min())
@@ -241,7 +257,7 @@ def parse_lat_lon(station_row):
 # 计算与文件输出
 # ==========================================================
 def calculate_sediment_load(q, ssc):
-    """计算每日泥沙通量 (ton/day)"""
+    """计算每日泥沙通量 (ton/day) — 仅当 Q 和 SSC 同时有效"""
     if pd.isna(q) or pd.isna(ssc) or q < 0 or ssc < 0:
         return np.nan
     return q * ssc * 0.0864
@@ -361,6 +377,7 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
         flag_values=[0, 1, 2, 3, 9],
         flag_meanings=final_meanings
     )
+
     _add_flag_var(
         "SSL_flag", SSL_flag, "final quality flag for sediment load",
         flag_values=[0, 1, 2, 3, 9],
@@ -469,12 +486,15 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     log_station_qc(
         station_id=station_id,
         station_name=str(station_row.get('Station Name', station_id)),
-        n_samples=len(discharge),
+        n_samples=len(dates),
         skipped_log_iqr=False,
         skipped_ssc_q=False,
-        q_value=float(np.nanmedian(np.asarray(discharge, dtype=float))), q_flag=int(np.min(Q_flag)),
-        ssc_value=float(np.nanmedian(np.asarray(ssc, dtype=float))), ssc_flag=int(np.min(SSC_flag)),
-        ssl_value=float(np.nanmedian(np.asarray(ssl, dtype=float))), ssl_flag=int(np.min(SSL_flag)),
+        q_value=float(np.nanmedian(np.asarray(discharge, dtype=float))),
+        q_flag=int(np.min(Q_flag)),
+        ssc_value=float(np.nanmedian(np.asarray(ssc, dtype=float))),
+        ssc_flag=int(np.min(SSC_flag)),
+        ssl_value=float(np.nanmedian(np.asarray(ssl, dtype=float))),
+        ssl_flag=int(np.min(SSL_flag)),
         created_path=filepath
     )
 
@@ -483,6 +503,14 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
 # main processing function
 # ==========================================================
 def process_one_station(args):
+    """
+    Process one station with manuscript-consistent rules:
+    - Candidate stations from water-quality records (TSS in Water.csv)
+    - Q and SSC daily series aggregated independently, then outer-merged
+    - SSC-only records preserved; SSL computed only when Q+SSC both valid
+    - QC3 SSC-Q consistency only on valid Q-SSC pairs
+    - Station skipped only if no valid SSC or SSL remains after QC
+    """
     station_id, flux_df, water_df, station_df, output_dir = args
 
     try:
@@ -490,29 +518,48 @@ def process_one_station(args):
 
         station_match = station_df[station_df['GEMS Station Number'] == station_id]
         if station_match.empty:
-            return None, None, f"Skipped {station_id}: station metadata not found"
+            return None, None, None, f"Skipped {station_id}: station metadata not found"
 
         station_row = station_match.iloc[0]
 
+        # --- 1. Extract raw data ---
         discharge_data, sediment_data = extract_station_data(station_id, flux_df, water_df)
-        start, end = find_overlapping_period(discharge_data, sediment_data)
-        if start is None:
-            return None, None, f"Skipped {station_id}: no overlapping period"
 
-        discharge_daily = aggregate_to_daily(discharge_data)
-        sediment_daily = aggregate_to_daily(sediment_data)
+        has_q = len(discharge_data) > 0
+        has_ssc = len(sediment_data) > 0
 
-        merged = pd.merge(
-            discharge_daily,
-            sediment_daily,
-            on='Date',
-            how='inner',
-            suffixes=('_Q', '_SSC')
-        )
+        # --- 2. Aggregate to daily independently ---
+        if has_q:
+            discharge_daily = aggregate_to_daily(discharge_data)
+        else:
+            discharge_daily = pd.DataFrame(columns=['Date', 'Clean_Value', 'Quality'])
 
-        if merged.empty:
-            return None, None, f"Skipped {station_id}: no same-day data"
+        if has_ssc:
+            sediment_daily = aggregate_to_daily(sediment_data)
+        else:
+            sediment_daily = pd.DataFrame(columns=['Date', 'Clean_Value', 'Quality'])
 
+        # --- 3. Outer merge: keep all dates where either Q or SSC exists ---
+        if has_q and has_ssc:
+            merged = pd.merge(
+                discharge_daily,
+                sediment_daily,
+                on='Date',
+                how='outer',
+                suffixes=('_Q', '_SSC')
+            )
+        elif has_q and not has_ssc:
+            merged = discharge_daily.rename(columns={'Clean_Value': 'Clean_Value_Q', 'Quality': 'Quality_Q'})
+            merged['Clean_Value_SSC'] = np.nan
+            merged['Quality_SSC'] = 'unknown'
+        elif not has_q and has_ssc:
+            merged = sediment_daily.rename(columns={'Clean_Value': 'Clean_Value_SSC', 'Quality': 'Quality_SSC'})
+            merged['Clean_Value_Q'] = np.nan
+            merged['Quality_Q'] = 'unknown'
+        else:
+            return None, None, None, f"Skipped {station_id}: no Q and no SSC data"
+
+        # --- 4. Compute SSL only where Q AND SSC both valid (Rule 5) ---
         Q_arr = merged["Clean_Value_Q"].to_numpy(dtype=float)
         SSC_arr = merged["Clean_Value_SSC"].to_numpy(dtype=float)
         SSL_arr = np.full(len(merged), np.nan, dtype=float)
@@ -525,8 +572,12 @@ def process_one_station(args):
         SSL_arr[valid_ssl] = Q_arr[valid_ssl] * SSC_arr[valid_ssl] * 0.0864
         merged["SSL"] = SSL_arr
 
+        # Count paired Q-SSC records (for audit)
+        n_paired = int(valid_ssl.sum())
+
         time_arr = pd.to_datetime(merged["Date"]).values
 
+        # --- 5. Run QC pipeline ---
         qc = apply_hydro_qc_with_provenance(
             time=time_arr,
             Q=Q_arr,
@@ -543,7 +594,16 @@ def process_one_station(args):
         )
 
         if qc is None:
-            return None, None, f"Skipped {station_id}: QC produced no valid data"
+            return None, None, None, f"Skipped {station_id}: QC produced no valid data"
+
+        # --- 6. Final station skip: based on SSC or SSL at least one valid (Rule 2) ---
+        ssc_valid = (qc["SSC_flag"] != FILL_VALUE_INT)
+        ssl_valid = (qc["SSL_flag"] != FILL_VALUE_INT)
+        if not np.any(ssc_valid | ssl_valid):
+            return None, None, None, f"Skipped {station_id}: no valid SSC or SSL after QC"
+
+        # Track final SSC record count (for audit)
+        n_final_ssc = int(np.sum(ssc_valid))
 
         merged['Q_flag'] = qc['Q_flag']
         merged['SSC_flag'] = qc['SSC_flag']
@@ -586,6 +646,7 @@ def process_one_station(args):
 
         ssc_q_bounds = qc.get("ssc_q_bounds", None)
 
+        # Diagnostic plot: only when ssc_q_bounds is available (requires Q-SSC pairs)
         if ssc_q_bounds is not None and plot_ssc_q_diagnostic is not None:
             plot_dir = Path(output_dir) / "diagnostic"
             plot_dir.mkdir(exist_ok=True)
@@ -670,10 +731,19 @@ def process_one_station(args):
             output_dir=output_dir,
         )
 
-        return export_df, station_info, f"Finished {station_id}"
+        # Attach audit info to the return
+        audit = {
+            "has_q": has_q,
+            "has_ssc": has_ssc,
+            "n_raw_ssc": len(sediment_data),
+            "n_paired": n_paired,
+            "n_final_ssc": n_final_ssc,
+        }
+
+        return export_df, station_info, audit, f"Finished {station_id}"
 
     except Exception as e:
-        return None, None, f"Failed {station_id}: {repr(e)}"
+        return None, None, None, f"Failed {station_id}: {repr(e)}"
 
 
 def process_all_stations(flux_df, water_df, station_df, output_dir):
@@ -682,22 +752,44 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # ================================================================
+    # CANDIDATE STATIONS: from water-quality records with TSS (Rule 1-2)
+    # 不再使用 flux_stations & water_stations 的交集
+    # ================================================================
+    tss_water = water_df[water_df['Parameter.Code'] == 'TSS']
+    ssc_stations = set(tss_water['GEMS.Station.Number'].unique())
     flux_stations = set(flux_df['GEMS.Station.Number'].unique())
-    water_stations = set(water_df['GEMS.Station.Number'].unique())
-    common_stations = flux_stations & water_stations
+
+    stations_with_q = ssc_stations & flux_stations
+    ssc_only_stations = ssc_stations - flux_stations
+
+    print(f"\n{'='*60}")
+    print(f"AUDIT: Candidate station summary")
+    print(f"{'='*60}")
+    print(f"  Raw SSC-bearing stations (TSS in Water.csv):  {len(ssc_stations)}")
+    print(f"  Stations with Q+SSC:                           {len(stations_with_q)}")
+    print(f"  SSC-only stations (no Q in Flux.csv):          {len(ssc_only_stations)}")
 
     tasks = [
         (station_id, flux_df, water_df, station_df, output_dir)
-        for station_id in sorted(common_stations)
+        for station_id in sorted(ssc_stations)
     ]
 
     max_workers = min(24, max(1, mp.cpu_count() - 1))
+
+    # Audit accumulators
+    total_raw_ssc_records = 0
+    total_paired_records = 0
+    total_final_ssc_records = 0
+    final_station_ids = []
+    final_q_ssc_stations = []
+    final_ssc_only_stations = []
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_one_station, task) for task in tasks]
 
         for future in as_completed(futures):
-            export_df, station_info, message = future.result()
+            export_df, station_info, audit, message = future.result()
             print(message)
 
             if export_df is not None:
@@ -705,6 +797,29 @@ def process_all_stations(flux_df, water_df, station_df, output_dir):
 
             if station_info is not None:
                 stations_info.append(station_info)
+                sid = station_info["Source_ID"]
+                final_station_ids.append(sid)
+                if sid in ssc_only_stations:
+                    final_ssc_only_stations.append(sid)
+                else:
+                    final_q_ssc_stations.append(sid)
+
+            if audit is not None:
+                total_raw_ssc_records += audit["n_raw_ssc"]
+                total_paired_records += audit["n_paired"]
+                total_final_ssc_records += audit["n_final_ssc"]
+
+    # === AUDIT REPORT ===
+    print(f"\n{'='*60}")
+    print(f"AUDIT: Final output summary")
+    print(f"{'='*60}")
+    print(f"  Final output stations:                         {len(final_station_ids)}")
+    print(f"    with Q+SSC:                                  {len(final_q_ssc_stations)}")
+    print(f"    SSC-only (no Q, still output):               {len(final_ssc_only_stations)}")
+    print(f"  SSC raw records (from Water.csv TSS rows):     {total_raw_ssc_records}")
+    print(f"  Paired Q-SSC records (same-day Q & SSC):       {total_paired_records}")
+    print(f"  Final retained SSC records (after QC):         {total_final_ssc_records}")
+    print(f"{'='*60}")
 
     # === 所有站点合并输出 Excel ===
     if all_records:

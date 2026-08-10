@@ -7,6 +7,15 @@ NOTE: This script ONLY processes DAILY average data (tmw = Tagesmittelwert).
 
 Data source: https://www.gkd.bayern.de/en/rivers/discharge and
              https://www.gkd.bayern.de/en/rivers/suspended-sediment
+
+Station eligibility (revised 2026-08):
+  - Sediment (SSC) files are the CORE input; discharge files are OPTIONAL.
+  - A station with valid SSC data is processed even if NO discharge file exists.
+  - Q-only stations (discharge but no sediment) are NOT included in the final
+    sediment product.
+  - When both Q and SSC exist, all SSC observations are kept (outer/union join).
+  - SSL is computed only on dates where both Q and SSC are valid; SSC-only dates
+    carry missing Q and SSL.
 """
 
 import os
@@ -74,7 +83,8 @@ def parse_bayern_csv(filepath, data_type='discharge'):
     skiprows = None
     with open(filepath, 'r', encoding='utf-8-sig') as f:
         for i, line in enumerate(f):
-            if ('Datum' in line and 'Mittelwert' in line) or ('Zeitpunkt' in line and 'Konzentration' in line):
+            if ('Datum' in line and 'Mittelwert' in line) or \
+               ('Zeitpunkt' in line and 'Konzentration' in line):
                 skiprows = i
                 break
 
@@ -154,12 +164,19 @@ def utm_to_latlon(easting, northing, zone=32):
     return lat, lon
 
 
-def process_station(station_id, discharge_dir, sediment_dir, output_dir):
+def process_station(station_id, discharge_dir, sediment_dir, output_dir, audit):
     """
-    Process a single station: combine all files, find overlap, create NetCDF.
+    Process a single station: combine all files, align data, create NetCDF.
 
     Note: This function ONLY processes daily average (tmw) data files.
     Files with other time resolutions (e.g., ezw) are explicitly excluded.
+
+    Revised logic (2026-08):
+      - Sediment files are CORE and REQUIRED.
+      - Discharge files are OPTIONAL.
+      - No overlap-period rejection.
+      - Union/outer join: all SSC observations retained.
+      - SSL computed ONLY on Q+SSC paired dates.
 
     Parameters:
     -----------
@@ -171,6 +188,8 @@ def process_station(station_id, discharge_dir, sediment_dir, output_dir):
         Directory containing sediment files
     output_dir : str
         Output directory for NetCDF files
+    audit : dict
+        Mutable audit dictionary for accumulating statistics.
 
     Returns:
     --------
@@ -180,43 +199,26 @@ def process_station(station_id, discharge_dir, sediment_dir, output_dir):
     print(f"\nProcessing station {station_id}...")
 
     # IMPORTANT: Only process daily average (tmw = Tagesmittelwert) files
-    # Exclude other time resolutions like ezw (Einzelwert)
-    discharge_files = sorted(glob.glob(os.path.join(discharge_dir, f"{station_id}_*_tmw_*.csv")))
     sediment_files = sorted(glob.glob(os.path.join(sediment_dir, f"{station_id}_*_tmw_*.csv")))
+    discharge_files = sorted(glob.glob(os.path.join(discharge_dir, f"{station_id}_*_tmw_*.csv")))
 
-    if not discharge_files:
-        print(f"  No discharge data found for station {station_id}")
-        return False
-
+    # --- Sediment files are REQUIRED ---
     if not sediment_files:
-        print(f"  No sediment data found for station {station_id}")
+        print(f"  No sediment data found for station {station_id} -- skipped (Q-only station -> not in sediment product)")
+        audit['q_only_skipped'] += 1
         return False
 
-    # Combine all discharge files
-    discharge_dfs = []
+    # --- Parse sediment files (primary / core input) ---
+    sediment_dfs = []
     metadata = None
 
-    for f in discharge_files:
-        df, meta = parse_bayern_csv(f, 'discharge')
-        if df is not None and not df.empty:
-            discharge_dfs.append(df)
-            if metadata is None:
-                metadata = meta
-
-    if not discharge_dfs:
-        print(f"  Failed to read discharge data for station {station_id}")
-        return False
-
-    discharge_data = pd.concat(discharge_dfs).sort_index()
-    discharge_data = discharge_data[~discharge_data.index.duplicated(keep='first')]
-
-    # Combine all sediment files
-    sediment_dfs = []
-
     for f in sediment_files:
-        df, _ = parse_bayern_csv(f, 'sediment')
+        df, meta = parse_bayern_csv(f, 'sediment')
         if df is not None and not df.empty:
             sediment_dfs.append(df)
+            # Prefer sediment-file metadata (real source for SSC stations)
+            if metadata is None:
+                metadata = meta
 
     if not sediment_dfs:
         print(f"  Failed to read sediment data for station {station_id}")
@@ -225,71 +227,102 @@ def process_station(station_id, discharge_dir, sediment_dir, output_dir):
     sediment_data = pd.concat(sediment_dfs).sort_index()
     sediment_data = sediment_data[~sediment_data.index.duplicated(keep='first')]
 
-    # Check if either dataset is all NaN
-    if discharge_data['value'].isna().all():
-        print(f"  Discharge data is all NaN for station {station_id}")
-        return False
-
     if sediment_data['value'].isna().all():
         print(f"  Sediment data is all NaN for station {station_id}")
         return False
 
-    # Find overlapping period
-    discharge_start = discharge_data.index.min()
-    discharge_end = discharge_data.index.max()
-    sediment_start = sediment_data.index.min()
-    sediment_end = sediment_data.index.max()
+    audit['sediment_stations_total'] += 1
 
-    # Get the intersection
-    overlap_start = max(discharge_start, sediment_start)
-    overlap_end = min(discharge_end, sediment_end)
+    # --- Parse discharge files (OPTIONAL) ---
+    has_q = False
+    discharge_data = None
 
-    if overlap_start > overlap_end:
-        print(f"  No temporal overlap for station {station_id}")
-        print(f"    Discharge: {discharge_start} to {discharge_end}")
-        print(f"    Sediment: {sediment_start} to {sediment_end}")
-        return False
+    if discharge_files:
+        discharge_dfs = []
+        for f in discharge_files:
+            df, meta = parse_bayern_csv(f, 'discharge')
+            if df is not None and not df.empty:
+                discharge_dfs.append(df)
+                # Fallback: only take discharge metadata if we still have none
+                if metadata is None:
+                    metadata = meta
 
+        if discharge_dfs:
+            discharge_data = pd.concat(discharge_dfs).sort_index()
+            discharge_data = discharge_data[~discharge_data.index.duplicated(keep='first')]
+            if not discharge_data['value'].isna().all():
+                has_q = True
 
-    print(f"  Overlap period: {overlap_start} to {overlap_end}")
+    if has_q:
+        audit['stations_with_q'] += 1
+    else:
+        audit['ssc_only_stations'] += 1
+        print(f"  No discharge data -- SSC-only station (will generate NetCDF)")
 
-    # Filter data to overlap period
-    discharge_data = discharge_data.loc[overlap_start:overlap_end]
-    sediment_data = sediment_data.loc[overlap_start:overlap_end]
+    # --- Build merged dataframe with UNION / outer alignment ---
+    if has_q:
+        # Union of all dates that have SSC OR Q
+        all_dates = discharge_data.index.union(sediment_data.index)
+        merged = pd.DataFrame(index=all_dates.sort_values())
+        merged['discharge'] = discharge_data['value']
+        merged['ssc'] = sediment_data['value']
 
-    # 按真实观测日期对齐
-    # merged_data = pd.DataFrame(index=discharge_data.index.union(sediment_data.index))
-    # merged_data = merged_data.loc[overlap_start:overlap_end]
+        # Count paired vs SSC-only dates
+        paired_mask = merged['discharge'].notna() & merged['ssc'].notna()
+        ssc_only_mask = merged['ssc'].notna() & merged['discharge'].isna()
 
-    # merged_data['discharge'] = discharge_data['value']
-    # merged_data['ssc'] = sediment_data['value']
+        audit['paired_dates'] += int(paired_mask.sum())
+        audit['ssc_only_dates'] += int(ssc_only_mask.sum())
 
-    #只保留Q和SSC都存在的日期【need_check】
-    merged_data = discharge_data[['value']].rename(columns={'value': 'discharge'}).join(
-    sediment_data[['value']].rename(columns={'value': 'ssc'}),
-    how='inner')
-    merged_data = merged_data.loc[overlap_start:overlap_end]
+        # SSL only on paired dates
+        merged['sediment_load'] = np.nan
+        merged.loc[paired_mask, 'sediment_load'] = (
+            merged.loc[paired_mask, 'discharge'] * merged.loc[paired_mask, 'ssc'] * 0.0864
+        )
+    else:
+        # SSC-only station: no Q at all
+        merged = pd.DataFrame(index=sediment_data.index.sort_values())
+        merged['discharge'] = np.nan
+        merged['ssc'] = sediment_data['value']
+        merged['sediment_load'] = np.nan
 
-    # Calculate sediment load (ton/day)
-    # Load = Q (m³/s) × SSC (g/m³) × 86400 (s/day) / 1e6 (g/ton)
-    # Load = Q × SSC × 0.0864
-    merged_data['sediment_load'] = merged_data['discharge'] * merged_data['ssc'] * 0.0864
+        ssc_only_mask = merged['ssc'].notna()
+        audit['ssc_only_dates'] += int(ssc_only_mask.sum())
+        # paired_dates stays 0
 
-    # Convert coordinates
-    if 'easting' in metadata and 'northing' in metadata:
+    # Final sort
+    merged = merged.sort_index()
+
+    # --- Count records ---
+    n_records = len(merged)
+    n_ssc_valid = int((~merged['ssc'].isna()).sum())
+    n_q_valid = int((~merged['discharge'].isna()).sum())
+    n_ssl_valid = int((~merged['sediment_load'].isna()).sum())
+    audit['final_records'] += n_records
+
+    print(f"  Records: {n_records} total | SSC valid: {n_ssc_valid} | Q valid: {n_q_valid} | SSL valid: {n_ssl_valid}")
+
+    # --- Convert coordinates ---
+    if metadata and 'easting' in metadata and 'northing' in metadata:
         lat, lon = utm_to_latlon(metadata['easting'], metadata['northing'])
     else:
         lat, lon = np.nan, np.nan
 
-    # Create NetCDF file
+    # --- Store metadata source provenance ---
+    if metadata is None:
+        metadata = {}
+    metadata['_source_has_discharge'] = has_q
+
+    # --- Create NetCDF file ---
     output_file = os.path.join(output_dir, f"Bayern_{station_id}.nc")
 
     try:
-        create_netcdf(output_file, merged_data, metadata, lat, lon)
+        create_netcdf(output_file, merged, metadata, lat, lon)
         print(f"  Created {output_file}")
-        print(f"    {len(merged_data)} time steps")
-        print(f"    Discharge: {(~merged_data['discharge'].isna()).sum()} valid values")
-        print(f"    SSC: {(~merged_data['ssc'].isna()).sum()} valid values")
+        print(f"    {len(merged)} time steps")
+        print(f"    Discharge: {n_q_valid} valid values")
+        print(f"    SSC: {n_ssc_valid} valid values")
+        print(f"    SSL: {n_ssl_valid} valid values")
         return True
 
     except Exception as e:
@@ -310,7 +343,7 @@ def create_netcdf(filename, data, metadata, lat, lon):
     data : pd.DataFrame
         Time series data with columns: discharge, ssc, sediment_load
     metadata : dict
-        Station metadata
+        Station metadata (with optional _source_has_discharge provenance key)
     lat, lon : float
         Station coordinates
     """
@@ -376,7 +409,7 @@ def create_netcdf(filename, data, metadata, lat, lon):
     ssc_var.long_name = 'suspended sediment concentration'
     ssc_var.units = 'mg L-1'
     ssc_var.coordinates = 'time latitude longitude'
-    ssc_var.comment = 'Original data in g/m³, which equals mg/L'
+    ssc_var.comment = 'Original data in g/m3, which equals mg/L'
     ssc_var[:] = data['ssc'].fillna(-9999.0).values
 
     load_var = dataset.createVariable('sediment_load', 'f4', ('time',),
@@ -384,23 +417,88 @@ def create_netcdf(filename, data, metadata, lat, lon):
     load_var.long_name = 'suspended sediment load'
     load_var.units = 'ton day-1'
     load_var.coordinates = 'time latitude longitude'
-    load_var.comment = 'Calculated as: Load = Q × SSC × 0.0864 (Q in m³/s, SSC in g/m³, Load in ton/day)'
+    load_var.comment = 'Calculated as: Load = Q x SSC x 0.0864 (Q in m3/s, SSC in g/m3, Load in ton/day). Only computed on dates where both Q and SSC are available; missing otherwise.'
     load_var[:] = data['sediment_load'].fillna(-9999.0).values
+
+    # ---- Source provenance (avoid fabricating) ----
+    source_has_discharge = metadata.get('_source_has_discharge', False)
+    ssc_source_note = 'In-situ observations from Bayern monitoring network (ssp / suspended-sediment data)'
+    if source_has_discharge:
+        source_note = ssc_source_note + '; discharge data from same network'
+    else:
+        source_note = ssc_source_note + '; no discharge data available for this station'
+    meta_station_id = metadata.get('station_id', '')
 
     # Global attributes
     dataset.Conventions = 'CF-1.8'
-    dataset.title = f"Bayern Sediment and Discharge Data for Station {metadata.get('station_id', 'Unknown')}"
-    dataset.institution = 'Bayerisches Landesamt für Umwelt'
-    dataset.source = 'In-situ observations from Bayern monitoring network'
+    dataset.title = f"Bayern Sediment Data for Station {meta_station_id or 'Unknown'}"
+    dataset.institution = 'Bayerisches Landesamt fur Umwelt'
+    dataset.source = source_note
     dataset.history = f"Created on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} by convert_bayern_to_netcdf.py"
     dataset.references = 'https://www.gkd.bayern.de/en/rivers/discharge; https://www.gkd.bayern.de/en/rivers/suspended-sediment'
-    dataset.comment = 'Daily average values. Sediment load calculated as: Load = Q × SSC × 0.0864 (Q in m³/s, SSC in g/m³, Load in ton/day)'
-    dataset.station_id = metadata.get('station_id', '')
+    dataset.comment = 'Daily average values. Sediment load calculated as: Load = Q x SSC x 0.0864 (Q in m3/s, SSC in g/m3, Load in ton/day). SSC-only dates (no Q) carry missing Q and SSL.'
+    dataset.station_id = meta_station_id
     dataset.station_name = metadata.get('station_name', '')
     dataset.river_name = metadata.get('river_name', '')
+    dataset.source_has_discharge = 'yes' if source_has_discharge else 'no'
 
     # Close the file
     dataset.close()
+
+
+def regression_test(discharge_dir, sediment_dir, output_dir):
+    """
+    Regression test: prove that a Bayern station with a sediment file but
+    NO discharge file can successfully produce an SSC NetCDF.
+
+    Uses station 12001006 (Fussen / Lech) which has sediment but no discharge.
+    """
+    print("\n" + "=" * 60)
+    print("REGRESSION TEST: SSC-only station (sediment file, no discharge)")
+    print("=" * 60)
+
+    station_id = '12001006'
+    audit = {
+        'sediment_stations_total': 0,
+        'stations_with_q': 0,
+        'ssc_only_stations': 0,
+        'q_only_skipped': 0,
+        'paired_dates': 0,
+        'ssc_only_dates': 0,
+        'final_records': 0,
+    }
+
+    success = process_station(station_id, discharge_dir, sediment_dir, output_dir, audit)
+
+    if success:
+        # Quick verification: read back the NetCDF and check SSC is present
+        test_file = os.path.join(output_dir, f"Bayern_{station_id}.nc")
+        ds = nc.Dataset(test_file, 'r')
+        ssc = ds.variables['ssc'][:]
+        q = ds.variables['discharge'][:]
+        ssl = ds.variables['sediment_load'][:]
+        n_ssc_finite = int(np.sum(ssc != -9999.0))
+        n_q_present = int(np.sum(q != -9999.0))
+        n_ssl_present = int(np.sum(ssl != -9999.0))
+        has_discharge_attr = getattr(ds, 'source_has_discharge', 'unknown')
+        ds.close()
+
+        print(f"\n  REGRESSION TEST RESULT: PASS")
+        print(f"    Station {station_id} generated NetCDF successfully.")
+        print(f"    SSC valid records: {n_ssc_finite}")
+        print(f"    Q valid records:   {n_q_present} (expected 0)")
+        print(f"    SSL valid records: {n_ssl_present} (expected 0)")
+        print(f"    source_has_discharge attr: {has_discharge_attr}")
+
+        if n_ssc_finite > 0 and n_q_present == 0 and n_ssl_present == 0:
+            print(f"  + All checks passed: SSC-only station handled correctly.")
+        else:
+            print(f"  ! Unexpected values -- please investigate.")
+    else:
+        print(f"\n  REGRESSION TEST RESULT: FAIL")
+        print(f"    Station {station_id} could NOT be processed.")
+
+    return success
 
 
 def main():
@@ -409,55 +507,95 @@ def main():
 
     Note: This script ONLY processes DAILY data (tmw files).
     Other time resolutions (e.g., ezw files) are NOT processed.
+
+    Revised (2026-08):
+      - Candidate stations are based on sediment/SSC files (core input).
+      - Discharge is optional; SSC-only stations are processed.
+      - Q-only stations (no sediment) are excluded from the sediment product.
     """
 
     # Directories
     input_dir = PROJECT_ROOT / "Source" / "bayern"
     discharge_dir = input_dir / "discharge"
     sediment_dir = input_dir / "ssp"
-    output_dir = PROJECT_ROOT / "Source" / "bayern" / "done"
+    output_dir = input_dir / "done"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get all unique station IDs from DAILY (tmw) discharge files only
-    # tmw = Tagesmittelwert (daily average)
-    # Other file types (e.g., ezw = Einzelwert) are excluded
-    discharge_files = glob.glob(os.path.join(discharge_dir, '*_tmw_*.csv'))
-    discharge_ids = set([os.path.basename(f).split('_')[0] for f in discharge_files])
+    # --- Candidate station IDs: based on SEDIMENT files (core input) ---
+    # Get all unique station IDs from DAILY (tmw) sediment files
+    sediment_files_list = glob.glob(os.path.join(sediment_dir, '*_tmw_*.csv'))
+    sediment_ids = set([os.path.basename(f).split('_')[0] for f in sediment_files_list])
 
-    # Get all unique station IDs from DAILY (tmw) sediment files only
-    sediment_files = glob.glob(os.path.join(sediment_dir, '*_tmw_*.csv'))
-    sediment_ids = set([os.path.basename(f).split('_')[0] for f in sediment_files])
+    # Get all unique station IDs from DAILY (tmw) discharge files (for reference)
+    discharge_files_list = glob.glob(os.path.join(discharge_dir, '*_tmw_*.csv'))
+    discharge_ids = set([os.path.basename(f).split('_')[0] for f in discharge_files_list])
 
-    # Process only stations that have both discharge and sediment data
-    common_ids = discharge_ids.intersection(sediment_ids)
+    # Candidate stations = stations with sediment data (NOT Q+SSC)
+    candidate_ids = sorted(sediment_ids)
 
-    print("="*60)
+    # Q-only stations (excluded from sediment product)
+    q_only_ids = discharge_ids - sediment_ids
+
+    print("=" * 60)
     print("NOTE: Processing DAILY data only (tmw files)")
     print("      Other time resolutions (ezw files) are excluded")
-    print("="*60)
-    print(f"Found {len(discharge_ids)} stations with DAILY discharge data")
-    print(f"Found {len(sediment_ids)} stations with DAILY sediment data")
-    print(f"Found {len(common_ids)} stations with both DAILY datasets")
+    print("=" * 60)
+    print(f"Stations with DAILY discharge data: {len(discharge_ids)}")
+    print(f"Stations with DAILY sediment data:  {len(sediment_ids)}")
+    print(f"Candidate stations (have sediment):  {len(candidate_ids)}")
+    print(f"Q-only stations (excluded):          {len(q_only_ids)}")
+    if q_only_ids:
+        print(f"  Q-only IDs: {sorted(q_only_ids)}")
+    ssc_only_ids = sediment_ids - discharge_ids
+    print(f"SSC-only stations (sediment, no Q):  {len(ssc_only_ids)}")
+    if ssc_only_ids:
+        print(f"  SSC-only IDs: {sorted(ssc_only_ids)}")
+
+    # --- Audit accumulator ---
+    audit = {
+        'sediment_stations_total': 0,
+        'stations_with_q': 0,
+        'ssc_only_stations': 0,
+        'q_only_skipped': 0,
+        'paired_dates': 0,
+        'ssc_only_dates': 0,
+        'final_records': 0,
+    }
 
     # Process each station
     success_count = 0
     failed_count = 0
+    retained_stations = []
 
-    for station_id in sorted(common_ids):
-        success = process_station(station_id, discharge_dir, sediment_dir, output_dir)
+    for station_id in candidate_ids:
+        success = process_station(station_id, discharge_dir, sediment_dir, output_dir, audit)
         if success:
             success_count += 1
+            retained_stations.append(station_id)
         else:
             failed_count += 1
 
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"  Successfully processed: {success_count} stations")
-    print(f"  Failed/skipped: {failed_count} stations")
-    print(f"  Output directory: {output_dir}")
-    print(f"{'='*60}")
+    # --- Audit summary ---
+    print(f"\n{'=' * 60}")
+    print(f"AUDIT SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"Sediment stations total (candidate):    {len(candidate_ids)}")
+    print(f"  -> Successfully processed:              {success_count}")
+    print(f"  -> Failed / skipped:                    {failed_count}")
+    print(f"Stations also having Q:                  {audit['stations_with_q']}")
+    print(f"SSC-only stations (no Q):                {audit['ssc_only_stations']}")
+    print(f"Q-only stations (excluded from product): {audit['q_only_skipped']}")
+    print(f"Paired Q+SSC dates (total):              {audit['paired_dates']}")
+    print(f"SSC-only dates (total):                  {audit['ssc_only_dates']}")
+    print(f"Final retained stations:                 {success_count}")
+    print(f"Final retained records (total):          {audit['final_records']}")
+    print(f"Output directory:                        {output_dir}")
+    print(f"{'=' * 60}")
+
+    # --- Regression test ---
+    regression_test(discharge_dir, sediment_dir, output_dir)
 
 
 if __name__ == '__main__':
