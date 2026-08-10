@@ -273,22 +273,29 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
 def process_single_station(args):
     """
     Process a single USGS station independently (for multiprocessing).
-    Returns a summary dict or None if processing failed.
+
+    Eligibility: sediment/SSC data is the core entry requirement.
+    Discharge file is OPTIONAL — SSC-only stations are processed with Q=NaN.
+    Q and SSC are aligned via outer join (union), not inner join.
+    Station/record eligibility is based on SSC OR SSL, not Q.
+
+    Returns a summary dict with _audit fields for diagnostics.
     """
     station_dir, sites_info_df, output_dir = args
     station_id = station_dir.name.split('_')[1]
     
     try:
         # --------------------------
-        # Read discharge and sediment data
+        # Read sediment data (MANDATORY entry requirement)
+        # Discharge file is OPTIONAL -- SSC-only stations are valid.
         # --------------------------
-        discharge_file = station_dir / f"{station_id}_discharge.csv"
         sediment_file = station_dir / f"{station_id}_sediment.csv"
+        if not sediment_file.exists():
+            return {'status': 'skipped', 'station_id': station_id, 'reason': 'missing sediment file'}
 
-        if not (discharge_file.exists() and sediment_file.exists()):
-            return {'status': 'skipped', 'station_id': station_id, 'reason': 'missing discharge or sediment file'}
+        discharge_file = station_dir / f"{station_id}_discharge.csv"
+        has_discharge = discharge_file.exists()
 
-        discharge_df = pd.read_csv(discharge_file, comment="#", low_memory=False)
         sediment_df = pd.read_csv(sediment_file, comment='#')
 
         # --------------------------
@@ -300,42 +307,61 @@ def process_single_station(args):
         station_info = station_info.iloc[0]
 
         # --------------------------
-        # Extract and align Q / SSC
+        # Extract SSC (mandatory)
         # --------------------------
-        discharge_df['datetime'] = pd.to_datetime(discharge_df['datetime'])
         sediment_df['datetime'] = pd.to_datetime(sediment_df['datetime'])
-
-        q_col = next((c for c in discharge_df.columns if '00060' in c), None)
         ssc_col = next((c for c in sediment_df.columns if '80154' in c), None)
-        if q_col is None or ssc_col is None:
-            return {'status': 'skipped', 'station_id': station_id, 'reason': 'missing 00060 or 80154 column'}
+        if ssc_col is None:
+            return {'status': 'skipped', 'station_id': station_id, 'reason': 'missing 80154 column in sediment file'}
 
-        discharge_df = discharge_df[['datetime', q_col]].rename(columns={q_col: 'Q'})
         sediment_df = sediment_df[['datetime', ssc_col]].rename(columns={ssc_col: 'SSC'})
+        sediment_df['SSC'] = pd.to_numeric(sediment_df['SSC'], errors='coerce')
+        sediment_df.dropna(subset=['SSC'], inplace=True)
+        if sediment_df.empty:
+            return {'status': 'skipped', 'station_id': station_id, 'reason': 'no valid SSC records in sediment file'}
 
-        # Inner join → only retain times where both Q and SSC exist
-        df = pd.merge(discharge_df, sediment_df, on='datetime', how='inner')
-        if df.empty:
-            return {'status': 'skipped', 'station_id': station_id, 'reason': 'no overlapping Q and SSC records'}
+        ssc_source_count = len(sediment_df)
 
         # --------------------------
-        # Unit conversion and QC
+        # Extract Q (optional) — if discharge file or 00060 column is missing,
+        # the station still proceeds with Q=NaN.
         # --------------------------
-        df['Q'] = pd.to_numeric(df['Q'], errors='coerce') * CFS_TO_CMS
-        df['SSC'] = pd.to_numeric(df['SSC'], errors='coerce')
-        df.dropna(subset=['Q', 'SSC'], inplace=True)
+        if has_discharge:
+            try:
+                discharge_df = pd.read_csv(discharge_file, comment="#", low_memory=False)
+                discharge_df['datetime'] = pd.to_datetime(discharge_df['datetime'])
+                q_col = next((c for c in discharge_df.columns if '00060' in c), None)
+                if q_col is None:
+                    has_discharge = False
+                else:
+                    discharge_df = discharge_df[['datetime', q_col]].rename(columns={q_col: 'Q'})
+                    discharge_df['Q'] = pd.to_numeric(discharge_df['Q'], errors='coerce') * CFS_TO_CMS
+            except Exception:
+                has_discharge = False
 
-        if df.empty:
-            return {'status': 'skipped', 'station_id': station_id, 'reason': 'all overlapping values invalid'}
+        # --------------------------
+        # Align Q and SSC via OUTER join (union), NOT inner join.
+        # All SSC records are retained; Q is NaN where no matching discharge.
+        # --------------------------
+        if has_discharge:
+            df = pd.merge(discharge_df, sediment_df, on='datetime', how='outer')
+        else:
+            df = sediment_df.copy()
+            df['Q'] = np.nan
 
-        # Compute SSL (ton/day)
+        df = df.sort_values('datetime').reset_index(drop=True)
+        paired_count = int(df['Q'].notna().sum())
+
+        # --------------------------
+        # Compute SSL (ton/day) — only where both Q and SSC are valid
+        # --------------------------
+        df["SSL"] = np.nan
         valid_ssl = (
             np.isfinite(df["Q"])
             & np.isfinite(df["SSC"])
             & (df["Q"] >= 0)
             & (df["SSC"] >= 0)
         )
-        df["SSL"] = np.nan
         df.loc[valid_ssl, "SSL"] = df.loc[valid_ssl, "Q"] * df.loc[valid_ssl, "SSC"] * 0.0864
 
         # --------------------------------------------------
@@ -465,12 +491,22 @@ def process_single_station(args):
         # Save NetCDF
         # --------------------------
         output_file = output_dir / f"USGS_{station_id}.nc"
-        ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': 'days since 1970-01-01'}})
+        # Try NETCDF4 first; fall back to default engine if backend unavailable
+        try:
+            ds.to_netcdf(output_file, format='NETCDF4', encoding={'time': {'units': 'days since 1970-01-01'}})
+        except (ValueError, TypeError):
+            ds.to_netcdf(output_file, encoding={'time': {'units': 'days since 1970-01-01'}})
 
         # --------------------------
-        # Summary record
+        # Station eligibility: SSC OR SSL (not Q).
+        # SSC-only stations with Q=NaN are valid as long as SSC_flag == 0.
         # --------------------------
-        good_df = df[(df['Q_flag'] == 0) & (df['SSC_flag'] == 0)]
+        ssc_good = df['SSC_flag'] == 0
+        ssl_good = df['SSL_flag'] == 0
+        eligible = ssc_good | ssl_good
+        good_df = df[eligible]
+        retained_count = len(df)
+
         if not good_df.empty:
             return {
                 'status': 'success',
@@ -488,9 +524,24 @@ def process_single_station(args):
                 'Mean_SSC': good_df['SSC'].mean(),
                 'Mean_SSL': good_df['SSL'].mean(),
                 'qc_row': qc_row,
+                '_audit': {
+                    'has_discharge': has_discharge,
+                    'ssc_source_count': ssc_source_count,
+                    'paired_count': paired_count,
+                    'retained_count': retained_count,
+                },
             }
         else:
-            return {'status': 'skipped', 'station_id': station_id, 'reason': 'no good data after QC', 'record_count': len(df)}
+            return {
+                'status': 'skipped', 'station_id': station_id,
+                'reason': 'no good data after QC', 'record_count': len(df),
+                '_audit': {
+                    'has_discharge': has_discharge,
+                    'ssc_source_count': ssc_source_count,
+                    'paired_count': paired_count,
+                    'retained_count': len(df),
+                },
+            }
             
     except Exception as e:
         return {'status': 'error', 'station_id': station_id, 'error': str(e)}
@@ -540,6 +591,18 @@ def process_usgs(num_workers=None):
             skipped = 0
             errors = 0
 
+            # --- Audit counters ---
+            audit = {
+                'station_dirs': len(station_dirs),
+                'sediment_stations': 0,
+                'q_ssc_stations': 0,
+                'ssc_only_stations': 0,
+                'final_stations': 0,
+                'ssc_source_total': 0,
+                'paired_total': 0,
+                'retained_total': 0,
+            }
+
             if num_workers is None:
                 num_workers = os.cpu_count() or 4
 
@@ -551,7 +614,20 @@ def process_usgs(num_workers=None):
                     station_id = result.get('station_id', 'unknown')
                     if 'qc_row' in result and isinstance(result['qc_row'], dict):
                         qc_rows.append(result['qc_row'])
+                    # --- Accumulate audit ---
+                    au = result.get('_audit', {})
+                    if au:
+                        audit['sediment_stations'] += 1
+                        audit['ssc_source_total'] += au.get('ssc_source_count', 0)
+                        audit['paired_total'] += au.get('paired_count', 0)
+                        audit['retained_total'] += au.get('retained_count', 0)
+                        if au.get('has_discharge'):
+                            audit['q_ssc_stations'] += 1
+                        else:
+                            audit['ssc_only_stations'] += 1
+
                     if status == 'success':
+                        audit['final_stations'] += 1
                         print(f"✓ Station {station_id}: {result.get('record_count')} records, {result.get('good_count')} good")
                         results.append(result)
                         processed += 1
@@ -622,6 +698,21 @@ def process_usgs(num_workers=None):
                 print(f"\nSummary CSV saved: USGS_station_summary.csv ({len(summary_data)} stations)")
             else:
                 print("\nNo valid stations processed.")
+
+            # --- Audit report ---
+            print("\n" + "=" * 60)
+            print("AUDIT: USGS Station & Record Eligibility")
+            print("=" * 60)
+            print(f"  Station dirs found       : {audit['station_dirs']}")
+            print(f"  Sediment stations        : {audit['sediment_stations']}  (have sediment file)")
+            print(f"    Q+SSC stations         : {audit['q_ssc_stations']}  (have both discharge & sediment files)")
+            print(f"    SSC-only stations      : {audit['ssc_only_stations']}  (sediment file only, no discharge)")
+            print(f"  Final stations (output)  : {audit['final_stations']}  (SSC or SSL eligible)")
+            print(f"  ---")
+            print(f"  SSC source records       : {audit['ssc_source_total']}  (raw from sediment files)")
+            print(f"  Paired records (Q&SSC)   : {audit['paired_total']}  (both Q and SSC present)")
+            print(f"  Retained records         : {audit['retained_total']}  (after QC, all flags)")
+            print("=" * 60)
 
             print("\n" + "="*60)
             print(f"Summary: {processed} processed, {skipped} skipped, {errors} errors")

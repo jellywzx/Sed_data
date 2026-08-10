@@ -428,28 +428,73 @@ def parse_date_flexible(date_str):
 
 
 
-def trim_to_valid_data(df, date_col='date'):
+def trim_to_valid_data(df, date_col='date', _audit=False):
     """
-    Trim dataframe to period with valid data
-    Keeps data from first valid Q or SSL value to last valid value
+    Trim dataframe to period with valid sediment data (SSC or SSL).
+
+    Sediment-oriented rule (manuscript): temporal coverage is defined by
+    SSC OR SSL, never by Q alone.  Q-only observations may exist as
+    source-level auxiliary Q but do not determine station entry or
+    temporal extent.
     """
-    # Find valid data (not NaN and not missing)
-    valid_q = df['Q'].notna() & (df['Q'] != FILL_VALUE)
+    # --- sediment eligibility (SSC | SSL) ---
+    valid_ssc = df['SSC'].notna() & (df['SSC'] != FILL_VALUE)
     valid_ssl = df['SSL'].notna() & (df['SSL'] != FILL_VALUE)
-    valid_data = valid_q | valid_ssl
+    valid_sediment = valid_ssc | valid_ssl
 
-    if not valid_data.any():
-        return None  # No valid data
+    if not valid_sediment.any():
+        if _audit:
+            return None, _classify_records(df)
+        return None  # No valid sediment data -> skip station
 
-    # Find first and last valid indices
-    valid_indices = valid_data[valid_data].index
+    # Find first and last valid sediment indices
+    valid_indices = valid_sediment[valid_sediment].index
     first_valid = valid_indices[0]
     last_valid = valid_indices[-1]
 
     # Trim to valid range
     df_trimmed = df.loc[first_valid:last_valid].copy()
 
+    if _audit:
+        return df_trimmed, _classify_records(df), _classify_records(df_trimmed)
     return df_trimmed
+
+def _classify_records(df):
+    """Classify records by variable availability. Returns dict of counts."""
+    valid_q = df['Q'].notna() & (df['Q'] != FILL_VALUE)
+    valid_ssc = df['SSC'].notna() & (df['SSC'] != FILL_VALUE)
+    valid_ssl = df['SSL'].notna() & (df['SSL'] != FILL_VALUE)
+
+    return {
+        'n_total': len(df),
+        'n_ssc_only': int((valid_ssc & ~valid_q & ~valid_ssl).sum()),
+        'n_ssl_only': int((valid_ssl & ~valid_q & ~valid_ssc).sum()),
+        'n_q_only':   int((valid_q & ~valid_ssc & ~valid_ssl).sum()),
+        'n_paired':   int((valid_q & (valid_ssc | valid_ssl)).sum()),
+        'n_any_sediment': int((valid_ssc | valid_ssl).sum()),
+        'n_any_q':    int(valid_q.sum()),
+    }
+
+
+def _print_audit(station_id, before, after):
+    """Print per-station audit: records by category before/after trimming."""
+    labels = [
+        ('total',       'n_total'),
+        ('SSC-only',    'n_ssc_only'),
+        ('SSL-only',    'n_ssl_only'),
+        ('Q-only',      'n_q_only'),
+        ('paired',      'n_paired'),
+        ('any_sediment','n_any_sediment'),
+        ('any_Q',       'n_any_q'),
+    ]
+    print(f"  AUDIT station {station_id}:")
+    for label, key in labels:
+        b = before[key]
+        a = after[key]
+        delta = a - b
+        delta_str = f"{delta:+d}" if delta != 0 else "  ±"  # +/- or unchanged mark
+        print(f"    {label:>14s}: {b:>6d} -> {a:>6d}  ({delta_str})")
+
 
 def _to_float_array(x):
     """Safe float array conversion; keeps NaN for missing, not FillValue."""
@@ -1022,11 +1067,19 @@ def process_station(station_id, country):
         print(f"  Skipping: No data available")
         return None
 
+    # Audit: classify records before trimming
+    audit_before = _classify_records(df)
+
     # Trim to valid data range
     df = trim_to_valid_data(df)
     if df is None or len(df) == 0:
-        print(f"  Skipping: No valid data after trimming")
+        print(f"  Skipping: No valid sediment data after trimming")
+        _print_audit(station_id, audit_before, {'n_total':0,'n_ssc_only':0,'n_ssl_only':0,'n_q_only':0,'n_paired':0,'n_any_sediment':0,'n_any_q':0})
         return None
+
+    # Audit: classify records after trimming
+    audit_after = _classify_records(df)
+    _print_audit(station_id, audit_before, audit_after)
 
     # ------------------------------------------
     # QC using tool.py
