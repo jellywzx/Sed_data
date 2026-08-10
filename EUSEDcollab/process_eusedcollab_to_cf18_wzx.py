@@ -53,6 +53,7 @@ from code.qc import (
 )
 from code.runtime import resolve_output_root, resolve_source_root
 from code.units import convert_ssl_units_if_needed
+from code.daily_aggregation import aggregate_daily
 
 
 # =============================================================================
@@ -1100,9 +1101,58 @@ def process_station(station_id, country):
         )
 
 
+    # =====================================================================
+    # Daily aggregation: collapse sub-daily observations to one record/day
+    # =====================================================================
+    epoch = datetime(1970, 1, 1)
+    time_seconds = np.array([(d - epoch).total_seconds() for d in df['date']], dtype=np.float64)
+
+    agg = aggregate_daily(
+        time_seconds=time_seconds,
+        Q=pd.to_numeric(df['Q'], errors='coerce').to_numpy(dtype=float),
+        SSC=pd.to_numeric(df['SSC'], errors='coerce').to_numpy(dtype=float),
+        SSL=pd.to_numeric(df['SSL'], errors='coerce').to_numpy(dtype=float),
+        Q_flag=q_flag,
+        SSC_flag=ssc_flag,
+        SSL_flag=ssl_flag,
+        Q_derived_mask=df.get('Q_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+        SSC_derived_mask=df.get('SSC_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+        SSL_derived_mask=df.get('SSL_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+    )
+
+    n_before = len(df)
+    df = pd.DataFrame({
+        'date': [epoch + pd.Timedelta(seconds=float(t)) for t in agg['time']],
+        'Q': agg['Q'],
+        'SSC': agg['SSC'],
+        'SSL': agg['SSL'],
+        'Q_derived': agg['Q_derived_mask'],
+        'SSC_derived': agg['SSC_derived_mask'],
+        'SSL_derived': agg['SSL_derived_mask'],
+    })
+    q_flag = agg['Q_flag']
+    ssc_flag = agg['SSC_flag']
+    ssl_flag = agg['SSL_flag']
+
+    # Recalculate completeness on aggregated data
+    q_completeness = calculate_data_completeness_from_flag(q_flag)
+    ssc_completeness = calculate_data_completeness_from_flag(ssc_flag)
+    ssl_completeness = calculate_data_completeness_from_flag(ssl_flag)
+
+    # Update date range
+    start_date = df['date'].min()
+    end_date = df['date'].max()
+
+    print(f"  Daily aggregation: {n_before} raw records -> {len(df)} daily records")
+    print(f"  Aggregated date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(f"  Aggregated Q completeness: {q_completeness:.1f}%")
+    print(f"  Aggregated SSC completeness: {ssc_completeness:.1f}%")
+    print(f"  Aggregated SSL completeness: {ssl_completeness:.1f}%")
+
+
     # Create NetCDF file
     output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
-    write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=df)
+    write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=None)
     # ---- Print QC result summary (station-level) ----
     def _repr_val_and_flag(val_arr, flag_arr):
         v = np.asarray(val_arr, dtype=float)
