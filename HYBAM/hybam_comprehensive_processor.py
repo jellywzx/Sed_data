@@ -570,6 +570,25 @@ class HYBAMProcessor:
 
         n_times = len(time_days)
 
+        # ---- Defensive: verify ALL time-dependent arrays have the same length ----
+        _time_vars = {}
+        for _vname in ["discharge", "ssc", "SSL",
+                       "Q_flag", "SSC_flag", "SSL_flag",
+                       "Q_flag_qc1_physical", "SSC_flag_qc1_physical",
+                       "SSL_flag_qc1_physical",
+                       "Q_flag_qc2_log_iqr", "SSC_flag_qc2_log_iqr",
+                       "SSL_flag_qc2_log_iqr",
+                       "SSC_flag_qc3_ssc_q", "SSL_flag_qc3_from_ssc_q"]:
+            _arr = data_dict.get(_vname)
+            if _arr is not None:
+                _arr = np.asarray(_arr)
+                if _arr.ndim >= 1 and _arr.shape[0] != n_times:
+                    raise ValueError(
+                        f"HYBAM dimension mismatch before NetCDF export: "
+                        f"time has {n_times} records but '{_vname}' has "
+                        f"{_arr.shape[0]} records"
+                    )
+
         # Prepare fill value (from tool.py)
         fill_value = FILL_VALUE_FLOAT
 
@@ -921,6 +940,25 @@ class HYBAMProcessor:
         data["Q_flag"] = agg["Q_flag"]
         data["SSC_flag"] = agg["SSC_flag"]
         data["SSL_flag"] = agg["SSL_flag"]
+
+        # ---- Truncate step flags to post-aggregation size ----
+        # After daily aggregation, the main arrays (time, Q, SSC, SSL, flags)
+        # shrink.  The step/provenance flags computed in apply_qc_checks
+        # (e.g. Q_flag_qc1_physical) must be shortened to the same length,
+        # otherwise writing them to a ('time',) UNLIMITED variable in
+        # write_cf18_netcdf would force the time dimension to grow, causing
+        # NC_FILL_DOUBLE padding in the time coordinate.
+        n_agg = len(data["time"])
+        _step_flag_keys = [
+            "Q_flag_qc1_physical", "SSC_flag_qc1_physical", "SSL_flag_qc1_physical",
+            "Q_flag_qc2_log_iqr", "SSC_flag_qc2_log_iqr", "SSL_flag_qc2_log_iqr",
+            "SSC_flag_qc3_ssc_q", "SSL_flag_qc3_from_ssc_q",
+        ]
+        for _k in _step_flag_keys:
+            if _k in data and data[_k] is not None:
+                _v = np.asarray(data[_k])
+                if _v.shape[0] > n_agg:
+                    data[_k] = _v[:n_agg]
 
         # ---- Validate time after daily aggregation ----
         if len(data["time"]) == 0:
