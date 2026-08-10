@@ -12,46 +12,41 @@ permissions:
 
 jobs:
   rewrite:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: fix/subdaily-daily-eused-hybam
-          fetch-depth: 0
+      - name: Checkout branch without external actions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=20 origin fix/subdaily-daily-eused-hybam
+          git checkout -B fix/subdaily-daily-eused-hybam FETCH_HEAD
 
       - name: Rewrite original processors in place
         shell: bash
         run: |
           cp EUSEDcollab/process_eusedcollab_to_cf18_wzx_impl.py EUSEDcollab/process_eusedcollab_to_cf18_wzx.py
           cp HYBAM/hybam_comprehensive_processor_impl.py HYBAM/hybam_comprehensive_processor.py
-
           python - <<'PY'
           from pathlib import Path
 
-          # ------------------------------------------------------------------
-          # EUSEDcollab: retain the original script and insert daily aggregation
-          # directly into read_station_data().
-          # ------------------------------------------------------------------
           eused_path = Path('EUSEDcollab/process_eusedcollab_to_cf18_wzx.py')
           text = eused_path.read_text(encoding='utf-8')
-
-          import_anchor = 'from code.units import convert_ssl_units_if_needed\n'
-          import_line = 'from code.daily_aggregation import aggregate_eused_to_daily\n'
-          if import_line not in text:
-              if import_anchor not in text:
+          anchor = 'from code.units import convert_ssl_units_if_needed\n'
+          addition = 'from code.daily_aggregation import aggregate_eused_to_daily\n'
+          if addition not in text:
+              if anchor not in text:
                   raise RuntimeError('EUSED import anchor not found')
-              text = text.replace(import_anchor, import_anchor + import_line, 1)
+              text = text.replace(anchor, anchor + addition, 1)
 
-          return_anchor = "    df['Q_derived'] = q_derived\n    df['SSC_derived'] = ssc_derived\n    df['SSL_derived'] = ssl_derived\n    return df[['date', 'Q', 'SSC', 'SSL', 'Q_derived', 'SSC_derived', 'SSL_derived']]\n"
+          anchor = "    df['Q_derived'] = q_derived\n    df['SSC_derived'] = ssc_derived\n    df['SSL_derived'] = ssl_derived\n    return df[['date', 'Q', 'SSC', 'SSL', 'Q_derived', 'SSC_derived', 'SSL_derived']]\n"
           replacement = """    df['Q_derived'] = q_derived
     df['SSC_derived'] = ssc_derived
     df['SSL_derived'] = ssl_derived
 
     # Collapse sub-daily/duplicate same-day rows to one daily record before QC.
-    # Q and SSC use arithmetic daily means. When both daily values are present,
-    # daily SSL is recalculated from daily Q and SSC; sediment-only days retain
-    # the mean available SSL so the SSC|SSL eligibility rule is preserved.
     day_counts = pd.to_datetime(df['date'], errors='coerce').dt.floor('D').value_counts()
     n_problem_days = int((day_counts > 1).sum())
     n_rows_before_daily = len(df)
@@ -64,41 +59,24 @@ jobs:
 
     return df[['date', 'Q', 'SSC', 'SSL', 'Q_derived', 'SSC_derived', 'SSL_derived']]
 """
-          if return_anchor not in text:
-              raise RuntimeError('EUSED read_station_data return anchor not found')
-          text = text.replace(return_anchor, replacement, 1)
+          if anchor not in text:
+              raise RuntimeError('EUSED daily anchor not found')
+          text = text.replace(anchor, replacement, 1)
           eused_path.write_text(text, encoding='utf-8')
 
-          # ------------------------------------------------------------------
-          # HYBAM: retain the original script and replace only merge_discharge_ssc
-          # so raw Q and SSC are independently aggregated to UTC-day means before
-          # alignment and downstream QC/SSL calculation.
-          # ------------------------------------------------------------------
           hybam_path = Path('HYBAM/hybam_comprehensive_processor.py')
           text = hybam_path.read_text(encoding='utf-8')
-
-          import_anchor = "from code.constants import (\n    FILL_VALUE_FLOAT,\n    FILL_VALUE_INT,\n)\n"
-          import_line = "from code.daily_aggregation import aggregate_unix_series_to_daily, align_daily_series\n"
-          if import_line not in text:
-              if import_anchor not in text:
+          anchor = "from code.constants import (\n    FILL_VALUE_FLOAT,\n    FILL_VALUE_INT,\n)\n"
+          addition = "from code.daily_aggregation import aggregate_unix_series_to_daily, align_daily_series\n"
+          if addition not in text:
+              if anchor not in text:
                   raise RuntimeError('HYBAM import anchor not found')
-              text = text.replace(import_anchor, import_anchor + import_line, 1)
+              text = text.replace(anchor, anchor + addition, 1)
 
           start = text.index('    def merge_discharge_ssc(self, discharge_file, ssc_file):\n')
           end = text.index('    def apply_qc_checks(self, data_dict):\n', start)
-
-          new_method = '''    def merge_discharge_ssc(self, discharge_file, ssc_file):
-        """Aggregate raw Q and SSC independently to UTC-day means, then align them.
-
-        The former nearest-SSC-to-every-Q-timestamp mapping could duplicate one
-        SSC observation across several sub-daily Q timestamps. This method first
-        computes arithmetic daily means for each raw source independently, then
-        aligns the unique daily dates. When both sources exist, the legacy
-        overlapping-period requirement is retained, but overlap is evaluated on
-        UTC calendar days and the daily axis is the union of Q and SSC days
-        inside that common period. Downstream apply_qc_checks() recalculates SSL
-        from the resulting daily Q and SSC values.
-        """
+          method = '''    def merge_discharge_ssc(self, discharge_file, ssc_file):
+        """Aggregate raw Q and SSC independently to UTC-day means, then align them."""
         result = {
             'time': None,
             'discharge': None,
@@ -127,9 +105,7 @@ jobs:
             result['discharge_origin'] = q_origin
             result['discharge_quality'] = q_quality
             q_daily_t, q_daily_v = aggregate_unix_series_to_daily(
-                q_raw_t,
-                q_raw_v,
-                fill_values=(q_fill, FILL_VALUE_FLOAT),
+                q_raw_t, q_raw_v, fill_values=(q_fill, FILL_VALUE_FLOAT)
             )
 
         if ssc_file:
@@ -139,9 +115,7 @@ jobs:
             result['ssc_origin'] = s_origin
             result['ssc_quality'] = s_quality
             s_daily_t, s_daily_v = aggregate_unix_series_to_daily(
-                s_raw_t,
-                s_raw_v,
-                fill_values=(s_fill, FILL_VALUE_FLOAT),
+                s_raw_t, s_raw_v, fill_values=(s_fill, FILL_VALUE_FLOAT)
             )
 
         if q_raw_t is not None and s_raw_t is not None:
@@ -187,12 +161,10 @@ jobs:
 
         before_q = 0 if q_raw_t is None else int(np.size(q_raw_t))
         before_s = 0 if s_raw_t is None else int(np.size(s_raw_t))
-        after_q = int(q_daily_t.size)
-        after_s = int(s_daily_t.size)
-        if before_q > after_q or before_s > after_s:
+        if before_q > q_daily_t.size or before_s > s_daily_t.size:
             print(
                 '    Daily aggregation: Q {0}->{1} rows; SSC {2}->{3} rows.'.format(
-                    before_q, after_q, before_s, after_s
+                    before_q, int(q_daily_t.size), before_s, int(s_daily_t.size)
                 )
             )
 
@@ -200,7 +172,7 @@ jobs:
 
 
 '''
-          text = text[:start] + new_method + text[end:]
+          text = text[:start] + method + text[end:]
           hybam_path.write_text(text, encoding='utf-8')
           PY
 
@@ -208,16 +180,11 @@ jobs:
           rm HYBAM/hybam_comprehensive_processor_impl.py
           rm .github/workflows/cleanup_subdaily_pr.yml
 
-      - name: Validate syntax and aggregation tests
+      - name: Validate and push
         shell: bash
         run: |
           python -m py_compile EUSEDcollab/process_eusedcollab_to_cf18_wzx.py HYBAM/hybam_comprehensive_processor.py code/daily_aggregation.py
-          python -m pip install --quiet numpy pandas pytest
           python -m pytest -q test/test_daily_subdaily_aggregation.py
-
-      - name: Commit cleaned PR
-        shell: bash
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
