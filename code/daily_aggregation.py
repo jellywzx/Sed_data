@@ -1,8 +1,8 @@
 """Utilities for collapsing sub-daily observations to one record per UTC/calendar day.
 
-These helpers are intentionally small and source-agnostic. They are used by
-EUSEDcollab and HYBAM so the source-level products entering the daily workflow
-cannot contain multiple timestamps for the same day.
+The two-stage aggregation used here first collapses exact duplicate timestamps
+and only then computes a daily mean. This prevents duplicated rows at one
+instant from receiving more weight than other genuine within-day observations.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ def _as_float(values, fill_values=()):
 def aggregate_eused_to_daily(df, *, fill_value=-9999.0, factor=0.0864):
     """Collapse EUSEDcollab rows to one record per calendar day.
 
-    Q and SSC are arithmetic daily means of all available within-day values.
-    When both daily Q and daily SSC are available, daily SSL is recalculated as
-    ``Q * SSC * factor`` rather than averaging sub-daily SSL. If a day lacks Q
-    or SSC but contains source/previously-derived SSL, its daily SSL falls back
-    to the arithmetic mean of those available SSL values so sediment-only days
-    are not discarded.
+    Exact duplicate timestamps are averaged first. The resulting unique
+    timestamps are then averaged by calendar day for Q and SSC. When both daily
+    Q and SSC are available, daily SSL is recalculated as ``Q * SSC * factor``.
+    If a day lacks Q or SSC but contains source/previously-derived SSL, daily
+    SSL falls back to the arithmetic mean of available SSL values so
+    sediment-only days are retained.
 
     Derived masks are propagated conservatively with ``any``; recalculated SSL
     is always marked derived.
@@ -39,7 +39,7 @@ def aggregate_eused_to_daily(df, *, fill_value=-9999.0, factor=0.0864):
         return df
 
     out = df.copy()
-    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.floor("D")
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out = out[out["date"].notna()].copy()
     if out.empty:
         return out
@@ -54,11 +54,34 @@ def aggregate_eused_to_daily(df, *, fill_value=-9999.0, factor=0.0864):
             out[mask_col] = False
         out[mask_col] = out[mask_col].fillna(False).astype(bool)
 
-    grouped = out.groupby("date", sort=True, as_index=False)
-    daily = grouped[["Q", "SSC", "SSL"]].mean(numeric_only=True)
+    # Stage 1: exact-timestamp duplicates should count as one sampling instant.
+    exact_values = (
+        out.groupby("date", sort=True, as_index=False)[["Q", "SSC", "SSL"]]
+        .mean(numeric_only=True)
+    )
+    exact_masks = (
+        out.groupby("date", sort=True, as_index=False)[
+            ["Q_derived", "SSC_derived", "SSL_derived"]
+        ]
+        .any()
+    )
+    exact = exact_values.merge(exact_masks, on="date", how="left", validate="1:1")
+    exact["day"] = exact["date"].dt.floor("D")
 
-    mask_daily = grouped[["Q_derived", "SSC_derived", "SSL_derived"]].any()
-    daily = daily.merge(mask_daily, on="date", how="left", validate="1:1")
+    # Stage 2: arithmetic daily means over unique sampling instants.
+    daily_values = (
+        exact.groupby("day", sort=True, as_index=False)[["Q", "SSC", "SSL"]]
+        .mean(numeric_only=True)
+        .rename(columns={"day": "date"})
+    )
+    daily_masks = (
+        exact.groupby("day", sort=True, as_index=False)[
+            ["Q_derived", "SSC_derived", "SSL_derived"]
+        ]
+        .any()
+        .rename(columns={"day": "date"})
+    )
+    daily = daily_values.merge(daily_masks, on="date", how="left", validate="1:1")
 
     paired = np.isfinite(daily["Q"].to_numpy(dtype=float)) & np.isfinite(
         daily["SSC"].to_numpy(dtype=float)
@@ -79,14 +102,8 @@ def aggregate_eused_to_daily(df, *, fill_value=-9999.0, factor=0.0864):
 def aggregate_unix_series_to_daily(time_seconds, values, *, fill_values=()):
     """Return unique UTC-day timestamps and arithmetic daily means.
 
-    Parameters
-    ----------
-    time_seconds : array-like
-        Unix timestamps in seconds.
-    values : array-like
-        Observation values aligned with ``time_seconds``.
-    fill_values : iterable
-        Numeric fill values to treat as missing.
+    Exact duplicate Unix timestamps are averaged first, then unique sampling
+    instants are averaged within UTC calendar days.
     """
     if time_seconds is None or values is None:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
@@ -104,8 +121,9 @@ def aggregate_unix_series_to_daily(time_seconds, values, *, fill_values=()):
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
     frame = pd.DataFrame({"time": t[valid_time], "value": v[valid_time]})
-    frame["day"] = np.floor(frame["time"] / 86400.0) * 86400.0
-    daily = frame.groupby("day", sort=True, as_index=False)["value"].mean()
+    exact = frame.groupby("time", sort=True, as_index=False)["value"].mean()
+    exact["day"] = np.floor(exact["time"] / 86400.0) * 86400.0
+    daily = exact.groupby("day", sort=True, as_index=False)["value"].mean()
     return daily["day"].to_numpy(dtype=float), daily["value"].to_numpy(dtype=float)
 
 
