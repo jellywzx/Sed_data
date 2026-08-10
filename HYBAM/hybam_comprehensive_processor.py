@@ -132,6 +132,46 @@ class HYBAMProcessor:
         arr = np.asarray(values, dtype=float)
         return np.where(np.isfinite(arr), arr, fill_value)
 
+    @staticmethod
+    def _validate_time_mask(time_seconds, context=""):
+        """Create a boolean mask of valid (finite, not a fill sentinel) timestamps.
+
+        Invalid timestamps include:
+        - masked / NaN
+        - +/-Inf
+        - netCDF default fill values such as 9.969209968386869e+36
+          (abs(time) >= 1e30)
+
+        Returns:
+            tuple: (valid_mask, n_invalid, time_float64)
+        """
+        time_float = np.asarray(np.ma.filled(time_seconds, np.nan), dtype=np.float64)
+        valid = (
+            np.isfinite(time_float)
+            & (np.abs(time_float) < 1e30)
+        )
+        n_invalid = int((~valid).sum())
+        if n_invalid > 0 and context:
+            print(f"    \u26a0 {context}: {n_invalid} invalid time records filtered")
+        return valid, n_invalid, time_float
+
+    @staticmethod
+    def _ensure_time_finite(time_seconds, context=""):
+        """Defensive check: raise ValueError if any time is non-finite or a
+        netCDF fill sentinel.  Returns validated float64 array on success."""
+        time_float = np.asarray(np.ma.filled(time_seconds, np.nan), dtype=np.float64)
+        invalid = (
+            ~np.isfinite(time_float)
+            | (np.abs(time_float) >= 1e30)
+        )
+        if np.any(invalid):
+            bad_idx = np.where(invalid)[0]
+            raise ValueError(
+                f"HYBAM {context}: invalid time values detected before export: "
+                f"{len(bad_idx)} invalid records; sample indices={bad_idx[:10].tolist()}"
+            )
+        return time_float
+
     def find_station_dirs(self):
         """Find all station directories in source."""
         return sorted([d for d in self.source_dir.iterdir() if d.is_dir() and '-' in d.name])
@@ -200,13 +240,32 @@ class HYBAMProcessor:
     def read_nc_data(self, nc_file):
         """Read time and data from NC file.
 
+        Invalid time records (masked, NaN, Inf, netCDF default fill
+        values >= 1e30) are removed at read time.  All arrays returned
+        (time, data, origine, qualite) share the same valid-time mask,
+        so they remain one-to-one aligned.
+
         Returns:
             tuple: (time_seconds, data_values, data_varname, fill_value, origine, qualite)
+                   All None if no valid time records exist in the file.
         """
         with nc.Dataset(nc_file, 'r') as ds:
-            # Read time (unix seconds)
+            # ---- Read time and validate immediately ----
             time_var = ds.variables['Date']
-            time_seconds = self._to_float_array(time_var[:])
+            raw_time = time_var[:]
+            valid_time, n_invalid, time_float = self._validate_time_mask(
+                raw_time, context=f"{nc_file.name}"
+            )
+
+            if not valid_time.any():
+                print(f"    \u26a0 All {len(raw_time)} time records are invalid in {nc_file.name}, skipping file")
+                return None, None, None, None, None, None
+
+            # Apply the valid-time mask to time
+            if n_invalid > 0:
+                time_seconds = time_float[valid_time]
+            else:
+                time_seconds = time_float
 
             # Find data variable (skip metadata variables)
             data_varname = None
@@ -218,13 +277,44 @@ class HYBAMProcessor:
             if not data_varname:
                 return None, None, None, None, None, None
 
-            # Read data values
+            # Read data values and filter with the same time mask
             fill_value = getattr(ds.variables[data_varname], '_FillValue', FILL_VALUE_FLOAT)
-            data_values = self._to_float_array(ds.variables[data_varname][:], fill_value)
+            raw_data = ds.variables[data_varname][:]
+            data_values_raw = self._to_float_array(raw_data, fill_value)
+            if n_invalid > 0:
+                data_values = data_values_raw[valid_time]
+            else:
+                data_values = data_values_raw
 
-            # Read quality information
-            origine = ds.variables.get('_Origine', [None] * len(time_seconds))[:]
-            qualite = ds.variables.get('_Qualité', [None] * len(time_seconds))[:]
+            # Read quality information and filter with the same time mask
+            origine_raw = None
+            qualite_raw = None
+            if '_Origine' in ds.variables:
+                origine_raw = ds.variables['_Origine'][:]
+            if '_Qualité' in ds.variables:
+                qualite_raw = ds.variables['_Qualité'][:]
+
+            if n_invalid > 0:
+                if origine_raw is not None:
+                    if np.ma.isMaskedArray(origine_raw):
+                        origine_raw = np.ma.filled(origine_raw, fill_value=0)
+                    origine = np.asarray(origine_raw)[valid_time]
+                else:
+                    origine = None
+
+                if qualite_raw is not None:
+                    if np.ma.isMaskedArray(qualite_raw):
+                        qualite_raw = np.ma.filled(qualite_raw, fill_value=0)
+                    qualite = np.asarray(qualite_raw)[valid_time]
+                else:
+                    qualite = None
+            else:
+                origine = np.asarray(origine_raw) if origine_raw is not None else None
+                qualite = np.asarray(qualite_raw) if qualite_raw is not None else None
+
+            if n_invalid > 0:
+                print(f"    \u2713 {nc_file.name}: kept {len(time_seconds)}/{len(raw_time)} records "
+                      f"after removing {n_invalid} invalid time records")
 
             return time_seconds, data_values, data_varname, fill_value, origine, qualite
 
@@ -276,6 +366,16 @@ class HYBAMProcessor:
             result['ssc_raw'] = ssc_data
             result['ssc_fill'] = ssc_fill
 
+        # ---- Defensive check: ensure both time axes are clean before union ----
+        if discharge_time is not None:
+            discharge_time = self._ensure_time_finite(
+                discharge_time, context="discharge time before union"
+            )
+        if ssc_time is not None:
+            ssc_time = self._ensure_time_finite(
+                ssc_time, context="SSC time before union"
+            )
+
         # Build union time axis: sorted unique timestamps from both series.
         # Q and SSC values are placed only at their native timestamps.
         # No nearest-neighbor matching, no +/-1 day tolerance.
@@ -310,10 +410,16 @@ class HYBAMProcessor:
             result['time'] = ssc_time
             result['ssc'] = ssc_data
 
-        # Set time coverage
+        # Set time coverage (only if time is valid and non-empty)
         if result['time'] is not None and len(result['time']) > 0:
-            result['time_coverage_start'] = datetime.utcfromtimestamp(result['time'][0]).strftime('%Y-%m-%d')
-            result['time_coverage_end'] = datetime.utcfromtimestamp(result['time'][-1]).strftime('%Y-%m-%d')
+            t0 = float(result['time'][0])
+            t1 = float(result['time'][-1])
+            if np.isfinite(t0) and np.isfinite(t1):
+                result['time_coverage_start'] = datetime.utcfromtimestamp(t0).strftime('%Y-%m-%d')
+                result['time_coverage_end'] = datetime.utcfromtimestamp(t1).strftime('%Y-%m-%d')
+            else:
+                print(f"    \u26a0 merge_discharge_ssc: non-finite time endpoints after merge, "
+                      f"time_coverage will be empty")
 
         return result
     def apply_qc_checks(self, data_dict):
@@ -446,8 +552,22 @@ class HYBAMProcessor:
         - Quality flag variables with flag_values and flag_meanings
         """
 
+        # =====================================================================
+        # DEFENSIVE CHECK: time must be ALL finite and valid before export.
+        # NaN or netCDF fill sentinels (>= 1e30) in time are NEVER acceptable
+        # in the final product.  We raise here instead of masking so the
+        # upstream data-cleaning steps are forced to deal with the problem.
+        # =====================================================================
+        time_seconds_clean = self._ensure_time_finite(
+            data_dict['time'], context="final product before NetCDF export"
+        )
+
         # Prepare data
-        time_days = data_dict['time'] / 86400.0
+        time_days = time_seconds_clean / 86400.0
+
+        if not np.all(np.isfinite(time_days)):
+            raise ValueError("Non-finite HYBAM time values after conversion to days.")
+
         n_times = len(time_days)
 
         # Prepare fill value (from tool.py)
@@ -802,15 +922,31 @@ class HYBAMProcessor:
         data["SSC_flag"] = agg["SSC_flag"]
         data["SSL_flag"] = agg["SSL_flag"]
 
-        # Update time coverage after aggregation
-        if len(data["time"]) > 0:
-            data["time_coverage_start"] = datetime.utcfromtimestamp(data["time"][0]).strftime('%Y-%m-%d')
-            data["time_coverage_end"] = datetime.utcfromtimestamp(data["time"][-1]).strftime('%Y-%m-%d')
-
-        print(f"    Daily aggregation: {n_before} raw records -> {len(data['time'])} daily records")
-        if data.get("time") is None or len(data["time"]) == 0:
+        # ---- Validate time after daily aggregation ----
+        if len(data["time"]) == 0:
             print("    \u2717 No data after daily aggregation")
             return False
+
+        try:
+            _ = self._ensure_time_finite(
+                data["time"], context=f"daily aggregation for {station_id}"
+            )
+        except ValueError as e:
+            print(f"    \u2717 Invalid time after daily aggregation: {e}")
+            return False
+
+        # Update time coverage after aggregation
+        if len(data["time"]) > 0:
+            t0 = float(data["time"][0])
+            t1 = float(data["time"][-1])
+            if np.isfinite(t0) and np.isfinite(t1):
+                data["time_coverage_start"] = datetime.utcfromtimestamp(t0).strftime('%Y-%m-%d')
+                data["time_coverage_end"] = datetime.utcfromtimestamp(t1).strftime('%Y-%m-%d')
+            else:
+                print(f"    \u26a0 Non-finite time endpoints after daily aggregation for {station_id}")
+                return False
+
+        print(f"    Daily aggregation: {n_before} raw records -> {len(data['time'])} daily records")
 
         latitude = FILL_VALUE_FLOAT
         longitude = FILL_VALUE_FLOAT
