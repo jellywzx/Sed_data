@@ -67,6 +67,7 @@ from code.runtime import resolve_output_root, resolve_source_root
 from code.units import (
     convert_ssl_units_if_needed,
 )
+from code.daily_aggregation import aggregate_daily
 
 STATION_INFO = {
     "4071002205": {"lon": -63.40258, "lat": -18.90892, "alt": 430, "country": "Bolivia", "continent_region": "South America", "iso_a3": "BOL"},
@@ -228,7 +229,12 @@ class HYBAMProcessor:
             return time_seconds, data_values, data_varname, fill_value, origine, qualite
 
     def merge_discharge_ssc(self, discharge_file, ssc_file):
-        """Merge discharge and SSC data on common time axis.
+        """Merge discharge and SSC data on a union time axis.
+
+        Builds a sorted union of Q and SSC timestamps. Each variable exists
+        only at its own native timestamps (NaN elsewhere). No nearest-neighbor
+        matching or +/-1 day tolerance is applied -- daily aggregation handles
+        temporal alignment downstream.
 
         Returns:
             dict: Merged data with time, discharge, ssc, and related metadata
@@ -250,7 +256,13 @@ class HYBAMProcessor:
         }
 
         discharge_time = None
+        discharge_data = None
+        discharge_origin = None
+        discharge_quality = None
         ssc_time = None
+        ssc_data = None
+        ssc_origin = None
+        ssc_quality = None
 
         if discharge_file:
             discharge_time, discharge_data, _, discharge_fill, discharge_origin, discharge_quality = \
@@ -264,33 +276,31 @@ class HYBAMProcessor:
             result['ssc_raw'] = ssc_data
             result['ssc_fill'] = ssc_fill
 
-        # Determine time axis: use intersection or single source
+        # Build union time axis: sorted unique timestamps from both series.
+        # Q and SSC values are placed only at their native timestamps.
+        # No nearest-neighbor matching, no +/-1 day tolerance.
         if discharge_time is not None and ssc_time is not None:
-            # Find overlapping time range
-            q_start_idx = np.where(discharge_time >= np.min(ssc_time))[0]
-            q_end_idx = np.where(discharge_time <= np.max(ssc_time))[0]
+            all_times = np.unique(np.concatenate([discharge_time, ssc_time]))
+            n = len(all_times)
 
-            if len(q_start_idx) > 0 and len(q_end_idx) > 0:
-                q_start = q_start_idx[0]
-                q_end = q_end_idx[-1]
+            # Q: map to union axis via searchsorted
+            q_mapped = np.full(n, np.nan, dtype='f4')
+            q_idx = np.searchsorted(all_times, discharge_time)
+            for j, qi in enumerate(q_idx):
+                if qi < n:
+                    q_mapped[qi] = discharge_data[j]
 
-                # Use discharge time as base
-                result['time'] = discharge_time[q_start:q_end+1]
-                result['discharge'] = discharge_data[q_start:q_end+1]
-                result['discharge_origin'] = discharge_origin[q_start:q_end+1] if discharge_origin is not None else None
-                result['discharge_quality'] = discharge_quality[q_start:q_end+1] if discharge_quality is not None else None
+            # SSC: map to union axis via searchsorted
+            ssc_mapped = np.full(n, np.nan, dtype='f4')
+            ssc_idx = np.searchsorted(all_times, ssc_time)
+            for j, si in enumerate(ssc_idx):
+                if si < n:
+                    ssc_mapped[si] = ssc_data[j]
 
-                # Map SSC to discharge time axis
-                ssc_mapped = np.full(len(result['time']), np.nan, dtype='f4')
-                for i, q_time in enumerate(result['time']):
-                    # Find closest SSC time
-                    idx = np.argmin(np.abs(ssc_time - q_time))
-                    if np.abs(ssc_time[idx] - q_time) < 86400:  # Within 1 day
-                        ssc_mapped[i] = ssc_data[idx]
+            result['time'] = all_times
+            result['discharge'] = q_mapped
+            result['ssc'] = ssc_mapped
 
-                result['ssc'] = ssc_mapped
-                result['q_start'] = q_start
-                result['q_end'] = q_end
         elif discharge_time is not None:
             result['time'] = discharge_time
             result['discharge'] = discharge_data
@@ -306,7 +316,6 @@ class HYBAMProcessor:
             result['time_coverage_end'] = datetime.utcfromtimestamp(result['time'][-1]).strftime('%Y-%m-%d')
 
         return result
-
     def apply_qc_checks(self, data_dict):
         """
         Apply QC via tool.apply_hydro_qc_with_provenance (QC1/QC2/QC3 + provenance flags)
@@ -767,6 +776,42 @@ class HYBAMProcessor:
             return False
 
         # Get metadata from existing HYBAM file
+
+        # =====================================================================
+        # Daily aggregation: collapse sub-daily observations to one record/day
+        # =====================================================================
+        n_before = len(data["time"])
+        agg = aggregate_daily(
+            time_seconds=data["time"],
+            Q=data.get("discharge", np.full(n_before, np.nan)),
+            SSC=data.get("ssc", np.full(n_before, np.nan)),
+            SSL=data.get("SSL", np.full(n_before, np.nan)),
+            Q_flag=data["Q_flag"],
+            SSC_flag=data["SSC_flag"],
+            SSL_flag=data["SSL_flag"],
+            Q_derived_mask=None,
+            SSC_derived_mask=None,
+            SSL_derived_mask=None,
+        )
+
+        data["time"] = agg["time"]
+        data["discharge"] = agg["Q"]
+        data["ssc"] = agg["SSC"]
+        data["SSL"] = agg["SSL"]
+        data["Q_flag"] = agg["Q_flag"]
+        data["SSC_flag"] = agg["SSC_flag"]
+        data["SSL_flag"] = agg["SSL_flag"]
+
+        # Update time coverage after aggregation
+        if len(data["time"]) > 0:
+            data["time_coverage_start"] = datetime.utcfromtimestamp(data["time"][0]).strftime('%Y-%m-%d')
+            data["time_coverage_end"] = datetime.utcfromtimestamp(data["time"][-1]).strftime('%Y-%m-%d')
+
+        print(f"    Daily aggregation: {n_before} raw records -> {len(data['time'])} daily records")
+        if data.get("time") is None or len(data["time"]) == 0:
+            print("    \u2717 No data after daily aggregation")
+            return False
+
         latitude = FILL_VALUE_FLOAT
         longitude = FILL_VALUE_FLOAT
         altitude = FILL_VALUE_FLOAT
