@@ -372,11 +372,29 @@ def process_yajiang():
             pass  # Q already in m³/s
         elif 'discharge' in df:
             df['Q'] = df['discharge']
-        
+
+        # Yajiang intermediate NetCDF files store SSC in g/L. Convert to the
+        # project-standard mg/L before QC and before deriving SSL. Detect the
+        # source units explicitly so already-standardized files are not scaled
+        # a second time and unknown units cannot be silently mislabeled.
+        ssc_source_name = None
         if 'SSC' in df:
-            pass  # SSC already in g/L
+            ssc_source_name = 'SSC'
         elif 'ssc' in df:
             df['SSC'] = df['ssc']
+            ssc_source_name = 'ssc'
+
+        if ssc_source_name is not None:
+            ssc_units = str(ds[ssc_source_name].attrs.get('units', '')).strip().lower()
+            if ssc_units in {'g l-1', 'g/l', 'g l^-1', 'kg m-3', 'kg/m3', 'kg m^-3'}:
+                df['SSC'] = df['SSC'] * 1000.0
+                print(f"  Converted SSC from {ssc_units} to mg/L before QC.")
+            elif ssc_units in {'mg l-1', 'mg/l', 'mg l^-1'}:
+                pass
+            else:
+                raise ValueError(
+                    f"Unsupported or missing Yajiang SSC units for {nc_file.name}: {ssc_units!r}"
+                )
         
         if 'Q' in df and 'SSC' in df:
             df['SSL'] = df['Q'] * df['SSC'] * 0.0864
