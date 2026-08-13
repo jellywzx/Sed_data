@@ -930,7 +930,7 @@ class HYBAMProcessor:
             SSL_flag=data["SSL_flag"],
             Q_derived_mask=None,
             SSC_derived_mask=None,
-            SSL_derived_mask=None,
+            SSL_derived_mask=np.isfinite(np.asarray(data.get("SSL", np.full(n_before, np.nan)), dtype=float)),
         )
 
         data["time"] = agg["time"]

@@ -4,7 +4,7 @@ Daily aggregation helpers for harmonized sediment dataset processing.
 Provides functions to:
 1. Collapse duplicate timestamps (same exact time -> single observation)
 2. Aggregate sub-daily Q and SSC to daily means
-3. Re-derive daily SSL from daily Q and SSC
+3. Re-derive daily SSL from daily Q and SSC only when source SSL is absent
 
 These functions are designed to be called AFTER QC and BEFORE NetCDF output.
 They operate on numeric arrays (Q, SSC, SSL) with associated flag arrays,
@@ -116,10 +116,13 @@ def aggregate_daily(
     Processing steps:
     1. For each variable (Q, SSC, SSL), collapse duplicate timestamps.
     2. Group collapsed timestamps by calendar day (UTC).
-    3. Q_daily = arithmetic mean of valid Q in the day.
-    4. SSC_daily = arithmetic mean of valid SSC in the day.
-    5. SSL_daily = Q_daily * SSC_daily * ssl_factor (only when both exist).
-       Direct source SSL is retained for days without Q+SSC.
+    3. Q_daily = arithmetic mean of valid source Q in the day, or derived Q
+       only when no source Q is available.
+    4. SSC_daily = arithmetic mean of valid source SSC in the day, or derived
+       SSC only when no source SSC is available.
+    5. SSL_daily = valid source SSL when available. If no source SSL exists,
+       derive from daily Q and SSC when possible, otherwise aggregate derived
+       SSL records.
 
     Parameters
     ----------
@@ -169,82 +172,15 @@ def aggregate_daily(
 
     ts = np.asarray(time_seconds, dtype=np.float64)
 
-    # Step 1: Collapse duplicate timestamps per variable
-    ts_q, Q_c, Qf_c = collapse_duplicate_timestamps(ts, Q_raw, Qf, fill_value=fill_value)
-    ts_ssc, SSC_c, SSCf_c = collapse_duplicate_timestamps(ts, SSC_raw, SSCf, fill_value=fill_value)
-    ts_ssl, SSL_c, SSLf_c = collapse_duplicate_timestamps(ts, SSL_raw, SSLf, fill_value=fill_value)
-
-    # Step 2: Determine calendar days for each collapsed series
     def _calendar_dates(ts_arr):
         """Convert epoch seconds to UTC date strings (YYYY-MM-DD)."""
         result = np.empty(len(ts_arr), dtype='<U10')
         for i, t in enumerate(ts_arr):
-            result[i] = datetime.fromtimestamp(max(0, float(t)), tz=timezone.utc).strftime('%Y-%m-%d')
+            result[i] = datetime.fromtimestamp(float(t), tz=timezone.utc).strftime('%Y-%m-%d')
         return result
 
-    days_q = _calendar_dates(ts_q)
-    days_ssc = _calendar_dates(ts_ssc)
-    days_ssl = _calendar_dates(ts_ssl)
-
-    # Step 3: Aggregate Q by day
-    unique_q_days, q_day_idx = np.unique(days_q, return_inverse=True)
-    n_q_days = len(unique_q_days)
-    Q_daily = np.full(n_q_days, np.nan, dtype=float)
-    Q_flag_daily = np.full(n_q_days, np.int8(9), dtype=np.int8)
-
-    for i in range(n_q_days):
-        mask = q_day_idx == i
-        vals = Q_c[mask]
-        flags = Qf_c[mask]
-        valid = np.isfinite(vals) & (vals >= 0) & (flags != 9)
-        if valid.any():
-            Q_daily[i] = float(np.nanmean(vals[valid]))
-            Q_flag_daily[i] = _worst_flag(flags[valid])
-        else:
-            Q_daily[i] = np.nan
-            Q_flag_daily[i] = _worst_flag(flags)
-
-    q_daily_by_day = dict(zip(unique_q_days, zip(Q_daily, Q_flag_daily)))
-
-    # Step 4: Aggregate SSC by day
-    unique_ssc_days, ssc_day_idx = np.unique(days_ssc, return_inverse=True)
-    n_ssc_days = len(unique_ssc_days)
-    SSC_daily = np.full(n_ssc_days, np.nan, dtype=float)
-    SSC_flag_daily = np.full(n_ssc_days, np.int8(9), dtype=np.int8)
-
-    for i in range(n_ssc_days):
-        mask = ssc_day_idx == i
-        vals = SSC_c[mask]
-        flags = SSCf_c[mask]
-        valid = np.isfinite(vals) & (vals >= 0) & (flags != 9)
-        if valid.any():
-            SSC_daily[i] = float(np.nanmean(vals[valid]))
-            SSC_flag_daily[i] = _worst_flag(flags[valid])
-        else:
-            SSC_daily[i] = np.nan
-            SSC_flag_daily[i] = _worst_flag(flags)
-
-    ssc_daily_by_day = dict(zip(unique_ssc_days, zip(SSC_daily, SSC_flag_daily)))
-
-    # Step 5: Aggregate direct source SSL by day (preserved for SSC-only days)
-    unique_ssl_days, ssl_day_idx = np.unique(days_ssl, return_inverse=True)
-    n_ssl_days = len(unique_ssl_days)
-    SSL_source_daily = np.full(n_ssl_days, np.nan, dtype=float)
-    SSL_source_flag_daily = np.full(n_ssl_days, np.int8(9), dtype=np.int8)
-
-    for i in range(n_ssl_days):
-        mask = ssl_day_idx == i
-        vals = SSL_c[mask]
-        flags = SSLf_c[mask]
-        valid = np.isfinite(vals) & (vals >= 0) & (flags != 9)
-        if valid.any():
-            SSL_source_daily[i] = float(np.nanmean(vals[valid]))
-            SSL_source_flag_daily[i] = _worst_flag(flags[valid])
-
-    ssl_daily_by_day = dict(zip(unique_ssl_days, zip(SSL_source_daily, SSL_source_flag_daily)))
-
-    # Step 6: Build the unified daily timeline
-    all_days = sorted(set(unique_q_days) | set(unique_ssc_days) | set(unique_ssl_days))
+    days = _calendar_dates(ts)
+    all_days = sorted(set(days))
     n_out = len(all_days)
     if n_out == 0:
         n_out = 1
@@ -261,6 +197,45 @@ def aggregate_daily(
     out_SSC_der = np.zeros(n_out, dtype=bool)
     out_SSL_der = np.zeros(n_out, dtype=bool)
 
+    def _has_valid(vals, flags):
+        return np.isfinite(vals) & (vals >= 0) & (flags != 9)
+
+    def _aggregate_selected(sel, vals, flags):
+        if not np.any(sel):
+            return np.nan, np.int8(9), False
+
+        ts_c, vals_c, flags_c = collapse_duplicate_timestamps(
+            ts[sel],
+            vals[sel],
+            flags[sel],
+            fill_value=fill_value,
+        )
+        del ts_c
+        valid = _has_valid(vals_c, flags_c)
+        if not np.any(valid):
+            return np.nan, np.int8(9), False
+
+        return (
+            float(np.nanmean(vals_c[valid])),
+            _worst_flag(flags_c[valid]),
+            True,
+        )
+
+    def _aggregate_with_source_priority(day_mask, vals, flags, derived_mask):
+        valid = _has_valid(vals, flags)
+
+        source_sel = day_mask & (~derived_mask) & valid
+        value, flag, present = _aggregate_selected(source_sel, vals, flags)
+        if present:
+            return value, flag, False, True
+
+        derived_sel = day_mask & derived_mask & valid
+        value, flag, present = _aggregate_selected(derived_sel, vals, flags)
+        if present:
+            return value, flag, True, True
+
+        return np.nan, np.int8(9), False, False
+
     for idx, day in enumerate(all_days):
         # Use noon UTC as representative timestamp
         try:
@@ -269,25 +244,34 @@ def aggregate_daily(
             continue
         out_time[idx] = (dt - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds() + 43200.0
 
-        q_val, q_fl = q_daily_by_day.get(day, (np.nan, np.int8(9)))
-        ssc_val, ssc_fl = ssc_daily_by_day.get(day, (np.nan, np.int8(9)))
-        ssl_val, ssl_fl = ssl_daily_by_day.get(day, (np.nan, np.int8(9)))
+        day_mask = days == day
+        q_val, q_fl, q_is_derived, q_present = _aggregate_with_source_priority(
+            day_mask, Q_raw, Qf, Q_der
+        )
+        ssc_val, ssc_fl, ssc_is_derived, ssc_present = _aggregate_with_source_priority(
+            day_mask, SSC_raw, SSCf, SSC_der
+        )
+        ssl_val, ssl_fl, ssl_is_derived, ssl_present = _aggregate_with_source_priority(
+            day_mask, SSL_raw, SSLf, SSL_der
+        )
 
-        # Q
         out_Q[idx] = q_val
         out_Q_flag[idx] = q_fl
-        out_Q_der[idx] = False
+        out_Q_der[idx] = q_is_derived and q_present
 
-        # SSC
         out_SSC[idx] = ssc_val
         out_SSC_flag[idx] = ssc_fl
-        out_SSC_der[idx] = False
+        out_SSC_der[idx] = ssc_is_derived and ssc_present
 
-        # SSL: prefer recalculated from daily Q and SSC
+        # SSL: source-reported records outrank formula-derived daily SSL.
         q_valid = np.isfinite(q_val) and q_val >= 0 and q_fl != 9
         ssc_valid = np.isfinite(ssc_val) and ssc_val >= 0 and ssc_fl != 9
 
-        if q_valid and ssc_valid:
+        if ssl_present and not ssl_is_derived:
+            out_SSL[idx] = ssl_val
+            out_SSL_flag[idx] = ssl_fl
+            out_SSL_der[idx] = False
+        elif q_valid and ssc_valid:
             out_SSL[idx] = float(q_val * ssc_val * float(ssl_factor))
             # Derived SSL: flag = estimated (1), propagate suspect/bad from inputs
             if q_fl == 3 or ssc_fl == 3:
@@ -297,11 +281,10 @@ def aggregate_daily(
             else:
                 out_SSL_flag[idx] = np.int8(1)
             out_SSL_der[idx] = True
-        elif np.isfinite(ssl_val) and ssl_val >= 0 and ssl_fl != 9:
-            # Keep direct source SSL for sediment-only days
+        elif ssl_present:
             out_SSL[idx] = ssl_val
             out_SSL_flag[idx] = ssl_fl
-            out_SSL_der[idx] = False
+            out_SSL_der[idx] = True
         else:
             out_SSL[idx] = np.nan
             out_SSL_flag[idx] = np.int8(9)

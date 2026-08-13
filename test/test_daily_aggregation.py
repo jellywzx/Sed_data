@@ -9,7 +9,7 @@ Covers:
   Test  5: two days, each with multiple obs -> exactly 2 daily records
   Test  6: HYBAM-style: Q and SSC timestamps offset -> merged by day, no duplicates
   Test  7: HYBAM: SSC day D, Q only D+1 -> no cross-day pairing
-  Test  8: SSL_daily = Q_daily * SSC_daily * 0.0864 exactly
+  Test  8: SSL_daily = Q_daily * SSC_daily * 0.0864 when source SSL is absent
   Test  9: SSC-only day -> sediment observation preserved
   Test 10: final daily output: max count per station+date = 1
 """
@@ -276,20 +276,20 @@ def test_7_hybam_no_cross_day_pairing():
 
 
 # ---------------------------------------------------------------------------
-# Test 8: SSL_daily = Q_daily * SSC_daily * 0.0864 exactly
+# Test 8: SSL_daily = Q_daily * SSC_daily * 0.0864 when source SSL is absent
 # ---------------------------------------------------------------------------
-def test_8_ssl_formula_exact():
-    """SSL_daily must equal Q_daily * SSC_daily * 0.0864."""
+def test_8_ssl_formula_exact_when_no_source_ssl():
+    """SSL_daily must equal Q_daily * SSC_daily * 0.0864 when SSL is absent."""
     base = _epoch_seconds(2000, 8, 1, 0, 0, 0)
     n = 10
     times = base + np.arange(n) * 7200.0  # every 2 hours
     Q = np.array([50.0, 52.0, 48.0, 51.0, 53.0, 49.0, 50.0, 51.0, 52.0, 48.0])
     SSC = np.array([100.0, 102.0, 98.0, 101.0, 103.0, 99.0, 100.0, 101.0, 102.0, 98.0])
-    SSL = np.full(n, 999999.0)  # Some garbage values that should be ignored
+    SSL = np.full(n, np.nan)
 
     qf = np.full(n, FLAG_GOOD, dtype=np.int8)
     sscf = np.full(n, FLAG_GOOD, dtype=np.int8)
-    sslf = np.full(n, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(n, FLAG_MISSING, dtype=np.int8)
 
     result = aggregate_daily(times, Q, SSC, SSL, qf, sscf, sslf)
 
@@ -301,12 +301,115 @@ def test_8_ssl_formula_exact():
     assert_close(q_mean, result["Q"][0])
     assert_close(ssc_mean, result["SSC"][0])
     assert_close(expected_ssl, result["SSL"][0])
+    assert result["SSL_derived_mask"][0] == True
+    assert result["SSL_flag"][0] == FLAG_ESTIMATED
+    print("PASS test_8_ssl_formula_exact_when_no_source_ssl")
 
-    # Verify it is NOT mean(subdaily SSL) = mean(Q_i * SSC_i * 0.0864)
-    wrong_ssl = np.mean(Q * SSC * 0.0864)
-    assert not math.isclose(expected_ssl, wrong_ssl, rel_tol=1e-12), \
-        "SSL should NOT be mean of sub-daily SSL products"
-    print("PASS test_8_ssl_formula_exact")
+
+def test_8b_source_ssl_priority_over_q_ssc_formula():
+    """Source-reported SSL must not be overwritten by daily Q*SSC."""
+    base = _epoch_seconds(2000, 8, 2, 0, 0, 0)
+    times = np.array([base + 3600, base + 7200])
+    Q = np.array([10.0, 20.0])
+    SSC = np.array([10.0, 20.0])
+    SSL = np.array([1000.0, 2000.0])
+
+    qf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sscf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    source = np.zeros(2, dtype=bool)
+
+    result = aggregate_daily(
+        times, Q, SSC, SSL, qf, sscf, sslf,
+        Q_derived_mask=source,
+        SSC_derived_mask=source,
+        SSL_derived_mask=source,
+    )
+
+    assert len(result["time"]) == 1
+    assert_close(1500.0, result["SSL"][0])
+    assert result["SSL_flag"][0] == FLAG_GOOD
+    assert result["SSL_derived_mask"][0] == False
+    assert not math.isclose(
+        float(result["SSL"][0]),
+        float(np.mean(Q) * np.mean(SSC) * 0.0864),
+        rel_tol=1e-12,
+    )
+    print("PASS test_8b_source_ssl_priority_over_q_ssc_formula")
+
+
+def test_8c_derived_q_provenance_when_no_source_q():
+    """Day with only derived Q -> daily Q_derived_mask=True."""
+    base = _epoch_seconds(2000, 8, 3, 0, 0, 0)
+    times = np.array([base + 3600, base + 7200])
+    Q = np.array([10.0, 20.0])
+    SSC = np.array([1.0, 1.0])
+    SSL = np.full(2, np.nan)
+
+    qf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sscf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(2, FLAG_MISSING, dtype=np.int8)
+
+    result = aggregate_daily(
+        times, Q, SSC, SSL, qf, sscf, sslf,
+        Q_derived_mask=np.ones(2, dtype=bool),
+    )
+
+    assert_close(15.0, result["Q"][0])
+    assert result["Q_derived_mask"][0] == True
+    print("PASS test_8c_derived_q_provenance_when_no_source_q")
+
+
+def test_8d_source_q_priority_over_derived_q():
+    """Day with source and derived Q -> use source Q and mark source."""
+    base = _epoch_seconds(2000, 8, 4, 0, 0, 0)
+    times = np.array([base + 3600, base + 7200])
+    Q = np.array([10.0, 999.0])
+    SSC = np.array([1.0, 1.0])
+    SSL = np.full(2, np.nan)
+
+    qf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sscf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(2, FLAG_MISSING, dtype=np.int8)
+
+    result = aggregate_daily(
+        times, Q, SSC, SSL, qf, sscf, sslf,
+        Q_derived_mask=np.array([False, True], dtype=bool),
+    )
+
+    assert_close(10.0, result["Q"][0])
+    assert result["Q_derived_mask"][0] == False
+    print("PASS test_8d_source_q_priority_over_derived_q")
+
+
+def test_8e_ssc_source_and_derived_provenance_rules():
+    """SSC follows the same source-priority provenance rules as Q."""
+    base = _epoch_seconds(2000, 8, 5, 0, 0, 0)
+    times = np.array([
+        base + 3600,
+        base + 7200,
+        _epoch_seconds(2000, 8, 6, 1, 0, 0),
+        _epoch_seconds(2000, 8, 6, 2, 0, 0),
+    ])
+    Q = np.ones(4, dtype=float)
+    SSC = np.array([10.0, 999.0, 50.0, 70.0])
+    SSL = np.full(4, np.nan)
+
+    qf = np.full(4, FLAG_GOOD, dtype=np.int8)
+    sscf = np.full(4, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(4, FLAG_MISSING, dtype=np.int8)
+
+    result = aggregate_daily(
+        times, Q, SSC, SSL, qf, sscf, sslf,
+        SSC_derived_mask=np.array([False, True, True, True], dtype=bool),
+    )
+
+    assert len(result["time"]) == 2
+    assert_close(10.0, result["SSC"][0])
+    assert result["SSC_derived_mask"][0] == False
+    assert_close(60.0, result["SSC"][1])
+    assert result["SSC_derived_mask"][1] == True
+    print("PASS test_8e_ssc_source_and_derived_provenance_rules")
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +645,32 @@ def test_16_multi_day_hybam_mixed():
             assert_close(205.0, result["Q"][i])
             assert_close(102.5, result["SSC"][i])
     print("PASS test_16_multi_day_hybam_mixed")
+
+
+def test_17_pre_1970_dates_are_not_clamped_or_merged():
+    """Negative Unix timestamps must retain their real calendar days."""
+    times = np.array([
+        _epoch_seconds(1965, 1, 1, 12, 0, 0),
+        _epoch_seconds(1965, 1, 2, 12, 0, 0),
+    ])
+    Q = np.array([10.0, 20.0])
+    SSC = np.array([1.0, 2.0])
+    SSL = np.full(2, np.nan)
+
+    qf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sscf = np.full(2, FLAG_GOOD, dtype=np.int8)
+    sslf = np.full(2, FLAG_MISSING, dtype=np.int8)
+
+    result = aggregate_daily(times, Q, SSC, SSL, qf, sscf, sslf)
+
+    result_dates = [
+        datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
+        for t in result["time"]
+    ]
+    assert result_dates == ["1965-01-01", "1965-01-02"]
+    assert_close(10.0, result["Q"][0])
+    assert_close(20.0, result["Q"][1])
+    print("PASS test_17_pre_1970_dates_are_not_clamped_or_merged")
 
 
 # ---------------------------------------------------------------------------
