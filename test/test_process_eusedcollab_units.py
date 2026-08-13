@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Focused EUSEDcollab unit-conversion regressions."""
 
-from __future__ import annotations
 
 import importlib.util
 import math
@@ -362,6 +361,143 @@ def test_write_netcdf_records_mixed_ssc_ssl_provenance_metadata():
             assert "SSL_flag_qc2_log_iqr" in ssl.ancillary_variables
             np.testing.assert_array_equal(ds.variables["SSC_derived_mask"][:], np.array([0, 1], dtype=np.int8))
             np.testing.assert_array_equal(ds.variables["SSL_derived_mask"][:], np.array([0, 1], dtype=np.int8))
+            assert ds.temporal_resolution == "daily"
+            step_names = [
+                "Q_flag_qc1_physical",
+                "Q_flag_qc2_log_iqr",
+                "SSC_flag_qc1_physical",
+                "SSC_flag_qc2_log_iqr",
+                "SSC_flag_qc3_ssc_q",
+                "SSL_flag_qc1_physical",
+                "SSL_flag_qc2_log_iqr",
+                "SSL_flag_qc3_from_ssc_q",
+            ]
+            for name in step_names:
+                assert name in ds.variables
+                assert ds.variables[name].shape == ds.variables["time"].shape
+            np.testing.assert_array_equal(
+                ds.variables["SSL_flag_qc3_from_ssc_q"].flag_values,
+                np.array([0, 2, 8, 9], dtype=np.int8),
+            )
+
+
+def test_final_qc_after_daily_aggregation_uses_final_axis():
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2000-01-01 00:00:00", "2000-01-01 12:00:00"]),
+        "Q": [1.0, 3.0],
+        "SSC": [10.0, 20.0],
+        "SSL": [mod.FILL_VALUE, mod.FILL_VALUE],
+        "Q_derived": [False, False],
+        "SSC_derived": [False, False],
+        "SSL_derived": [False, False],
+    })
+    metadata = {"data_type": "Event data - fixed timestep"}
+
+    normalized, aggregated, resolution = mod._normalize_station_resolution(df, metadata)
+
+    assert aggregated
+    assert resolution == "daily"
+    assert len(normalized) == 1
+    assert_close(normalized.loc[0, "Q"], 2.0)
+    assert_close(normalized.loc[0, "SSC"], 15.0)
+    assert_close(normalized.loc[0, "SSL"], 2.0 * 15.0 * 0.0864)
+    assert bool(normalized.loc[0, "SSL_derived"])
+
+    df_qc, _, _ = mod.apply_hydro_qc_with_provenance(
+        normalized,
+        station_id="synthetic",
+        station_name="final_axis",
+        iqr_k=mod.QC_IQR_K,
+        min_samples_envelope=mod.QC_MIN_SAMPLES_ENVELOPE,
+    )
+
+    assert len(df_qc) == 1
+    assert int(df_qc.loc[0, "SSL_flag"]) == int(mod.FLAG_ESTIMATED)
+    assert int(df_qc.loc[0, "SSL_flag_qc1_physical"]) == int(mod.FLAG_GOOD)
+    for col in [
+        "Q_flag_qc1_physical",
+        "Q_flag_qc2_log_iqr",
+        "SSC_flag_qc1_physical",
+        "SSC_flag_qc2_log_iqr",
+        "SSC_flag_qc3_ssc_q",
+        "SSL_flag_qc1_physical",
+        "SSL_flag_qc2_log_iqr",
+        "SSL_flag_qc3_from_ssc_q",
+    ]:
+        assert len(df_qc[col]) == len(normalized)
+
+
+def test_temporal_resolution_helper_is_conservative():
+    assert not mod._should_daily_aggregate("Monthly data")
+    assert mod._resolve_final_temporal_resolution("Monthly data", False) == "monthly"
+    assert mod._should_daily_aggregate("Daily data - fixed timestep")
+    assert mod._resolve_final_temporal_resolution("Daily data - fixed timestep", True) == "daily"
+    assert mod._should_daily_aggregate("Event data - variable timestep")
+    assert mod._resolve_final_temporal_resolution("Event data - variable timestep", True) == "daily"
+    assert not mod._should_daily_aggregate("Q and rating curve data")
+    assert mod._resolve_final_temporal_resolution("Q and rating curve data", False) == "q_and_rating_curve_data"
+
+
+def test_write_netcdf_keeps_monthly_temporal_resolution():
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2000-01-01", "2000-02-01"]),
+        "Q": [1.0, 2.0],
+        "SSC": [10.0, 20.0],
+        "SSL": [0.864, 3.456],
+        "Q_derived": [False, False],
+        "SSC_derived": [False, False],
+        "SSL_derived": [False, False],
+    })
+    flags = np.array([mod.FLAG_GOOD, mod.FLAG_GOOD], dtype=np.int8)
+    metadata = {
+        "station_name": "synthetic_monthly",
+        "catchment_id": 2,
+        "latitude": 1.0,
+        "longitude": 2.0,
+        "drainage_area": 3.0,
+        "data_type": "Monthly data",
+        "temporal_resolution": "monthly",
+        "stream_type": "perennial",
+        "country": "BE",
+        "references": "synthetic",
+        "contact_name": np.nan,
+        "contact_email": np.nan,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "eused_monthly.nc"
+        mod.write_netcdf(df, metadata, flags, flags, flags, str(out), step_flags=None)
+        with nc.Dataset(out) as ds:
+            assert ds.temporal_resolution == "monthly"
+
+
+def test_seconds_mismatch_heuristic_does_not_modify_source_ssc():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp)
+        q_ssl = source / "Q_SSL"
+        q_ssl.mkdir()
+        dates = pd.date_range("2000-01-01", periods=6, freq="D")
+        pd.DataFrame({
+            "Date (DD/MM/YYYY)": [d.strftime("%Y-%m-%d") for d in dates],
+            "Q (m3 d-1)": np.full(6, 86400.0),
+            "SSC (g m-3)": np.full(6, 100.0),
+            "SSL (kg d-1)": np.full(6, 0.1),
+        }).to_csv(q_ssl / "ID_88_Q_SSL_XX.csv", index=False)
+
+        old_source = mod.SOURCE_DIR
+        mod.SOURCE_DIR = str(source)
+        try:
+            out = mod.read_station_data(88, "XX")
+        finally:
+            mod.SOURCE_DIR = old_source
+
+    ssc = out["SSC"].replace(mod.FILL_VALUE, np.nan)
+    q = out["Q"].replace(mod.FILL_VALUE, np.nan)
+    ssl = out["SSL"].replace(mod.FILL_VALUE, np.nan)
+    ratio = ssl / (0.0864 * q * ssc)
+    assert_close(np.nanmedian(ssc), 100.0)
+    assert_close(np.nanmedian(ratio.replace([np.inf, -np.inf], np.nan).dropna()), 1.0 / 86400.0)
+    assert not bool(out["SSC_derived"].any())
 
 
 def test_real_source_id15_no_1000x_ssc_regression():
@@ -408,7 +544,7 @@ def test_real_source_timestep_records_are_standardized():
     assert np.nanmax(id10["SSL"].replace(mod.FILL_VALUE, np.nan)) < 10000.0
 
 
-def test_real_source_id20_seconds_mismatch_is_corrected():
+def test_real_source_id20_seconds_mismatch_source_ssc_retained():
     if not SOURCE_DIR.exists():
         return
     old_source = mod.SOURCE_DIR
@@ -421,9 +557,9 @@ def test_real_source_id20_seconds_mismatch_is_corrected():
     q = out["Q"].replace(mod.FILL_VALUE, np.nan)
     ssl = out["SSL"].replace(mod.FILL_VALUE, np.nan)
     ratio = ssl / (0.0864 * q * ssc)
-    assert_close(np.nanmax(ssc), 56178000.0 / 86400.0, rel=1e-6)
-    assert_close(np.nanmedian(ratio.replace([np.inf, -np.inf], np.nan).dropna()), 1.0, rel=1e-5)
-    assert bool(out["SSC_derived"].any())
+    assert_close(np.nanmax(ssc), 56178000.0, rel=1e-6)
+    assert_close(np.nanmedian(ratio.replace([np.inf, -np.inf], np.nan).dropna()), 1.0 / 86400.0, rel=1e-5)
+    assert not bool(out["SSC_derived"].any())
 
 
 def main():

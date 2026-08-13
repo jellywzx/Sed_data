@@ -61,9 +61,7 @@ from code.daily_aggregation import aggregate_daily
 # =============================================================================
 # Data paths
 SOURCE_DIR = os.fspath(resolve_source_root(start=__file__) / "EUSEDcollab")
-OUTPUT_DIR = os.fspath(
-    resolve_output_root(start=__file__) / "monthly" / "EUSEDcollab" / "qc"
-)
+OUTPUT_ROOT = os.fspath(resolve_output_root(start=__file__))
 METADATA_FILE = os.path.join(SOURCE_DIR, "ALL_METADATA.csv")
 
 # ISO 3166-1 alpha-2 country code mapping for EUSEDcollab (all European stations)
@@ -113,8 +111,6 @@ N_WORKERS = _env_int("EUSED_N_WORKERS", _default_worker_count())
 QC_IQR_K = 1.5
 QC_MIN_SAMPLES_ENVELOPE = 5
 WRITE_DIAGNOSTIC_PLOTS = True
-DIAGNOSTIC_DIR = os.path.join(OUTPUT_DIR, "diagnostic")
-DIAGNOSTIC_PLOT_DIR = os.path.join(OUTPUT_DIR, "diagnostic_plots")
 
 FILL_VALUE = -9999.0
 SSC_Q_SSL_RATIO_TARGETS = (
@@ -136,6 +132,97 @@ FLAG_MISSING = np.int8(9)
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def _sanitize_resolution_label(value):
+    text = str(value or "").strip().lower()
+    text = text.replace("&", "and")
+    parts = []
+    for char in text:
+        if char.isalnum():
+            parts.append(char)
+        else:
+            parts.append("_")
+    label = "_".join("".join(parts).split("_"))
+    return label or "source_native"
+
+
+def _should_daily_aggregate(data_type):
+    text = str(data_type or "").strip().lower()
+    if text.startswith("monthly"):
+        return False
+    if text.startswith("daily"):
+        return True
+    if text.startswith("event"):
+        return True
+    if "timestep" in text:
+        return True
+    if text == "q and rating curve data":
+        return False
+    return False
+
+
+def _resolve_final_temporal_resolution(data_type, aggregated_to_daily):
+    text = str(data_type or "").strip().lower()
+    if text.startswith("monthly"):
+        return "monthly"
+    if text.startswith("daily"):
+        return "daily"
+    if text.startswith("event") or "timestep" in text:
+        return "daily" if aggregated_to_daily else _sanitize_resolution_label(data_type)
+    if text == "q and rating curve data":
+        return "q_and_rating_curve_data"
+    return _sanitize_resolution_label(data_type)
+
+
+def _output_dir_for_resolution(resolution):
+    return os.path.join(OUTPUT_ROOT, _sanitize_resolution_label(resolution), "EUSEDcollab", "qc")
+
+
+def _base_flags_for_aggregation(df):
+    return {
+        "Q": apply_quality_flag_array(pd.to_numeric(df["Q"], errors="coerce"), "Q"),
+        "SSC": apply_quality_flag_array(pd.to_numeric(df["SSC"], errors="coerce"), "SSC"),
+        "SSL": apply_quality_flag_array(pd.to_numeric(df["SSL"], errors="coerce"), "SSL"),
+    }
+
+
+def _normalize_station_resolution(df, metadata):
+    data_type = metadata.get("data_type", "")
+    aggregate_to_daily = _should_daily_aggregate(data_type)
+    if not aggregate_to_daily:
+        final_resolution = _resolve_final_temporal_resolution(data_type, False)
+        return df.copy(), False, final_resolution
+
+    epoch = datetime(1970, 1, 1)
+    time_seconds = np.array(
+        [(d - epoch).total_seconds() for d in pd.to_datetime(df["date"])],
+        dtype=np.float64,
+    )
+    flags = _base_flags_for_aggregation(df)
+    agg = aggregate_daily(
+        time_seconds=time_seconds,
+        Q=pd.to_numeric(df["Q"], errors="coerce").to_numpy(dtype=float),
+        SSC=pd.to_numeric(df["SSC"], errors="coerce").to_numpy(dtype=float),
+        SSL=pd.to_numeric(df["SSL"], errors="coerce").to_numpy(dtype=float),
+        Q_flag=flags["Q"],
+        SSC_flag=flags["SSC"],
+        SSL_flag=flags["SSL"],
+        Q_derived_mask=df.get("Q_derived", pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+        SSC_derived_mask=df.get("SSC_derived", pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+        SSL_derived_mask=df.get("SSL_derived", pd.Series(False, index=df.index)).to_numpy(dtype=bool),
+    )
+
+    out = pd.DataFrame({
+        "date": [epoch + pd.Timedelta(seconds=float(t)) for t in agg["time"]],
+        "Q": agg["Q"],
+        "SSC": agg["SSC"],
+        "SSL": agg["SSL"],
+        "Q_derived": agg["Q_derived_mask"],
+        "SSC_derived": agg["SSC_derived_mask"],
+        "SSL_derived": agg["SSL_derived_mask"],
+    })
+    final_resolution = _resolve_final_temporal_resolution(data_type, True)
+    return out, True, final_resolution
 
 # =============================================================================
 # NEW FUNCTION ADDED HERE (Replace old behaviors)
@@ -996,12 +1083,11 @@ def read_station_data(station_id, country):
 
     seconds_mismatch, station_ratio = _detect_ssc_seconds_mismatch(df)
     if seconds_mismatch:
-        ssc_fix_mask = _finite_positive(df["SSC"])
-        df.loc[ssc_fix_mask, "SSC"] = df.loc[ssc_fix_mask, "SSC"] / 86400.0
-        ssc_derived |= ssc_fix_mask.to_numpy()
         print(
-            "  Corrected station-level SSC/Q/SSL seconds mismatch "
-            "(median SSL/(0.0864*Q*SSC)={:.6g}); divided SSC by 86400".format(
+            "  Warning: station-level Q/SSC/SSL ratio suggests a seconds-scale "
+            "mismatch (median SSL/(0.0864*Q*SSC)={:.6g}); source SSC retained "
+            "because the source column/unit metadata does not uniquely identify "
+            "SSC as the erroneous term.".format(
                 station_ratio
             )
         )
@@ -1082,26 +1168,33 @@ def process_station(station_id, country):
     audit_after = _classify_records(df)
     _print_audit(station_id, audit_before, audit_after)
 
-    # ------------------------------------------
-    # QC using tool.py
-    # ------------------------------------------
-    # Mark only values derived from the Q/SSC/SSL identity as estimated.
-    estimated_mask = {
-        "Q": df.get("Q_derived", pd.Series(False, index=df.index)).values,
-        "SSC": df.get("SSC_derived", pd.Series(False, index=df.index)).values,
-        "SSL": df.get("SSL_derived", pd.Series(False, index=df.index)).values,
-    }
+    # Normalize to the final time axis before the single final QC pass.
+    n_before_normalize = len(df)
+    df, aggregated_to_daily, final_resolution = _normalize_station_resolution(df, metadata)
+    output_dir = _output_dir_for_resolution(final_resolution)
+    diagnostic_dir = os.path.join(output_dir, "diagnostic")
+    diagnostic_plot_dir = os.path.join(output_dir, "diagnostic_plots")
+    os.makedirs(output_dir, exist_ok=True)
+    if WRITE_DIAGNOSTIC_PLOTS:
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        os.makedirs(diagnostic_plot_dir, exist_ok=True)
 
+    if aggregated_to_daily:
+        print(f"  Daily aggregation: {n_before_normalize} raw records -> {len(df)} daily records")
+    else:
+        print(
+            f"  Native resolution retained: {final_resolution} "
+            f"({len(df)} records)"
+        )
 
     df_qc, ssc_q_bounds, prov = apply_hydro_qc_with_provenance(
         df=df,
         station_id=station_id,
         station_name=metadata["station_name"],
-        output_dir=OUTPUT_DIR,          # 用于保存 provenance JSON
-        diagnostic_dir=DIAGNOSTIC_DIR if WRITE_DIAGNOSTIC_PLOTS else None,
+        output_dir=output_dir,
+        diagnostic_dir=None,
         iqr_k=QC_IQR_K,
         min_samples_envelope=QC_MIN_SAMPLES_ENVELOPE,
-        flag_estimated_mask=estimated_mask
     )
     print("  QC provenance summary:")
     print(f"    Q   good={prov['Q']['good']} ({prov['Q']['good_pct']:.1f}%)  missing={prov['Q']['missing']} ({prov['Q']['missing_pct']:.1f}%)")
@@ -1126,6 +1219,7 @@ def process_station(station_id, country):
 
     print(f"  Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     print(f"  Data points: {len(df)}")
+    print(f"  Temporal resolution: {final_resolution}")
     print(f"  Q completeness: {q_completeness:.1f}%")
     print(f"  SSC completeness: {ssc_completeness:.1f}%")
     print(f"  SSL completeness: {ssl_completeness:.1f}%")
@@ -1134,10 +1228,8 @@ def process_station(station_id, country):
     # SSC–Q diagnostic plot
     # --------------------------------------------------
     if WRITE_DIAGNOSTIC_PLOTS:
-        os.makedirs(DIAGNOSTIC_PLOT_DIR, exist_ok=True)
-
         plot_file = os.path.join(
-            DIAGNOSTIC_PLOT_DIR,
+            diagnostic_plot_dir,
             f"EUSEDcollab_{country}-{metadata['station_name']}-ID{station_id}_ssc_q.png"
         )
 
@@ -1153,59 +1245,11 @@ def process_station(station_id, country):
             out_png=plot_file,
         )
 
-
-    # =====================================================================
-    # Daily aggregation: collapse sub-daily observations to one record/day
-    # =====================================================================
-    epoch = datetime(1970, 1, 1)
-    time_seconds = np.array([(d - epoch).total_seconds() for d in df['date']], dtype=np.float64)
-
-    agg = aggregate_daily(
-        time_seconds=time_seconds,
-        Q=pd.to_numeric(df['Q'], errors='coerce').to_numpy(dtype=float),
-        SSC=pd.to_numeric(df['SSC'], errors='coerce').to_numpy(dtype=float),
-        SSL=pd.to_numeric(df['SSL'], errors='coerce').to_numpy(dtype=float),
-        Q_flag=q_flag,
-        SSC_flag=ssc_flag,
-        SSL_flag=ssl_flag,
-        Q_derived_mask=df.get('Q_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
-        SSC_derived_mask=df.get('SSC_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
-        SSL_derived_mask=df.get('SSL_derived', pd.Series(False, index=df.index)).to_numpy(dtype=bool),
-    )
-
-    n_before = len(df)
-    df = pd.DataFrame({
-        'date': [epoch + pd.Timedelta(seconds=float(t)) for t in agg['time']],
-        'Q': agg['Q'],
-        'SSC': agg['SSC'],
-        'SSL': agg['SSL'],
-        'Q_derived': agg['Q_derived_mask'],
-        'SSC_derived': agg['SSC_derived_mask'],
-        'SSL_derived': agg['SSL_derived_mask'],
-    })
-    q_flag = agg['Q_flag']
-    ssc_flag = agg['SSC_flag']
-    ssl_flag = agg['SSL_flag']
-
-    # Recalculate completeness on aggregated data
-    q_completeness = calculate_data_completeness_from_flag(q_flag)
-    ssc_completeness = calculate_data_completeness_from_flag(ssc_flag)
-    ssl_completeness = calculate_data_completeness_from_flag(ssl_flag)
-
-    # Update date range
-    start_date = df['date'].min()
-    end_date = df['date'].max()
-
-    print(f"  Daily aggregation: {n_before} raw records -> {len(df)} daily records")
-    print(f"  Aggregated date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-    print(f"  Aggregated Q completeness: {q_completeness:.1f}%")
-    print(f"  Aggregated SSC completeness: {ssc_completeness:.1f}%")
-    print(f"  Aggregated SSL completeness: {ssl_completeness:.1f}%")
-
-
     # Create NetCDF file
-    output_file = os.path.join(OUTPUT_DIR, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
-    write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=None)
+    nc_metadata = metadata.copy()
+    nc_metadata["temporal_resolution"] = final_resolution
+    output_file = os.path.join(output_dir, f'EUSEDcollab_{country}-{metadata["station_name"]}-ID{station_id}.nc')
+    write_netcdf(df, nc_metadata, q_flag, ssc_flag, ssl_flag, output_file, step_flags=df)
     # ---- Print QC result summary (station-level) ----
     def _repr_val_and_flag(val_arr, flag_arr):
         v = np.asarray(val_arr, dtype=float)
@@ -1261,7 +1305,7 @@ def process_station(station_id, country):
         'upstream_area': metadata['drainage_area'],
         'Data Source Name': 'EUSEDcollab Dataset',
         'Type': 'In-situ',
-        'Temporal Resolution': 'monthly',
+        'Temporal Resolution': final_resolution,
         'Temporal Span': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
         'Variables Provided': 'Q, SSC, SSL',
         'Geographic Coverage': f"{metadata['country']}",
@@ -1284,6 +1328,10 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
     """
     Write CF-1.8 compliant NetCDF file
     """
+    temporal_resolution = metadata.get(
+        "temporal_resolution",
+        _resolve_final_temporal_resolution(metadata.get("data_type", ""), False),
+    )
 
     # Create output directory if needed
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1509,13 +1557,18 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         def _add_step_flag(name, values, *, flag_values, flag_meanings, long_name):
             if values is None:
                 return
+            arr = np.asarray(values, dtype=np.int8)
+            if arr.shape[0] != len(df):
+                raise ValueError(
+                    f"{name} length mismatch: expected {len(df)}, got {arr.shape[0]}"
+                )
             v = ds.createVariable(name, 'b', ('time',), fill_value=FILL_VALUE_INT)
             v.long_name = long_name
             v.standard_name = 'status_flag'
             v.flag_values = np.array(flag_values, dtype=np.int8)
             v.flag_meanings = flag_meanings
             v.missing_value = np.int8(FILL_VALUE_INT)
-            v[:] = np.asarray(values, dtype=np.int8)
+            v[:] = arr
 
         if step_flags is not None:
             _add_step_flag('Q_flag_qc1_physical', step_flags.get('Q_flag_qc1_physical'),
@@ -1542,7 +1595,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
                 flag_values=[0, 2, 8, 9], flag_meanings='pass suspect not_checked missing',
                 long_name='QC2 log-IQR flag for suspended sediment load')
             _add_step_flag('SSL_flag_qc3_from_ssc_q', step_flags.get('SSL_flag_qc3_from_ssc_q'),
-                flag_values=[0, 1, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
+                flag_values=[0, 2, 8, 9], flag_meanings='not_propagated propagated not_checked missing',
                 long_name='QC3 propagation flag for suspended sediment load')
 
             # Update ancillary_variables to include step flags
@@ -1556,7 +1609,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
 
         ds.Conventions = 'CF-1.8, ACDD-1.3'
         ds.title = 'Harmonized Global River Discharge and Sediment'
-        ds.summary = f'River discharge and suspended sediment data for {metadata["station_name"]} station from the EUSEDcollab (European Sediment Collaboration) database. This dataset contains daily measurements of discharge, suspended sediment concentration, and sediment load with quality control flags.'
+        ds.summary = f'River discharge and suspended sediment data for {metadata["station_name"]} station from the EUSEDcollab (European Sediment Collaboration) database. This dataset contains {temporal_resolution} measurements of discharge, suspended sediment concentration, and sediment load with quality control flags.'
 
         ds.source = 'In-situ station data'
         ds.data_source_name = 'EUSEDcollab Dataset'
@@ -1568,7 +1621,7 @@ def write_netcdf(df, metadata, q_flag, ssc_flag, ssl_flag, output_file, step_fla
         # Temporal information
         start_date = df['date'].min()
         end_date = df['date'].max()
-        ds.temporal_resolution = 'monthly'
+        ds.temporal_resolution = temporal_resolution
         ds.temporal_span = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         ds.time_coverage_start = start_date.strftime('%Y-%m-%d')
         ds.time_coverage_end = end_date.strftime('%Y-%m-%d')
@@ -1673,6 +1726,19 @@ def generate_summary_csv(station_list, output_dir):
 
     print(f"\nStation summary CSV written: {csv_file}")
     print(f"Total stations processed: {len(station_list)}")
+
+
+def generate_summary_csv_by_resolution(station_list):
+    """Write one station summary in each final-resolution output directory."""
+    if len(station_list) == 0:
+        print("\nNo stations processed, skipping summary CSV generation")
+        return
+
+    summary_df = pd.DataFrame(station_list)
+    for resolution, group in summary_df.groupby("Temporal Resolution"):
+        output_dir = _output_dir_for_resolution(resolution)
+        os.makedirs(output_dir, exist_ok=True)
+        generate_summary_csv(group.to_dict("records"), output_dir)
 
 
 # =============================================================================
@@ -1792,17 +1858,14 @@ def main():
     print("EUSEDcollab Dataset Processing to CF-1.8 Format")
     print("="*80)
 
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    if WRITE_DIAGNOSTIC_PLOTS:
-        os.makedirs(DIAGNOSTIC_DIR, exist_ok=True)
-        os.makedirs(DIAGNOSTIC_PLOT_DIR, exist_ok=True)
+    # Create output root; per-resolution output directories are created per station.
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
     # Read metadata to get list of stations
     meta_df = pd.read_csv(METADATA_FILE, encoding='utf-8-sig')
 
     print(f"\nFound {len(meta_df)} stations in metadata")
-    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Output root: {OUTPUT_ROOT}")
     print(f"Parallel mode: {RUN_IN_PARALLEL}")
     print(f"Configured workers: {N_WORKERS}")
 
@@ -1813,8 +1876,8 @@ def main():
     else:
         station_list = _run_station_tasks_sequential(tasks)
 
-    # Generate summary CSV
-    generate_summary_csv(station_list, OUTPUT_DIR)
+    # Generate summary CSVs in the matching final-resolution output directories.
+    generate_summary_csv_by_resolution(station_list)
 
     print("\n" + "="*80)
     print("Processing complete!")
