@@ -48,7 +48,7 @@ from code.validation import require_existing_directory
 # Configuration
 INPUT_DIR = resolve_source_root(start=__file__) / 'GloRiSe' / 'netcdf_output_SS'
 OUTPUT_DIR = ensure_directory(
-    resolve_output_root(start=__file__) / 'daily' / 'GloRiSe' / 'SS' / 'qc'
+    resolve_output_root(start=__file__) / 'daily' / 'GloRiSe' / 'qc'
 )
 
 # Original data source information
