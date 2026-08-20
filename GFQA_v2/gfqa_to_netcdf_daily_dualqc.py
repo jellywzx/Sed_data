@@ -102,6 +102,38 @@ def clean_value(value):
     except Exception:
         return np.nan
 
+def clean_metadata_text(value):
+    """Return a clean scalar metadata string, or empty text for missing values."""
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {'', 'nan', 'none', 'null', '<na>'}:
+        return ''
+    return text
+
+def first_metadata_text(station_row, columns, default=''):
+    for column in columns:
+        if column in station_row.index:
+            text = clean_metadata_text(station_row.get(column))
+            if text:
+                return text
+    return default
+
+def get_station_display_name(station_row, station_id):
+    return first_metadata_text(
+        station_row,
+        ['Station Identifier', 'Station Narrative', 'Water Body Name'],
+        default=str(station_id),
+    )
+
+def get_river_name(station_row):
+    return first_metadata_text(station_row, ['Water Body Name', 'Main Basin'])
+
 def _safe_fmt(val):
     """Safely format a float for logging; returns 'N/A' for NaN."""
     try:
@@ -465,6 +497,11 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     # --------------------------
     ds.altitude = altitude
     ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
+    ds.station_id = str(station_id)
+    ds.Source_ID = str(station_id)
+    ds.source_station_id = str(station_id)
+    ds.station_name = get_station_display_name(station_row, station_id)
+    ds.river_name = get_river_name(station_row)
 
     # Geographic metadata
     country_name = str(station_row.get('Country Name', '')).strip()
@@ -485,7 +522,7 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     print(f"✅ Created file: {filename}")
     log_station_qc(
         station_id=station_id,
-        station_name=str(station_row.get('Station Name', station_id)),
+        station_name=get_station_display_name(station_row, station_id),
         n_samples=len(dates),
         skipped_log_iqr=False,
         skipped_ssc_q=False,
@@ -661,7 +698,7 @@ def process_one_station(args):
                 SSC_flag=merged['SSC_flag'].values,
                 ssc_q_bounds=ssc_q_bounds,
                 station_id=station_id,
-                station_name=str(station_row.get('Station Name', station_id)),
+                station_name=get_station_display_name(station_row, station_id),
                 out_png=str(out_png),
             )
 
@@ -685,7 +722,7 @@ def process_one_station(args):
             return {k: int(np.sum(f == np.int8(v))) for k, v in mapping.items()}
 
         station_info = {
-            "station_name": str(station_row.get("Station Name", station_id)),
+            "station_name": get_station_display_name(station_row, station_id),
             "Source_ID": station_id,
             "longitude": lon,
             "latitude": lat,
