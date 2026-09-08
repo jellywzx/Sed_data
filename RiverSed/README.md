@@ -740,8 +740,7 @@ reference 表来自：
 ### 18.1 只生成表，不改 nc
 
 ```bash
-/share/home/dq134/.conda/envs/wzx/bin/python3.9 \
-  /share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/RiverSed/fill_missing_coordinates.py
+python RiverSed/fill_missing_coordinates.py
 ```
 
 适合：
@@ -752,9 +751,7 @@ reference 表来自：
 ### 18.2 只写回高置信度结果
 
 ```bash
-/share/home/dq134/.conda/envs/wzx/bin/python3.9 \
-  /share/home/dq134/wzx/sed_data/sediment_wzx_1111/Script/RiverSed/fill_missing_coordinates.py \
-  --apply
+python RiverSed/fill_missing_coordinates.py --apply
 ```
 
 适合：

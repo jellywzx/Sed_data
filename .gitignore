@@ -1,33 +1,56 @@
-#unused folder
-/tools
-/delineator
-/core
+# Generated tabular, log, and report outputs
+*.csv
+*.xlsx
+*.txt
+!requirements.txt
+*.log
+*.html
 
-# 编译文件
+# Generated figures and data products
+*.png
+*.pdf
+*.svg
+*.nc
+*.gpkg
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# Local run directories
+/out/
+/output/
+/Output_r/
+/Source/
+/fig/
+/figs/
+/log/
+/tmp/
+/tools/
+/delineator/
+/core/
+
+# Build artifacts
 *.o
 *.mod
 *.exe
 
-# 输出文件
-out/
-output/
-*.nc
-*.csv
-*.txt
-log/
-*.log
-*.figs
-*.fig
-fig/
-
-# 临时文件
-*.swp
-*~
+# Python caches and local build/test state
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# 系统文件
+# Temporary/editor files
+*.swp
+*~
+
+# Local agent and system files
+.claude/
 .DS_Store
 
-#备份文件
+# Local backup files
 *.bak
+*.bak.*
+*.bak*

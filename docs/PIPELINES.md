@@ -61,5 +61,5 @@ These datasets should normally be launched through the following scripts:
 ## Notes
 
 - `run_pipeline.py --list --include-optional` also shows legacy converters, validators, and post-run utilities.
-- `Mekong_Delta` keeps several older helper scripts in the folder, but `process_mekong_delta.py` is the canonical end-to-end pipeline.
+- `Mekong_Delta` is represented by the canonical end-to-end `process_mekong_delta.py` pipeline.
 - `USGS`, `Myanmar`, `NERC`, `GSED`, `HMA`, and `Dethier` include optional verification or utility scripts that are intentionally not part of the default core run.

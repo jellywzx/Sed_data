@@ -157,7 +157,7 @@ QC 第三层 — 水文一致性检验          [code/qc.py]
 | Huanghe | 两阶段 | `convert_to_netcdf.py` → `qc_and_standardize.py` | 黄河 |
 | Hydat | 四阶段 | `1_` → `2_` → `3_` → `4_process_hydat_cf18.py` | 加拿大站点 |
 | Land2sea | 单脚本 | `convert_land2sea_to_netcdf.py` | 模型输出 |
-| Mekong_Delta | 单脚本 | `process_mekong_delta.py` | 其他脚本为辅助/遗留 |
+| Mekong_Delta | 单脚本 | `process_mekong_delta.py` | |
 | Milliman | 五阶段 | `1_convert_to_netcdf.py` → … → `5_qc_and_standardize.py` | 全球汇编 |
 | Myanmar | 单脚本 | `convert_to_netcdf.py` | 含验证与汇总脚本 |
 | NERC | 单脚本 | `convert_NERC_to_netcdf.py` | 含精化与验证步骤 |
@@ -216,4 +216,3 @@ python run_pipeline.py --all
 | 删除 `code/cf_writer.py` | 无任何脚本引用，所有数据集直接使用 `netCDF4`，可直接删除 |
 | 删除 `code/adapter.py` | ALi_De_Boer 专属逻辑，`process_data_tool.py` 已完整覆盖，建议删除并在 `process_data_tool.py` 中补充 `read_excel_validated` 列校验 |
 | 删除 `modify_plan_0413.md` | 临时工作文档，整理完成后可删除 |
-

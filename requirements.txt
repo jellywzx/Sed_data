@@ -1,0 +1,27 @@
+# Core scientific stack
+numpy
+pandas
+xarray
+scipy
+
+# NetCDF and HDF5 I/O
+netCDF4
+h5netcdf
+h5py
+
+# Geospatial I/O and geometry
+geopandas
+fiona
+pyogrio
+pyproj
+shapely
+pyshp
+
+# Plotting, utilities, and configuration
+matplotlib
+psutil
+tqdm
+PyYAML
+openpyxl
+xlrd
+bibtexparser

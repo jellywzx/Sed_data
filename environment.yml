@@ -1,0 +1,25 @@
+name: sed-reference-scripts
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - xarray
+  - scipy
+  - netcdf4
+  - h5netcdf
+  - h5py
+  - geopandas
+  - fiona
+  - pyogrio
+  - pyproj
+  - shapely
+  - pyshp
+  - matplotlib
+  - psutil
+  - tqdm
+  - pyyaml
+  - openpyxl
+  - xlrd
+  - bibtexparser

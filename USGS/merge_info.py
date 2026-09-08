@@ -1,8 +1,12 @@
 import pandas as pd
 from pathlib import Path
+import os
 
 # === 设置路径 ===
-base_dir = Path(r"/share/home/dq134/wzx/sed_data/sediment_wzx_1111/Source/USGS/usgs_data_by_station")
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = SCRIPT_ROOT.parent
+SOURCE_ROOT = Path(os.environ.get("SEDIMENT_SOURCE_ROOT", PROJECT_ROOT / "Source"))
+base_dir = Path(os.environ.get("USGS_STATION_DIR", SOURCE_ROOT / "USGS" / "usgs_data_by_station"))
 output_file = base_dir.parent / "common_sites_info.csv"
 
 # === 查找所有站点文件夹 ===

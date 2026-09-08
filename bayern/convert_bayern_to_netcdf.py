@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]   # .../Script
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../sediment_wzx_1111
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # project data root
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 from code.constants import FILL_VALUE_FLOAT

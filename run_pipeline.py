@@ -139,13 +139,9 @@ PIPELINES = {
         ],
     },
     "Mekong_Delta": {
-        "summary": "Canonical QC pipeline plus legacy utilities",
+        "summary": "Mekong Delta canonical QC pipeline",
         "stages": [
             {"script": "Mekong_Delta/process_mekong_delta.py", "description": "Canonical end-to-end QC pipeline"},
-            {"script": "Mekong_Delta/verify_qc.py", "description": "Post-run validator", "optional": True},
-            {"script": "Mekong_Delta/summarize_data.py", "description": "Post-run summarizer", "optional": True},
-            {"script": "Mekong_Delta/convert_to_netcdf.py", "description": "Legacy raw converter", "optional": True},
-            {"script": "Mekong_Delta/convert_to_netcdf_ratings_only.py", "description": "Legacy ratings-only variant", "optional": True},
         ],
     },
     "Milliman": {
