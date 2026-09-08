@@ -82,7 +82,9 @@ qc_result = apply_hydro_qc_with_provenance(
 | QC2 - Log-IQR | `SSC_flag_qc2_log_iqr` | 同上 | 同上 |
 | QC2 - Log-IQR | `SSL_flag_qc2_log_iqr` | 同上 | 同上 |
 | QC3 - SSC-Q | `SSC_flag_qc3_ssc_q` | SSC-Q 一致性检查 | 0=pass, 2=suspect, 8=not_checked, 9=missing |
-| QC3 - SSL propag. | `SSL_flag_qc3_from_ssc_q` | SSC-Q不一致到SSL的传播 | 0=not_propagated, 2=propagated, 8=not_checked, 9=missing |
+| QC3 - SSL propagation | `SSL_flag_qc3_from_ssc_q` | SSC-Q 不一致传播到由 Q 和 SSC 派生的 SSL | 0=not_propagated, 2=propagated, 8=not_checked, 9=missing |
+
+**Canonical rule:** `SSL_flag_qc3_from_ssc_q` 的 propagated 状态必须使用 `2`。这里的 `2` 与最终质量标志中的 `suspect` 一致，表示“SSC-Q 不一致已传播到 SSL，因此 SSL 应被视为 suspect”。不要使用 `1` 表示 propagated；`1` 只保留给最终变量标志中的 `estimated/derived`。代码层面的统一定义见 `code/constants.py` 中的 `QC3_SSL_FROM_SSC_Q_FLAG_VALUES`、`QC3_SSL_FROM_SSC_Q_FLAG_MEANINGS` 和 `QC3_SSL_FROM_SSC_Q_PROPAGATED_FLAG`。
 
 ### 3.3 NetCDF 必须写出的 QC 变量
 
@@ -210,15 +212,21 @@ ds.Source_ID = str(station_id)    # 兼容键名（建议保留）
 
 ### 5.3 QC 标志变量
 
-所有 QC 标志变量使用 `int8` 类型，共享相同的 flag_values/flag_meanings：
+最终 QC 标志变量使用 `int8` 类型，共享相同的 flag_values/flag_meanings：
 
 ```python
 flag_values = np.array([0, 1, 2, 3, 9], dtype=np.int8)
 flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
 ```
 
-逐步 QC 标志中，`SSC_flag_qc3_ssc_q` 的 0/2/8/9 含义为 pass/suspect/not_checked/missing；
-`SSL_flag_qc3_from_ssc_q` 的 0/2/8/9 含义为 not_propagated/propagated/not_checked/missing。
+逐步 QC 标志不使用同一套含义。尤其是 `SSL_flag_qc3_from_ssc_q` 必须使用以下独立 contract：
+
+```python
+flag_values = np.array([0, 2, 8, 9], dtype=np.int8)
+flag_meanings = 'not_propagated propagated not_checked missing'
+```
+
+其中 `2=propagated`，表示 SSC-Q inconsistency 已传播到派生 SSL，因此 SSL 的最终标志也应为 suspect。不要将 `1` 用于 propagated，因为 `1` 只表示最终变量值为 estimated/derived。
 
 ---
 
@@ -248,7 +256,7 @@ flag_meanings = 'good_data estimated_data suspect_data bad_data missing_data'
 [apply_hydro_qc_with_provenance]
     │  ├─ QC1: Physical (flag bad/missing)
     │  ├─ QC2: Log-IQR outlier (flag suspect)
-    │  └─ QC3: SSC-Q envelope + SSL propagation (flag suspect)
+    │  └─ QC3: SSC-Q envelope + SSL propagation (flag suspect; step flag uses 2=propagated)
     │
     ▼
 [trim_to_valid_data]  → 裁剪到有效数据范围
