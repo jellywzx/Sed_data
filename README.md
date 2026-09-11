@@ -4,7 +4,7 @@ This repository contains the **source-level processing workflow** used to prepar
 
 > *A harmonized global station-reference dataset of river discharge, suspended sediment concentration, and suspended sediment load*
 
-This README follows the methodology structure of **Sect. 3.1–3.4** of the manuscript, but documents **only the processing implemented in the `Sed_data` repository**.
+This README follows the methodology structure of **Sect. 3.1–3.3** of the manuscript and documents **only the processing implemented in the `Sed_data` repository**.
 
 The repository converts heterogeneous source files into standardized, quality-controlled, source-traceable NetCDF products. Its main responsibilities are:
 
@@ -16,8 +16,6 @@ The repository converts heterogeneous source files into standardized, quality-co
 - source-level quality control;
 - CF-1.8 / ACDD-1.3 compatible NetCDF output.
 
-The later release-level operations described in manuscript Sect. 3.4 are outside the scope of this repository and are therefore not documented here.
-
 ---
 
 ## Manuscript-to-code map
@@ -27,7 +25,6 @@ The later release-level operations described in manuscript Sect. 3.4 are outside
 | **Sect. 3.1** Metadata, temporal, variable, and unit harmonization | Source-specific parsing, metadata standardization, temporal harmonization, variable mapping, unit conversion, and derivation of missing Q/SSC/SSL variables | `run_pipeline.py`; source-specific processors; `code/time_utils.py`; `code/units.py`; `code/daily_aggregation.py`; `code/metadata.py`; `code/global_attrs.py`; `code/constants.py` |
 | **Sect. 3.2** Georeferencing and basin matching | Coordinate parsing, conversion, and standardization required before later hydrological matching | Source-specific processors; `code/geo.py`; source-specific coordinate utilities |
 | **Sect. 3.3** QC procedures and flagging system | Physical screening, statistical outlier detection, SSC-Q consistency checking, and flag propagation to derived variables | `code/qc.py`; `code/constants.py`; source-specific processors |
-| **Sect. 3.4** Temporal screening, station consolidation, and time-series integration | Not implemented in `Sed_data`; the source-level outputs produced here provide the standardized input products required by later integration | No `Sed_data` script corresponds directly to this section |
 
 ---
 
