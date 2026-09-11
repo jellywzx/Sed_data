@@ -4,8 +4,8 @@ title: "Sediment Reference Dataset Source Processing Scripts"
 type: software
 authors:
   - name: "Sediment Reference Dataset contributors"
-version: "0.1.0"
-date-released: "2026-09-08"
+version: "1.0.0"
+date-released: "2026-09-11"
 repository-code: "https://github.com/jellywzx/Sed_data"
 license: MIT
 keywords:
