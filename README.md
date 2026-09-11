@@ -23,8 +23,10 @@ The repository converts heterogeneous source files into standardized, quality-co
 | Manuscript section | Scope covered by `Sed_data` | Main scripts/modules |
 | --- | --- | --- |
 | **Sect. 3.1** Metadata, temporal, variable, and unit harmonization | Source-specific parsing, metadata standardization, temporal harmonization, variable mapping, unit conversion, and derivation of missing Q/SSC/SSL variables | `run_pipeline.py`; source-specific processors; `code/time_utils.py`; `code/units.py`; `code/daily_aggregation.py`; `code/metadata.py`; `code/global_attrs.py`; `code/constants.py` |
-| **Sect. 3.2** Georeferencing and basin matching | Coordinate parsing, conversion, and standardization required before later hydrological matching | Source-specific processors; `code/geo.py`; source-specific coordinate utilities |
+| **Sect. 3.2** Georeferencing and basin matching | Coordinate parsing, conversion, and standardization are handled in `Sed_data`; basin matching is performed in the companion `sed_data_integration` repository | Source-specific processors; `code/geo.py`; source-specific coordinate utilities. For MERIT-Basins reach assignment and upstream-basin tracing, refer to the basin-matching scripts in [`sed_data_integration`](https://github.com/jellywzx/sed_data_integration) |
 | **Sect. 3.3** QC procedures and flagging system | Physical screening, statistical outlier detection, SSC-Q consistency checking, and flag propagation to derived variables | `code/qc.py`; `code/constants.py`; source-specific processors |
+
+> **Basin-matching note:** `Sed_data` prepares the standardized spatial information required for hydrological matching, but does not implement the basin-matching workflow itself. The basin-matching procedures described in manuscript Sect. 3.2 are implemented in the companion [`sed_data_integration`](https://github.com/jellywzx/sed_data_integration) repository. Refer there to scripts such as `s4_basin_trace_watch.py`, `basin_tracer.py`, and `basin_policy.py` for MERIT-Basins reach assignment, upstream-basin tracing, and resolved/unresolved matching rules.
 
 ---
 
