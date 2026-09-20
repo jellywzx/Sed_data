@@ -323,31 +323,31 @@ def build_qc_results_summary_row(qc_df, station_name, source_id, river_name, lon
         row.update(cnt)
 
     # -------- qc2 log_iqr (pass/suspect/not_checked/missing) --------
-    # 这里默认 step code：0=pass, 2=suspect, 1=not_checked, 9=missing
+    # Shared step-QC code: 0=pass, 2=suspect, 8=not_checked, 9=missing
     for var in ["Q", "SSC", "SSL"]:
-        col = f"{var}_qc2_log_iqr"
+        col = f"{var}_flag_qc2_log_iqr"
         step = qc_df[col].to_numpy() if col in qc_df.columns else None
         cnt = _count_step(step, {
             f"{var}_qc2_pass": {0},
             f"{var}_qc2_suspect": {2},
-            f"{var}_qc2_not_checked": {1},
+            f"{var}_qc2_not_checked": {8},
             f"{var}_qc2_missing": {9, int(FILL_VALUE_INT)}
         })
         row.update(cnt)
 
     # -------- qc3 ssc-q consistency / propagation --------
-    # SSC_qc3：0=pass,2=suspect,1=not_checked,9=missing
-    col = "SSC_qc3_ssc_q"
+    # SSC QC3: 0=pass, 2=suspect, 8=not_checked, 9=missing
+    col = "SSC_flag_qc3_ssc_q"
     step = qc_df[col].to_numpy() if col in qc_df.columns else None
     row.update(_count_step(step, {
         "SSC_qc3_pass": {0},
         "SSC_qc3_suspect": {2},
-        "SSC_qc3_not_checked": {1},
+        "SSC_qc3_not_checked": {8},
         "SSC_qc3_missing": {9, int(FILL_VALUE_INT)}
     }))
 
     # SSL_qc3 propagation: 0=not_propagated, 2=propagated/suspect, 8=not_checked, 9=missing
-    col = "SSL_qc3_propagation"
+    col = "SSL_flag_qc3_from_ssc_q"
     step = qc_df[col].to_numpy() if col in qc_df.columns else None
     row.update(_count_step(step, {
         "SSL_qc3_not_propagated": {0},
@@ -438,55 +438,66 @@ def perform_qc_checks(daily_df):
         qc3_k=1.5, qc3_min_samples=5,
     )
 
-    # 兼容：可能返回 qc；也可能返回 (qc, provenance)
-    qc = None
-    prov = None
-    if isinstance(res, tuple) and len(res) >= 2:
-        qc, prov = res[0], res[1]
+    # Compatible with both current qc-only return and an older (qc, provenance) form.
+    if isinstance(res, tuple):
+        qc = res[0] if len(res) >= 1 else None
+        prov = res[1] if len(res) >= 2 and isinstance(res[1], dict) else {}
     else:
-        qc = res
+        qc, prov = res, {}
 
     if qc is None:
-        qc_df["Q_flag"]   = q_flag_qc1
+        qc_df["Q_flag"] = q_flag_qc1
         qc_df["SSC_flag"] = ssc_flag_qc1
         qc_df["SSL_flag"] = ssl_flag_qc1
-
-        # 把 qc1 physical 也写出来（用于 summary）
         qc_df["Q_qc1_physical"] = _qc1_physical_from_flag(q_flag_qc1)
         qc_df["SSC_qc1_physical"] = _qc1_physical_from_flag(ssc_flag_qc1)
         qc_df["SSL_qc1_physical"] = _qc1_physical_from_flag(ssl_flag_qc1)
-
         qc_df = qc_df.set_index("datetime").sort_index()
         return qc_df, None
 
-    # tool 返回 trimmed(valid_time)，用 time 对齐回 qc_df
-    qc_time = base + pd.to_timedelta(qc["time"], unit="D")
+    if not isinstance(qc, dict):
+        raise RuntimeError("Fukushima shared QC did not return a QC dictionary")
+
+    # The shared QC may trim rows where Q/SSC/SSL are all missing. Align the
+    # dataframe by the returned time coordinate first, then write all flags.
+    qc_time = pd.DatetimeIndex(base + pd.to_timedelta(qc["time"], unit="D"))
     qc_df = qc_df.set_index("datetime").loc[qc_time].copy()
 
-    # final flags
-    qc_df["Q_flag"]   = qc["Q_flag"]
-    qc_df["SSC_flag"] = qc["SSC_flag"]
-    qc_df["SSL_flag"] = qc["SSL_flag"]
+    for key in ("Q_flag", "SSC_flag", "SSL_flag"):
+        values = np.asarray(qc[key], dtype=np.int8).reshape(-1)
+        if values.shape[0] != len(qc_df):
+            raise RuntimeError(
+                f"Fukushima {key} length {values.shape[0]} does not match QC dataframe length {len(qc_df)}"
+            )
+        qc_df[key] = values
 
-    # qc1 physical（用 qc1 归并版；注意要对齐到 qc_time）
-    qc_df["Q_qc1_physical"] = _qc1_physical_from_flag(q_flag_qc1[:len(qc_df)])
-    qc_df["SSC_qc1_physical"] = _qc1_physical_from_flag(ssc_flag_qc1[:len(qc_df)])
-    qc_df["SSL_qc1_physical"] = _qc1_physical_from_flag(ssl_flag_qc1[:len(qc_df)])
-
-    # provenance（如果 tool 提供了分步数组，就落到列里）
-    # 建议把 key 标准化成这些列名（和 summary helper 对齐）：
-    #   Q_qc2_log_iqr / SSC_qc2_log_iqr / SSL_qc2_log_iqr
-    #   SSC_qc3_ssc_q
-    #   SSL_qc3_propagation
+    # Current shared QC returns all step/provenance arrays in the QC dict.
+    # Keep legacy provenance support, but make the eight required fields
+    # explicit so missing step flags cannot be silently omitted from NetCDF.
+    step_source = dict(qc)
     if isinstance(prov, dict):
-        # 常见情况：prov 已经给了这些 key，就直接写
-        for k, v in prov.items():
-            try:
-                arr = np.asarray(v)
-                if arr.shape[0] == len(qc_df):
-                    qc_df[k] = arr
-            except Exception:
-                pass
+        step_source.update(prov)
+
+    step_column_map = {
+        "Q_flag_qc1_physical": "Q_qc1_physical",
+        "SSC_flag_qc1_physical": "SSC_qc1_physical",
+        "SSL_flag_qc1_physical": "SSL_qc1_physical",
+        "Q_flag_qc2_log_iqr": "Q_flag_qc2_log_iqr",
+        "SSC_flag_qc2_log_iqr": "SSC_flag_qc2_log_iqr",
+        "SSL_flag_qc2_log_iqr": "SSL_flag_qc2_log_iqr",
+        "SSC_flag_qc3_ssc_q": "SSC_flag_qc3_ssc_q",
+        "SSL_flag_qc3_from_ssc_q": "SSL_flag_qc3_from_ssc_q",
+    }
+    for source_name, column_name in step_column_map.items():
+        if source_name not in step_source:
+            raise RuntimeError(f"Fukushima shared QC result is missing {source_name}")
+        values = np.asarray(step_source[source_name], dtype=np.int8).reshape(-1)
+        if values.shape[0] != len(qc_df):
+            raise RuntimeError(
+                f"Fukushima {source_name} length {values.shape[0]} "
+                f"does not match QC dataframe length {len(qc_df)}"
+            )
+        qc_df[column_name] = values
 
     ssc_q_bounds = qc.get("ssc_q_bounds", None)
     return qc_df.sort_index(), ssc_q_bounds
