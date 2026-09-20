@@ -85,10 +85,16 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None, station_name=None):
     res = apply_hydro_qc_with_provenance(**qc_kwargs)
 
     # ---- compat: res = (qc, prov) or qc-only
-    if isinstance(res, tuple) and len(res) == 2:
-        qc, prov = res
+    if isinstance(res, tuple):
+        qc = res[0] if len(res) >= 1 else None
+        prov = res[1] if len(res) >= 2 and isinstance(res[1], dict) else {}
     else:
-        qc, prov = res, None
+        qc, prov = res, {}
+
+    if not isinstance(qc, dict):
+        raise RuntimeError(
+            f"USGS {station_id}: apply_hydro_qc_with_provenance did not return a QC dict"
+        )
 
     def _get(obj, key, default=None):
         if obj is None:
@@ -97,6 +103,22 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None, station_name=None):
             return obj.get(key, default)
         return getattr(obj, key, default)
 
+    # Shared QC removes rows for which Q, SSC and SSL are all missing.
+    # Keep the dataframe aligned with the returned arrays before assigning
+    # values/flags, rather than silently dropping provenance columns.
+    qc_time = np.atleast_1d(_get(qc, "time", time)).reshape(-1)
+    if qc_time.shape[0] != out.shape[0]:
+        keep = np.isfinite(Q) | np.isfinite(SSC) | np.isfinite(SSL)
+        if int(np.sum(keep)) != qc_time.shape[0]:
+            raise RuntimeError(
+                f"USGS {station_id}: QC output length {qc_time.shape[0]} "
+                f"cannot be aligned to {out.shape[0]} input rows"
+            )
+        out = out.loc[keep].reset_index(drop=True)
+        Q = Q[keep]
+        SSC = SSC[keep]
+        SSL = SSL[keep]
+
     # ---- write back values
     out["Q"] = _get(qc, "Q", Q)
     out["SSC"] = _get(qc, "SSC", SSC)
@@ -104,30 +126,53 @@ def apply_tool_qc_usgs(df, station_id, diagnostic_dir=None, station_name=None):
 
     # ---- defaults: if qc doesn't return flags, compute with apply_quality_flag_array (fallback)
     try:
-        _Q_default = np.asarray(apply_quality_flag_array(Q, "Q"), dtype=np.int8)
+        _Q_default = np.asarray(apply_quality_flag_array(out["Q"].to_numpy(dtype=float), "Q"), dtype=np.int8)
     except Exception:
-        _Q_default = np.asarray([apply_quality_flag(v, "Q") for v in Q], dtype=np.int8)
+        _Q_default = np.asarray([apply_quality_flag(v, "Q") for v in out["Q"].to_numpy(dtype=float)], dtype=np.int8)
 
     try:
-        _SSC_default = np.asarray(apply_quality_flag_array(SSC, "SSC"), dtype=np.int8)
+        _SSC_default = np.asarray(apply_quality_flag_array(out["SSC"].to_numpy(dtype=float), "SSC"), dtype=np.int8)
     except Exception:
-        _SSC_default = np.asarray([apply_quality_flag(v, "SSC") for v in SSC], dtype=np.int8)
+        _SSC_default = np.asarray([apply_quality_flag(v, "SSC") for v in out["SSC"].to_numpy(dtype=float)], dtype=np.int8)
 
     try:
-        _SSL_default = np.asarray(apply_quality_flag_array(SSL, "SSL"), dtype=np.int8)
+        _SSL_default = np.asarray(apply_quality_flag_array(out["SSL"].to_numpy(dtype=float), "SSL"), dtype=np.int8)
     except Exception:
-        _SSL_default = np.asarray([apply_quality_flag(v, "SSL") for v in SSL], dtype=np.int8)
+        _SSL_default = np.asarray([apply_quality_flag(v, "SSL") for v in out["SSL"].to_numpy(dtype=float)], dtype=np.int8)
 
     out["Q_flag"] = _get(qc, "Q_flag", _Q_default)
     out["SSC_flag"] = _get(qc, "SSC_flag", _SSC_default)
     out["SSL_flag"] = _get(qc, "SSL_flag", _SSL_default)
 
-    # ---- step/provenance flags -> add as columns (if present)
+    # ---- step/provenance flags
+    # Current shared QC returns these arrays in the QC dict itself.  Keep
+    # support for an older (qc, provenance) return form, but require all
+    # eight source-stage fields so an incomplete organized NC cannot pass
+    # silently into the integration workflow.
+    step_source = dict(qc)
     if isinstance(prov, dict):
-        for k, v in prov.items():
-            vv = np.atleast_1d(v).reshape(-1)
-            if vv.shape[0] == out.shape[0]:
-                out[k] = vv
+        step_source.update(prov)
+
+    required_step_keys = (
+        "Q_flag_qc1_physical",
+        "SSC_flag_qc1_physical",
+        "SSL_flag_qc1_physical",
+        "Q_flag_qc2_log_iqr",
+        "SSC_flag_qc2_log_iqr",
+        "SSL_flag_qc2_log_iqr",
+        "SSC_flag_qc3_ssc_q",
+        "SSL_flag_qc3_from_ssc_q",
+    )
+    for key in required_step_keys:
+        if key not in step_source:
+            raise RuntimeError(f"USGS {station_id}: shared QC result is missing {key}")
+        values = np.asarray(step_source[key], dtype=np.int8).reshape(-1)
+        if values.shape[0] != out.shape[0]:
+            raise RuntimeError(
+                f"USGS {station_id}: {key} length {values.shape[0]} "
+                f"does not match QC dataframe length {out.shape[0]}"
+            )
+        out[key] = values
 
     return out
 
@@ -167,11 +212,12 @@ def _count_final_flags(flag_arr, fill_value):
     }
 
 def _count_step_flags(step_arr, fill_value):
-    # 约定：0=pass, 1=not_checked, 2=suspect, 3=bad, fill=missing
+    # Shared step-QC convention: 0=pass, 2=suspect/propagated,
+    # 3=bad, 8=not_checked, 9=missing.
     a = np.asarray(step_arr, dtype=np.int16)
     return {
         "pass": int(np.sum(a == 0)),
-        "not_checked": int(np.sum(a == 1)),
+        "not_checked": int(np.sum(a == 8)),
         "suspect": int(np.sum(a == 2)),
         "bad": int(np.sum(a == 3)),
         "missing": int(np.sum(a == fill_value)),
@@ -225,7 +271,7 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
 
     # qc1
     for v in ["Q", "SSC", "SSL"]:
-        col = _pick_step_col(df_station, [f"{v}_qc1_physical"], f"{v}_qc1")
+        col = _pick_step_col(df_station, [f"{v}_flag_qc1_physical"], f"{v}_flag_qc1")
         if col is None:
             row[f"{v}_qc1_pass"] = row[f"{v}_qc1_bad"] = row[f"{v}_qc1_missing"] = 0
         else:
@@ -236,7 +282,7 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
 
     # qc2
     for v in ["Q", "SSC", "SSL"]:
-        col = _pick_step_col(df_station, [f"{v}_qc2_log_iqr"], f"{v}_qc2")
+        col = _pick_step_col(df_station, [f"{v}_flag_qc2_log_iqr"], f"{v}_flag_qc2")
         if col is None:
             row[f"{v}_qc2_pass"] = row[f"{v}_qc2_suspect"] = row[f"{v}_qc2_not_checked"] = row[f"{v}_qc2_missing"] = 0
         else:
@@ -247,7 +293,7 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
             row[f"{v}_qc2_missing"] = c["missing"]
 
     # qc3 SSC
-    col = _pick_step_col(df_station, [], "SSC_qc3")
+    col = _pick_step_col(df_station, ["SSC_flag_qc3_ssc_q"], "SSC_flag_qc3")
     if col is None:
         row["SSC_qc3_pass"] = row["SSC_qc3_suspect"] = row["SSC_qc3_not_checked"] = row["SSC_qc3_missing"] = 0
     else:
@@ -258,7 +304,7 @@ def build_qc_results_summary_row(df_station, station_info, station_id, fill_valu
         row["SSC_qc3_missing"] = c["missing"]
 
     # qc3 SSL（传播）
-    col = _pick_step_col(df_station, [], "SSL_qc3")
+    col = _pick_step_col(df_station, ["SSL_flag_qc3_from_ssc_q"], "SSL_flag_qc3")
     if col is None:
         row["SSL_qc3_not_propagated"] = row["SSL_qc3_propagated"] = row["SSL_qc3_not_checked"] = row["SSL_qc3_missing"] = 0
     else:
