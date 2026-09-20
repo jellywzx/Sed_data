@@ -671,7 +671,7 @@ class HYBAMProcessor:
                     v = ds.createVariable(name, 'i1', ('time',), zlib=True, complevel=4, fill_value=FILL_VALUE_INT)
                     v.long_name = long_name
                     v.standard_name = 'status_flag'
-                    v.c = np.array(flag_values, dtype=np.int8)
+                    v.flag_values = np.array(flag_values, dtype=np.int8)
                     v.flag_meanings = flag_meanings
                     v.missing_value = np.int8(FILL_VALUE_INT)
                     v[:] = np.asarray(values, dtype=np.int8)
