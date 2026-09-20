@@ -46,6 +46,7 @@ CODE_DIR = SCRIPT_ROOT / "code"
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
+from audit import write_dataset_output_audit
 from runtime import OUTPUT_ROOT_ENV, SOURCE_ROOT_ENV, resolve_output_root, resolve_project_root, resolve_source_root
 
 
@@ -308,6 +309,11 @@ def parse_args():
     parser.add_argument("--output-root", type=Path, help="Override Output_r root")
     parser.add_argument("--source-root", type=Path, help="Override Source root for migrated scripts")
     parser.add_argument("--python", default=sys.executable, help="Python executable used to run stage scripts")
+    parser.add_argument(
+        "--skip-output-audit",
+        action="store_true",
+        help="Skip the final QC NetCDF record audit",
+    )
     return parser.parse_args()
 
 
@@ -369,6 +375,22 @@ def main():
         print(f"  python run_pipeline.py {' '.join(failed_datasets)}")
     else:
         print("All datasets completed successfully.")
+
+    if not args.dry_run and not args.skip_output_audit:
+        print("\n" + "=" * 60)
+        print("POST-PROCESSING OUTPUT AUDIT")
+        print("=" * 60)
+        try:
+            audit_paths = write_dataset_output_audit(output_root)
+            print("Dataset audit      : {}".format(audit_paths["dataset"]))
+            print("By-resolution audit: {}".format(audit_paths["by_resolution"]))
+            print(
+                "Retained records are time steps with non-missing SSC or SSL; "
+                "Q-only/fully-missing time steps are counted as screened for downstream integration."
+            )
+        except Exception as exc:
+            print("WARNING: output audit failed: {}".format(exc))
+            print("Run python audit_processed_outputs.py after fixing the audit dependency/output issue.")
 
 
 if __name__ == "__main__":
