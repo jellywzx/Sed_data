@@ -308,5 +308,5 @@ Output_r/
 |------|-----------|------|
 | **单脚本一体化** | HYBAM, GFQA, HMA, Rhine, EUSEDcollab | 1 个脚本完成读取→QC→标准化→输出 |
 | **两步式** | Huanghe, Vanmaercke, bayern | convert + qc_and_standardize 分离 |
-| **多步流水线** | Hydat (4步), Milliman (5步), GloRiSe (4步) | 流程拆分更细 |
+| **多步流水线** | Hydat (4步), Milliman (5步), GloRiSe (2步，SS-only) | 流程拆分更细；GloRiSe BS 不进入正式 integration |
 | **主处理+验证** | GSED, Myanmar, Mekong_Delta | 主脚本 + 独立验证/绘图脚本 |
