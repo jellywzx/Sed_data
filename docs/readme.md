@@ -151,7 +151,7 @@ QC 第三层 — 水文一致性检验          [code/qc.py]
 | Fukushima | 单脚本 | `fukushima_qc_and_cf_enhancement.py` | 核事故后数据 |
 | GFQA_v2 | 单脚本 | `gfqa_to_netcdf_daily_dualqc.py` | 双层 QC |
 | GSED | 单脚本 | `process_gsed_cf18.py` | 集成 ShapeFile |
-| GloRiSe | 四阶段 | `1_generate_netcdf_SS.py` → `2_qc_and_standardize_glorise.py` → `3_generate_nc_BS.py` → `4_qc_and_standardize_BS.py` | SS / BS / 营养盐 |
+| GloRiSe | 两阶段 | `1_generate_netcdf_SS.py` → `2_qc_and_standardize_glorise.py` | 正式发布仅处理 SS；BS 脚本仅用于源数据探索，不进入 integration |
 | HMA | 单脚本 | `convert_to_netcdf_cf18_qc.py` | 高山亚洲 |
 | HYBAM | 单脚本 | `hybam_comprehensive_processor.py` | 亚马逊 |
 | Huanghe | 两阶段 | `convert_to_netcdf.py` → `qc_and_standardize.py` | 黄河 |
