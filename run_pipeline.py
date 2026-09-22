@@ -102,12 +102,10 @@ PIPELINES = {
         ],
     },
     "GloRiSe": {
-        "summary": "Global River Sediment Database daily pipeline",
+        "summary": "Global River Sediment Database suspended-sediment (SS) daily pipeline",
         "stages": [
             {"script": "GloRiSe/1_generate_netcdf_SS.py", "description": "Generate SS intermediate NetCDF"},
             {"script": "GloRiSe/2_qc_and_standardize_glorise.py", "description": "QC + standardize SS"},
-            # {"script": "GloRiSe/3_generate_nc_BS.py", "description": "Generate BS intermediate NetCDF"},
-            # {"script": "GloRiSe/4_qc_and_standardize_BS.py", "description": "QC + standardize BS"},
         ],
     },
     "HMA": {
