@@ -10,6 +10,14 @@ This script:
 5. Removes invalid stations
 6. Generates station summary CSV
 
+NOTE
+----
+This script processes GloRiSe BS records for source-level exploration only.
+BS records are intentionally excluded from the ESSD suspended-sediment
+station-reference release and are not part of the canonical Sed_data pipeline.
+Its outputs are kept under the GloRiSe source workspace and must not be used
+as input to sed_data_integration.
+
 Author: Zhongwang Wei
 Date: 2025-10-26
 """
@@ -36,7 +44,7 @@ from code.qc import (
     compute_log_iqr_bounds,
     propagate_ssc_q_inconsistency_to_ssl,
 )
-from code.runtime import ensure_directory, resolve_output_root, resolve_source_root
+from code.runtime import ensure_directory, resolve_source_root
 from code.units import convert_ssl_units_if_needed
 from code.validation import require_existing_directory
 
@@ -44,7 +52,7 @@ from code.validation import require_existing_directory
 # Configuration
 INPUT_DIR = resolve_source_root(start=__file__) / "GloRiSe" / "netcdf_output_BS"
 OUTPUT_DIR = ensure_directory(
-    resolve_output_root(start=__file__) / "daily" / "GloRiSe" / "BS" / "qc"
+    resolve_source_root(start=__file__) / "GloRiSe" / "netcdf_output_BS_qc"
 )
 
 # Original data source information
