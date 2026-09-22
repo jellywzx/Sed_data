@@ -4,6 +4,13 @@ Generate CF-compliant NetCDF files from GloRiSe sediment database.
 
 This script reads data from multiple Excel files, integrates them by station,
 and generates one NetCDF file per station containing Discharge and TSS time series.
+
+NOTE
+----
+This script processes GloRiSe BS records for source-level exploration only.
+BS records are intentionally excluded from the ESSD suspended-sediment
+station-reference release and are not part of the canonical Sed_data pipeline.
+Outputs from this script must not be used as input to sed_data_integration.
 """
 
 import pandas as pd
