@@ -167,6 +167,20 @@ def parse_float(value):
     except Exception:
         return -9999.0
 
+def write_upstream_area(ds, raw_value):
+    """Write upstream basin area as both a scalar variable and legacy global attribute."""
+    area = parse_float(raw_value)
+    if not np.isfinite(area) or area <= 0:
+        area = -9999.0
+
+    area_var = ds.createVariable('upstream_area', 'f4', fill_value=-9999.0)
+    area_var.long_name = 'upstream drainage area'
+    area_var.units = 'km2'
+    area_var.comment = 'Source: GEMStat station metadata field Upstream Basin Area.'
+    area_var[:] = area
+    ds.upstream_area = area
+    return area
+
 
 def get_station_altitude(station_row, fill_value=-9999.0):
     """
@@ -358,6 +372,8 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     alt_var.positive = 'up'
     alt_var[:] = altitude
 
+    write_upstream_area(ds, station_row.get('Upstream Basin Area', -9999.0))
+
     # --------------------------
     # helper: add flag var
     # --------------------------
@@ -496,7 +512,6 @@ def create_netcdf_file(station_id, station_row, qc, q_quality, ssc_quality, outp
     # scalar metadata
     # --------------------------
     ds.altitude = altitude
-    ds.upstream_area = parse_float(station_row.get('Upstream Basin Area', -9999.0))
     ds.station_id = str(station_id)
     ds.Source_ID = str(station_id)
     ds.source_station_id = str(station_id)

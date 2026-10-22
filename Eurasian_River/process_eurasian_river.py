@@ -194,6 +194,22 @@ def _fmt_val(val):
     except (TypeError, ValueError):
         return "N/A"
 
+def write_upstream_area(nc, value):
+    """Write source-reported drainage area as a scalar NetCDF variable."""
+    try:
+        area = float(value)
+    except (TypeError, ValueError):
+        area = FILL_VALUE_FLOAT
+    if not np.isfinite(area) or area <= 0:
+        area = FILL_VALUE_FLOAT
+
+    area_var = nc.createVariable("upstream_area", "f4", fill_value=FILL_VALUE_FLOAT)
+    area_var.long_name = "upstream drainage area"
+    area_var.units = "km2"
+    area_var.comment = "Source: Eurasian Arctic River Database station metadata."
+    area_var[:] = area
+    return area
+
 def print_qc_summary(river_name, station_id, n, skipped_log_iqr, skipped_ssc_q, q, q_flag, ssc, ssc_flag, ssl, ssl_flag, nc_path):
     print(f"\nProcessing: {river_name} ({station_id}) +")
     if skipped_log_iqr:
@@ -729,6 +745,8 @@ def main():
             lon.standard_name = "longitude"
             lon.long_name = "station longitude"
             lon[:] = meta.get("longitude", np.nan)
+
+            write_upstream_area(nc, meta.get("drainage_area", np.nan))
 
             # Global Attributes (preserved from original)
             nc.Conventions = "CF-1.8, ACDD-1.3"

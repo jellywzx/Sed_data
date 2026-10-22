@@ -89,6 +89,11 @@ STATION_INFO = {
     "14420000":   {"lon": -64.82889, "lat": -0.4819444,"alt": None, "country": "Brazil", "continent_region": "South America", "iso_a3": "BRA"},
 }
 
+HYBAM_AREA_ALIASES = {
+    "2604100121": "30030000",  # Langa Tabiki / Maroni
+    "2604500124": "30055000",  # Saut Maripa / Oyapock
+}
+
 
 class HYBAMProcessor:
     """Process HYBAM discharge and sediment data with full QC and CF-1.8 compliance."""
@@ -108,6 +113,43 @@ class HYBAMProcessor:
         self.output_dir = Path(output_dir)
         self.output_r_dir = Path(output_r_dir)
         self.station_metadata = {}
+        area_file = self.source_dir.parent / 'HYBAM-old' / 'info' / '15min' / 'stNo2xy.txt'
+        self.upstream_area_lookup = self._load_upstream_area_lookup(area_file)
+
+    @staticmethod
+    def _is_valid_upstream_area(value):
+        try:
+            area = float(value)
+        except (TypeError, ValueError):
+            return False
+        return np.isfinite(area) and area > 0 and not np.isclose(area, FILL_VALUE_FLOAT)
+
+    @classmethod
+    def _load_upstream_area_lookup(cls, area_file):
+        """Load positive CaMa-Flood 15 arc-minute upstream areas by station ID."""
+        area_file = Path(area_file)
+        if not area_file.is_file():
+            print(f"    ⚠ HYBAM upstream-area lookup not found: {area_file}")
+            return {}
+
+        lookup = {}
+        with area_file.open(newline='', encoding='utf-8-sig') as f:
+            for row in csv.DictReader(f):
+                station_id = str(row.get('ID', '')).strip()
+                value = row.get('uparea')
+                if station_id and cls._is_valid_upstream_area(value):
+                    lookup[station_id] = float(value)
+        return lookup
+
+    def get_upstream_area(self, station_id):
+        """Return a validated upstream area, including two verified legacy ID aliases."""
+        station_id = str(station_id)
+        lookup_id = station_id if station_id in self.upstream_area_lookup else HYBAM_AREA_ALIASES.get(station_id)
+        area = self.upstream_area_lookup.get(lookup_id, FILL_VALUE_FLOAT)
+        if not self._is_valid_upstream_area(area):
+            print(f"    ⚠ No valid CaMa-Flood upstream area for HYBAM station {station_id}")
+            return FILL_VALUE_FLOAT
+        return area
 
     @staticmethod
     def _to_float_array(values, fill_value=None):
@@ -641,6 +683,7 @@ class HYBAMProcessor:
                 area_var = ds.createVariable('upstream_area', 'f4', zlib=True, fill_value=FILL_VALUE_FLOAT)
                 area_var.long_name = 'upstream drainage area'
                 area_var.units = 'km2'
+                area_var.comment = 'Source: CaMa-Flood 15 arc-minute model.'
                 area_var[:] = upstream_area if np.isfinite(upstream_area) else FILL_VALUE_FLOAT
 
             # =============
@@ -842,7 +885,7 @@ class HYBAMProcessor:
                 vars_provided.append('SSL')
             if altitude is not None:
                 vars_provided.append('altitude')
-            if upstream_area is not None:
+            if self._is_valid_upstream_area(upstream_area):
                 vars_provided.append('upstream_area')
 
             ds.variables_provided = ', '.join(vars_provided)
@@ -989,7 +1032,7 @@ class HYBAMProcessor:
         latitude = FILL_VALUE_FLOAT
         longitude = FILL_VALUE_FLOAT
         altitude = FILL_VALUE_FLOAT
-        upstream_area = FILL_VALUE_FLOAT
+        upstream_area = self.get_upstream_area(station_id)
 
         info = STATION_INFO.get(station_id, None)
 
