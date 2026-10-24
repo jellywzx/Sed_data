@@ -19,3 +19,14 @@ MILLIGRAMS_PER_TON = np.float64(1e9)
 SSC_DISCHARGE_TO_SSL_FACTOR = np.float64(
     SECONDS_PER_DAY * LITERS_PER_CUBIC_METER / MILLIGRAMS_PER_TON
 )
+
+# Canonical step-level QC flag contract.
+#
+# Important: SSL_flag_qc3_from_ssc_q uses FLAG_SUSPECT (2) for propagated
+# SSC-Q inconsistency. It must not use FLAG_ESTIMATED (1). The value 1 is
+# reserved for final derived/estimated data flags, not for QC3 propagation.
+QC3_SSL_FROM_SSC_Q_FLAG_VALUES = np.array(
+    [FLAG_GOOD, FLAG_SUSPECT, FLAG_NOT_CHECKED, FLAG_MISSING], dtype=np.int8
+)
+QC3_SSL_FROM_SSC_Q_FLAG_MEANINGS = "not_propagated propagated not_checked missing"
+QC3_SSL_FROM_SSC_Q_PROPAGATED_FLAG = FLAG_SUSPECT
